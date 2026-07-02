@@ -2350,6 +2350,32 @@ static void emit_node(FILE *out, Node *n){
             fprintf(out,"    }\n");
         } else {
             const char *vn=safe_cname(n->for_var);
+            /* Check if the list is a single unquoted $var — if so, word-split it */
+            int do_split = (n->for_len==1 && n->for_list[0][0]=='$'
+                            && n->for_list[0][1]!='{' && n->for_list[0][1]!='('
+                            && get_var_kind(n->for_list[0]+1)==V_STR);
+            if(do_split){
+                const char *vname = safe_cname(n->for_list[0]+1);
+                fprintf(out,"    {\n");
+                fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
+                fprintf(out,"    char *__sv=__sbuf;\n");
+                fprintf(out,"    while(*__sv){\n");
+                fprintf(out,"        while(*__sv==' '||*__sv=='\\t'||*__sv=='\\n')__sv++;\n");
+                fprintf(out,"        if(!*__sv)break;\n");
+                fprintf(out,"        char *__se=__sv;\n");
+                fprintf(out,"        while(*__se&&*__se!=' '&&*__se!='\\t'&&*__se!='\\n')__se++;\n");
+                fprintf(out,"        char __sc=*__se; *__se=0;\n");
+                VarKind vk=get_var_kind(n->for_var);
+                if(vk==V_INT)
+                    fprintf(out,"        %s=atoi(__sv);\n",vn);
+                else
+                    fprintf(out,"        strncpy(%s,__sv,sizeof(%s)-1); %s[sizeof(%s)-1]=0;\n",vn,vn,vn,vn);
+                emit_node(out,n->body);
+                fprintf(out,"        *__se=__sc; __sv=( *__se?__se:__se);\n");
+                fprintf(out,"        __sv=__se; if(*__sv)__sv++;\n");
+                fprintf(out,"    }\n");
+                fprintf(out,"    }\n");
+            } else {
             fprintf(out,"    {\n");
             fprintf(out,"    const char **__fl%d=(const char**)malloc(%d*sizeof(char*));\n",
                     n->lineno,n->for_len+1);
@@ -2371,6 +2397,7 @@ static void emit_node(FILE *out, Node *n){
             fprintf(out,"    for(int __fi%d=0;__fl%d[__fi%d];__fi%d++)free((char*)__fl%d[__fi%d]);\n",
                     n->lineno,n->lineno,n->lineno,n->lineno,n->lineno,n->lineno);
             fprintf(out,"    free(__fl%d);\n    }\n",n->lineno);
+            }
         }
         break;
     }
@@ -3072,10 +3099,11 @@ static const char *RT_HEADER =
 "  return __sh_strip_buf;\n"
 "}\n"
 "static const char *__sh_strip_suffix(const char *s,const char *pat,int greedy){\n"
-"  int best=0; int n=(int)strlen(s);\n"
-"  if(greedy){ for(int i=1;i<=n;i++){ const char *sub=s+i; if(fnmatch(pat,sub,0)==0){ best=i; break; } } }\n"
-"  else { for(int i=n;i>=1;i--){ const char *sub=s+i; if(fnmatch(pat,sub,0)==0){ best=i; break; } } }\n"
-"  int l=n-best; if(l<0) l=0; if(l>=(int)sizeof(__sh_strip_buf)) l=(int)sizeof(__sh_strip_buf)-1;\n"
+"  int n=(int)strlen(s); int best=n;\n"
+"  /* %pat: shortest suffix (largest i); %%pat: longest suffix (smallest i) */\n"
+"  if(!greedy){ for(int i=n;i>=1;i--){ if(fnmatch(pat,s+i,0)==0){ best=i; break; } } }\n"
+"  else { for(int i=1;i<=n;i++){ if(fnmatch(pat,s+i,0)==0){ best=i; break; } } }\n"
+"  int l=best; if(l<0) l=0; if(l>=(int)sizeof(__sh_strip_buf)) l=(int)sizeof(__sh_strip_buf)-1;\n"
 "  memcpy(__sh_strip_buf,s,l); __sh_strip_buf[l]=0;\n"
 "  return __sh_strip_buf;\n"
 "}\n"
