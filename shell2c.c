@@ -644,8 +644,7 @@ static char *translate_brace_expansion(const char *body){
         p+=2; char def[256]; int d=0;
         while(*p && *p!='}') def[d++]=*p++;
         def[d]=0;
-        char r[512];
-        /* Determine the C expression for the variable */
+        char r[2048];
         const char *cn;
         char cnbuf[300];
         if(isdigit((unsigned char)name[0])){
@@ -1726,17 +1725,17 @@ static char *translate_cond(const char *cond){
         /* Handle [ ! ... ] — negation */
         if(!strcmp(tok1,"!") && op[0]){
             /* shift: tok1=op, op=tok2, tok2="" */
-            char t[256]; strncpy(t,tok1,255); t[255]=0;
-            strncpy(tok1,op,255); tok1[255]=0;
-            strncpy(op,tok2,31); op[31]=0;
+            char t[256]; snprintf(t,sizeof(t),"%s",tok1);
+            snprintf(tok1,sizeof(tok1),"%s",op);
+            snprintf(op,sizeof(op),"%s",tok2);
             tok2[0]=0;
             /* re-check unary */
             int is_u2=0;
             for(int i=0;unary[i];i++) if(strcmp(tok1,unary[i])==0){is_u2=1;break;}
             if(is_u2){
-                char tmp[256]; strncpy(tmp,op,255); tmp[255]=0;
-                strncpy(op,tok1,31); op[31]=0;
-                strncpy(tok1,tmp,255); tok1[255]=0; tok2[0]=0;
+                char tmp[256]; snprintf(tmp,sizeof(tmp),"%s",op);
+                snprintf(op,sizeof(op),"%s",tok1);
+                snprintf(tok1,sizeof(tok1),"%s",tmp); tok2[0]=0;
             }
             if(op[0]){
                 char *r=translate_test_unary(op,tok1);
