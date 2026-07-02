@@ -864,11 +864,28 @@ static char *translate_expr(const char *tok){
                     sp++;
                     while(*sp && *sp!='\'' && ar<(int)sizeof(arg)-1) arg[ar++]=*sp++;
                     if(*sp=='\'') sp++;
+                } else if(*sp=='$' && *(sp+1)=='('){
+                    /* $(...) or $((...)) — read as single unit */
+                    arg[ar++]='$'; sp++;
+                    arg[ar++]='('; sp++;
+                    int d=1;
+                    while(*sp && d && ar<(int)sizeof(arg)-1){
+                        if(*sp=='(') d++;
+                        else if(*sp==')') d--;
+                        arg[ar++]=*sp++;
+                    }
                 } else {
                     while(*sp && *sp!=' ' && *sp!='\t' && ar<(int)sizeof(arg)-1) arg[ar++]=*sp++;
                 }
                 arg[ar]=0;
-                ai += snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                /* translate the argument */
+                if(arg[0]=='$'){
+                    char *e=translate_expr(arg);
+                    ai += snprintf(args+ai,sizeof(args)-ai,"%s,",e);
+                    free(e);
+                } else {
+                    ai += snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                }
                 nargs++;
             }
             ai += snprintf(args+ai,sizeof(args)-ai,"NULL}");
@@ -1098,9 +1115,38 @@ static void expand_string(const char *s, ExpandResult *er){
                         char arg[512]; int ar=0;
                         if(*sp=='"'){ sp++; while(*sp&&*sp!='"'&&ar<(int)sizeof(arg)-1){ if(*sp=='\\'&&*(sp+1))sp++; arg[ar++]=*sp++; } if(*sp=='"')sp++; }
                         else if(*sp=='\''){ sp++; while(*sp&&*sp!='\''&&ar<(int)sizeof(arg)-1) arg[ar++]=*sp++; if(*sp=='\'')sp++; }
+                        else if(*sp=='$' && *(sp+1)=='('){
+                            /* $(...) or $((...)) — read as single unit */
+                            arg[ar++]='$'; sp++;
+                            arg[ar++]='('; sp++;
+                            int d=1;
+                            while(*sp && d && ar<(int)sizeof(arg)-1){
+                                if(*sp=='(') d++;
+                                else if(*sp==')') d--;
+                                arg[ar++]=*sp++;
+                            }
+                        }
                         else { while(*sp&&*sp!=' '&&*sp!='\t'&&ar<(int)sizeof(arg)-1) arg[ar++]=*sp++; }
                         arg[ar]=0;
-                        ai += snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                        /* translate the argument */
+                        if(arg[0]=='$' && arg[1]=='(' && arg[2]=='('){
+                            /* $((expr)) — int result, convert to string via __sh_fmt */
+                            char *e=translate_expr(arg);
+                            ai += snprintf(args+ai,sizeof(args)-ai,"__sh_fmt(\"%%d\",(int)(%s)),",e);
+                            free(e);
+                        } else if(arg[0]=='$' && arg[1]=='('){
+                            /* $(cmd) — string result */
+                            char *e=translate_expr(arg);
+                            ai += snprintf(args+ai,sizeof(args)-ai,"%s,",e);
+                            free(e);
+                        } else if(arg[0]=='$'){
+                            /* $var — string variable */
+                            char *e=translate_expr(arg);
+                            ai += snprintf(args+ai,sizeof(args)-ai,"%s,",e);
+                            free(e);
+                        } else {
+                            ai += snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                        }
                         nargs++;
                     }
                     ai += snprintf(args+ai,sizeof(args)-ai,"NULL}");
@@ -2639,9 +2685,33 @@ static void emit_node(FILE *out, Node *n){
                     }
                 } else {
                     add_var(n->argv[i],V_STR);
-                    char *e=translate_expr(eq+1);
-                    fprintf(out,"    strncpy(%s,%s,sizeof(%s)-1); %s[sizeof(%s)-1]=0;\n",cn,e,cn,cn,cn);
-                    free(e);
+                    /* handle quoted strings with variable expansion */
+                    const char *val=eq+1;
+                    if(val[0]=='"' || val[0]=='\''){
+                        /* strip quotes */
+                        char inner[1024]; int il=0;
+                        const char *vp=val+1;
+                        while(*vp && *vp!=val[0] && il<(int)sizeof(inner)-1) inner[il++]=*vp++;
+                        inner[il]=0;
+                        if(strchr(inner,'$')){
+                            /* expand variables */
+                            ExpandResult er; expand_string(inner,&er);
+                            fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",cn,cn,er.fmt);
+                            for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                            fprintf(out,");\n");
+                            expand_free(&er);
+                        } else {
+                            fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,inner,cn);
+                        }
+                    } else if(strchr(val,'$')){
+                        ExpandResult er; expand_string(val,&er);
+                        fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",cn,cn,er.fmt);
+                        for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                        fprintf(out,");\n");
+                        expand_free(&er);
+                    } else {
+                        fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,val,cn);
+                    }
                 }
                 *eq='=';
             } else {
