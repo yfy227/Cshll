@@ -3208,6 +3208,7 @@ static int is_assignment(const char *t){
 }
 
 /* Check if token is an append assignment (+=, -=, etc.) */
+static int is_append_assign(const char *t) __attribute__((unused));
 static int is_append_assign(const char *t){
     const char *p=strstr(t,"+=");
     if(p && p>t){
@@ -3401,7 +3402,7 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
             snprintf(arith,sizeof(arith),"$((%s))",expr);
             char *e=translate_expr(arith);
             Node *nd=new_node(NODE_CMD,lineno);
-            nd->argv=malloc(2*sizeof(char*));
+            nd->argv=malloc(3*sizeof(char*));
             nd->argv[0]=xstrdup("__arith");
             nd->argv[1]=xstrdup(e);
             nd->argc=2;
@@ -3567,7 +3568,7 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
 
         if(!strcmp(kw,"local")||!strcmp(kw,"declare")||!strcmp(kw,"typeset")){
             /* declare/typeset/local: parse flags and variable assignments */
-            int is_int=0, is_array=0, is_readonly=0;
+            int is_int=0, is_array=0, is_readonly=0; (void)is_readonly;
             int start=1;
             /* parse flags */
             while(start<ntoks && toks[start][0]=='-' && toks[start][1]){
@@ -3671,7 +3672,6 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
                     add_var(nd->lhs,V_ARRAY);
                     /* build array append rhs */
                     char arr_rhs[4096]; arr_rhs[0]='('; arr_rhs[1]=0;
-                    const char *p=rhs[0]=='('?rhs+1:rhs;
                     for(int i=(rhs[0]=='('?1:2);i<ntoks;i++){
                         if(!strcmp(toks[i],";")) break;
                         if(!strcmp(toks[i],"(")) continue;
