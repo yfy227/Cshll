@@ -1675,7 +1675,7 @@ static char *translate_cond(const char *cond){
         s=tmp;
         /* Custom token splitter that handles $((...)), $(...), ${...}, quotes */
         char tok1[256]="",op[32]="",tok2[256]="";
-        char *toks3[4]; int nt3=0;
+        int nt3=0;
         const char *p=s;
         while(*p && nt3<3){
             while(*p==' '||*p=='\t') p++;
@@ -1707,7 +1707,7 @@ static char *translate_cond(const char *cond){
                 }
             }
             buf[bi]=0;
-            if(bi>0) toks3[nt3++]=buf;
+            if(bi>0) nt3++;
         }
         static const char *unary[]={"-z","-n","-f","-d","-e","-r","-w","-x","-s","-h","-L","-p","-S","-b","-c","-t","-g","-u","-k","-v","-O","-G","-N",NULL};
         int is_u=0;
@@ -3329,6 +3329,34 @@ static void emit_block(FILE *out, Node *n){
     emit_node(out,n);
 }
 
+/* Scan a node tree for local variable declarations */
+static void scan_locals(Node *n, char locals[][128], int *nloc, int max){
+    if(!n || *nloc>=max) return;
+    if(n->type==NODE_LOCAL){
+        for(int i=0;i<n->argc;i++){
+            char *eq=strchr(n->argv[i],'=');
+            if(eq) *eq=0;
+            if(n->argv[i][0]){
+                int found=0;
+                for(int j=0;j<*nloc;j++) if(strcmp(locals[j],n->argv[i])==0){found=1;break;}
+                if(!found && *nloc<max){
+                    strncpy(locals[*nloc],n->argv[i],127);
+                    locals[*nloc][127]=0;
+                    (*nloc)++;
+                }
+            }
+            if(eq) *eq='=';
+        }
+    }
+    /* recurse into sub-nodes */
+    if(n->next) scan_locals(n->next,locals,nloc,max);
+    if(n->then_blk) scan_locals(n->then_blk,locals,nloc,max);
+    if(n->else_blk) scan_locals(n->else_blk,locals,nloc,max);
+    if(n->body) scan_locals(n->body,locals,nloc,max);
+    if(n->while_body) scan_locals(n->while_body,locals,nloc,max);
+    if(n->func_body) scan_locals(n->func_body,locals,nloc,max);
+}
+
 static void emit_functions(FILE *out, Node *n){
     if(!n) return;
     if(n->type==NODE_FUNC){
@@ -3336,7 +3364,33 @@ static void emit_functions(FILE *out, Node *n){
         for(int i=1;i<=9;i++)
             fprintf(out,"    char __sh_arg%d[1024]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],1023);\n",
                     i,i,i,i);
+        /* Scan for local variables and save them */
+        char locals[32][128]; int nloc=0;
+        scan_locals(n->func_body,locals,&nloc,32);
+        for(int i=0;i<nloc;i++){
+            VarKind vk=get_var_kind(locals[i]);
+            const char *cn=safe_cname(locals[i]);
+            if(vk==V_INT){
+                fprintf(out,"    int __save_%s=%s;\n",cn,cn);
+            } else if(vk==V_ARRAY){
+                /* skip array save/restore for now */
+            } else {
+                fprintf(out,"    char __save_%s[1024]; strncpy(__save_%s,%s,sizeof(__save_%s)-1);\n",cn,cn,cn,cn);
+            }
+        }
         emit_node(out,n->func_body);
+        /* Restore local variables */
+        for(int i=0;i<nloc;i++){
+            VarKind vk=get_var_kind(locals[i]);
+            const char *cn=safe_cname(locals[i]);
+            if(vk==V_INT){
+                fprintf(out,"    %s=__save_%s;\n",cn,cn);
+            } else if(vk==V_ARRAY){
+                /* skip */
+            } else {
+                fprintf(out,"    strncpy(%s,__save_%s,sizeof(%s)-1);\n",cn,cn,cn);
+            }
+        }
         fprintf(out,"}\n\n");
     }
     emit_functions(out,n->next);
