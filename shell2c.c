@@ -132,6 +132,26 @@ static int is_user_func(const char *name){
     return 0;
 }
 
+/* Pending heredoc table — stores heredoc bodies read during pre-scan,
+ * indexed by order of appearance. The redirect parser looks them up. */
+#define MAX_HEREDOCS 64
+typedef struct { char *text; int expand; } HeredocEntry;
+static HeredocEntry heredoc_table[MAX_HEREDOCS];
+static int heredoc_count = 0;
+static int heredoc_next = 0;  /* index for redirect parser to consume */
+
+static int heredoc_store(const char *text, int expand){
+    if(heredoc_count>=MAX_HEREDOCS) return -1;
+    heredoc_table[heredoc_count].text = xstrdup(text);
+    heredoc_table[heredoc_count].expand = expand;
+    return heredoc_count++;
+}
+static const char *heredoc_consume(int *expand){
+    if(heredoc_next>=heredoc_count){ if(expand)*expand=1; return ""; }
+    if(expand) *expand = heredoc_table[heredoc_next].expand;
+    return heredoc_table[heredoc_next++].text;
+}
+
 static void add_var(const char *name, VarKind k){
     if(!name||!*name) return;
     for(int i=0;i<var_count;i++){
@@ -153,6 +173,22 @@ static VarKind get_var_kind(const char *name){
     for(int i=0;i<var_count;i++)
         if(strcmp(var_table[i].name,name)==0) return var_table[i].kind;
     return V_STR;
+}
+/* Check if a variable is known (declared in var_table) */
+static int is_known_var(const char *name){
+    if(!name) return 0;
+    for(int i=0;i<var_count;i++)
+        if(strcmp(var_table[i].name,name)==0) return 1;
+    return 0;
+}
+/* Get C expression for a variable reference.
+ * Known vars use their C name; unknown vars use getenv("name"). */
+static const char *var_c_expr(const char *name){
+    if(is_known_var(name)) return safe_cname(name);
+    /* unknown — use getenv at runtime */
+    static char buf[256];
+    snprintf(buf,sizeof(buf),"(__sh_getenv(\"%s\"))",name);
+    return buf;
 }
 
 /* ================================================================== */
@@ -176,6 +212,7 @@ typedef struct Redir {
     int dup_fd;          /* for >&N: dup source fd, -1 otherwise */
     int is_heredoc;      /* << EOF */
     int is_herestr;      /* <<< "str" */
+    int hd_expand;       /* heredoc: expand variables (1) or literal (0) */
     int fd_high;         /* stashed unique redirect-group id for save/restore */
     struct Redir *next;
 } Redir;
@@ -260,9 +297,38 @@ static int tokenize(const char *line, char **toks, int maxtoks){
         if(!*p) break;
         /* comments */
         if(*p=='#'){ break; }
-        /* double-quoted string (keep quotes) */
+        /* double-quoted string (keep quotes, but convert backticks to $(...)) */
         if(*p=='"'){
             const char *s=p; p++;
+            /* check if there are backticks inside */
+            const char *has_bt=NULL;
+            { const char *q=p; while(*q && *q!='"'){ if(*q=='\\'&&*(q+1)) q+=2; else if(*q=='`'){has_bt=q;break;} else q++; } }
+            if(has_bt){
+                /* expand backticks to $(...) inside the quoted string */
+                char buf[4096]; int bi=0;
+                buf[bi++]='"';
+                while(*p && *p!='"' && bi<(int)sizeof(buf)-3){
+                    if(*p=='\\' && *(p+1)=='`'){ buf[bi++]='`'; p+=2; }
+                    else if(*p=='\\' && *(p+1)=='\\'){ buf[bi++]='\\'; p+=2; }
+                    else if(*p=='\\' && *(p+1)=='$'){ buf[bi++]='$'; p+=2; }
+                    else if(*p=='`'){
+                        p++;
+                        buf[bi++]='$'; buf[bi++]='(';
+                        while(*p && *p!='`' && bi<(int)sizeof(buf)-3){
+                            if(*p=='\\' && *(p+1)=='`'){ buf[bi++]='`'; p+=2; }
+                            else if(*p=='\\' && *(p+1)=='\\'){ buf[bi++]='\\'; p+=2; }
+                            else if(*p=='\\' && *(p+1)=='$'){ buf[bi++]='$'; p+=2; }
+                            else buf[bi++]=*p++;
+                        }
+                        if(*p=='`') p++;
+                        buf[bi++]=')';
+                    } else if(*p=='\\' && *(p+1)=='"'){ buf[bi++]='\\'; buf[bi++]='"'; p+=2; }
+                    else { buf[bi++]=*p++; }
+                }
+                if(*p=='"') p++;
+                buf[bi++]='"'; buf[bi]=0;
+                toks[n++]=pool_dup(buf,bi); continue;
+            }
             while(*p && *p!='"'){ if(*p=='\\'&&*(p+1)) p+=2; else p++; }
             if(*p=='"') p++;
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
@@ -272,6 +338,21 @@ static int tokenize(const char *line, char **toks, int maxtoks){
             while(*p && *p!='\'') p++;
             if(*p=='\'') p++;
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
+        }
+        /* backtick command substitution — convert to $(...) form */
+        if(*p=='`'){
+            p++;
+            char buf[2048]; int bi=0;
+            buf[bi++]='$'; buf[bi++]='(';
+            while(*p && *p!='`' && bi<(int)sizeof(buf)-3){
+                if(*p=='\\' && *(p+1)=='`'){ buf[bi++]='`'; p+=2; }
+                else if(*p=='\\' && *(p+1)=='\\'){ buf[bi++]='\\'; p+=2; }
+                else if(*p=='\\' && *(p+1)=='$'){ buf[bi++]='$'; p+=2; }
+                else { buf[bi++]=*p++; }
+            }
+            if(*p=='`') p++;
+            buf[bi++]=')'; buf[bi]=0;
+            toks[n++]=pool_dup(buf,bi); continue;
         }
         /* multi-char operators */
         if(*p==';'&&*(p+1)==';'){ toks[n++]=(char*)";;"; p+=2; continue; }
@@ -310,6 +391,8 @@ static int tokenize(const char *line, char **toks, int maxtoks){
               if(*p=='|'&&*(p+1)!='|') break;
               if(*p=='&'&&*(p+1)!='&') break;
               if(*p=='<'||*p=='>') break;
+              /* backtick inside word — break word, let backtick handler process */
+              if(*p=='`') break;
               /* $((…)) intact */
               if(*p=='$'&&*(p+1)=='('&&*(p+2)=='('){
                   p++; int d=0;
@@ -693,7 +776,7 @@ static char *translate_expr(const char *tok){
         }
         while(isalnum((unsigned char)*p)||*p=='_') name[j++]=*p++;
         name[j]=0;
-        return xstrdup(safe_cname(name));
+        return xstrdup(var_c_expr(name));
     }
     return xstrdup(tok);
 }
@@ -911,7 +994,15 @@ static void expand_string(const char *s, ExpandResult *er){
             else if(*pp=='\0'||*pp=='}') vk=get_var_kind(nm);
             fmt[fi++]='%'; fmt[fi++]=(is_int||(vk==V_INT))?'d':'s';
             if(er->nargs<EXPAND_MAX_ARGS){
-                er->args[er->nargs]=e2;
+                /* for plain ${var} of unknown var, use getenv */
+                if(*pp=='\0'||*pp=='}'){
+                    if(!is_known_var(nm) && body[0]!='#'){
+                        char buf[300]; snprintf(buf,sizeof(buf),"(__sh_getenv(\"%s\"))",nm);
+                        er->args[er->nargs]=xstrdup(buf);
+                    } else
+                        er->args[er->nargs]=e2;
+                } else
+                    er->args[er->nargs]=e2;
                 er->arg_is_int[er->nargs++]=(is_int||(vk==V_INT));
             } else free(e2);
             continue;
@@ -944,7 +1035,7 @@ static void expand_string(const char *s, ExpandResult *er){
               VarKind vk=get_var_kind(name);
               fmt[fi++]='%'; fmt[fi++]=(vk==V_INT)?'d':'s';
               if(er->nargs<EXPAND_MAX_ARGS){
-                  er->args[er->nargs]=xstrdup(safe_cname(name));
+                  er->args[er->nargs]=xstrdup(var_c_expr(name));
                   er->arg_is_int[er->nargs++]=(vk==V_INT);
               }
           } else { fmt[fi++]='$'; }
@@ -1333,16 +1424,38 @@ static void emit_redirs_apply(FILE *out, Redir *r, int id){
             fprintf(out,"    { FILE *__hf=tmpfile(); if(__hf){ fputs(%s,__hf); fputc('\\n',__hf); fflush(__hf); int __hfd=fileno(__hf); lseek(__hfd,0,SEEK_SET); dup2(__hfd,%d); clearerr(stdin); } }\n",w,p->fd);
             free(w);
         } else if(p->is_heredoc){
-            /* heredoc: write raw content to temp file */
+            /* heredoc: write content to temp file.
+             * fd_high stores expand flag (1=expand vars, 0=literal). */
             const char *content = p->heredoc?p->heredoc:"";
-            fprintf(out,"    { FILE *__hf=tmpfile(); if(__hf){ fputs(\"");
-            for(const char *c=content;*c;c++){
-                if(*c=='\\'||*c=='"') fprintf(out,"\\");
-                if(*c=='\n') fprintf(out,"\\n");
-                else if(*c=='\t') fprintf(out,"\\t");
-                else fprintf(out,"%c",*c);
+            int do_expand = p->hd_expand;
+            if(do_expand && strchr(content,'$')){
+                /* expand variables using expand_string */
+                ExpandResult er; expand_string(content,&er);
+                fprintf(out,"    { FILE *__hf=tmpfile(); if(__hf){ char __hdb[16384]; snprintf(__hdb,sizeof(__hdb),\"");
+                /* escape the format string */
+                for(const char *c=er.fmt;*c;c++){
+                    if(*c=='\\'||*c=='"') fprintf(out,"\\");
+                    if(*c=='\n') fprintf(out,"\\n");
+                    else if(*c=='\t') fprintf(out,"\\t");
+                    else fprintf(out,"%c",*c);
+                }
+                fprintf(out,"\"");
+                for(int ai=0;ai<er.nargs;ai++){
+                    fprintf(out,",%s",er.args[ai]);
+                }
+                fprintf(out,"); fputs(__hdb,__hf); fflush(__hf); int __hfd=fileno(__hf); lseek(__hfd,0,SEEK_SET); dup2(__hfd,%d); clearerr(stdin); } }\n",p->fd);
+                expand_free(&er);
+            } else {
+                /* literal content (quoted delimiter or no vars) */
+                fprintf(out,"    { FILE *__hf=tmpfile(); if(__hf){ fputs(\"");
+                for(const char *c=content;*c;c++){
+                    if(*c=='\\'||*c=='"') fprintf(out,"\\");
+                    if(*c=='\n') fprintf(out,"\\n");
+                    else if(*c=='\t') fprintf(out,"\\t");
+                    else fprintf(out,"%c",*c);
+                }
+                fprintf(out,"\",__hf); fflush(__hf); int __hfd=fileno(__hf); lseek(__hfd,0,SEEK_SET); dup2(__hfd,%d); clearerr(stdin); } }\n",p->fd);
             }
-            fprintf(out,"\",__hf); fflush(__hf); int __hfd=fileno(__hf); lseek(__hfd,0,SEEK_SET); dup2(__hfd,%d); clearerr(stdin); } }\n",p->fd);
         } else if(p->dup_fd>=0){
             fprintf(out,"    dup2(%d,%d);\n",p->dup_fd,p->fd);
         } else {
@@ -2276,15 +2389,16 @@ static void emit_node(FILE *out, Node *n){
                 const char *nx=n->argv[i+1];
                 if(nx[0]=='>'||nx[0]=='<'){ prefix_fd=atoi(t); t=nx; i++; skip=0; }
             }
-            if(t[0]=='>'||t[0]=='<'||(t[0]=='2'&&t[1]=='>')||(t[0]=='&'&&t[1]=='>')||!strcmp(t,">>")||!strcmp(t,"<<<")||!strcmp(t,">&")){
-                int fd=1,append=0,dup_fd=-1,is_hs=0; const char *file=NULL;
+            if(t[0]=='>'||t[0]=='<'||(t[0]=='2'&&t[1]=='>')||(t[0]=='&'&&t[1]=='>')||!strcmp(t,">>")||!strcmp(t,"<<<")||!strcmp(t,">&")||!strcmp(t,"<<")){
+                int fd=1,append=0,dup_fd=-1,is_hs=0,is_hd=0; const char *file=NULL;
                 const char *op=t;
                 if(op[0]=='&'&&op[1]=='>'){ fd=1; file=n->argv[i+1]; skip=1; }
                 else if(!strcmp(op,">&")){ fd=1; const char *nxt=n->argv[i+1]; if(nxt&&isdigit((unsigned char)nxt[0])){dup_fd=atoi(nxt);} else {file=nxt;} skip=1; }
                 else if(op[0]=='2'&&op[1]=='>'){ fd=2; if(op[2]=='>'){append=1;file=(op[3]?op+3:n->argv[i+1]); if(!op[3])skip=1;} else {file=(op[2]?op+2:n->argv[i+1]); if(!op[2])skip=1;} }
                 else if(op[0]=='>'&&op[1]=='>'){ fd=1; append=1; file=(op[2]?op+2:n->argv[i+1]); if(!op[2])skip=1; }
                 else if(op[0]=='>'){ fd=1; file=(op[1]?op+1:n->argv[i+1]); if(!op[1])skip=1; }
-                else if(op[0]=='<'&&op[1]=='<'&&op[2]=='<'){ fd=0; is_hs=1; file=n->argv[i+1]; skip=1; }
+                else if(!strcmp(op,"<<<")){ fd=0; is_hs=1; file=n->argv[i+1]; skip=1; }
+                else if(!strcmp(op,"<<")){ fd=0; is_hd=1; skip=0; /* heredoc text from table */ }
                 else if(op[0]=='<'){ fd=0; file=(op[1]?op+1:n->argv[i+1]); if(!op[1])skip=1; }
                 /* prefix_fd (e.g. 2>) overrides the default fd */
                 if(prefix_fd>=0) fd=prefix_fd;
@@ -2295,6 +2409,12 @@ static void emit_node(FILE *out, Node *n){
                 }
                 Redir *r;
                 if(is_hs) r=new_redir(fd,NULL,0,-1,0,1,file);
+                else if(is_hd){
+                    int hd_expand=1;
+                    const char *hd_text=heredoc_consume(&hd_expand);
+                    r=new_redir(fd,NULL,0,-1,1,0,hd_text);
+                    r->hd_expand=hd_expand;
+                }
                 else r=new_redir(fd,file,append,dup_fd,0,0,NULL);
                 r->next=NULL;
                 if(rl_tail) rl_tail->next=r;
@@ -3002,28 +3122,59 @@ static Node *parse_script(FILE *f){
         strip_comment(line);
         char *t=ltrim(line); rtrim(t);
         if(!*t) continue;
-        /* heredoc */
-        if(strstr(t,"<<") && !strstr(t,"<<<")){
-            char *pp=strstr(t,"<<"); char delim[64]="";
-            sscanf(pp+2," %63s",delim);
-            if(delim[0]=='-') memmove(delim,delim+1,strlen(delim));
-            /* strip quotes from delim */
-            int dl=(int)strlen(delim);
-            if(dl>=2 && ((delim[0]=='"'&&delim[dl-1]=='"')||(delim[0]=='\''&&delim[dl-1]=='\''))){
-                memmove(delim,delim+1,dl-2); delim[dl-2]=0;
+        /* heredoc pre-scan: find <<DELIM patterns, read bodies, store in table.
+         * Multiple heredocs per line are supported (e.g. cat <<A <<B).
+         * We DON'T skip the line — it's processed normally after. */
+        {
+            char *scan=t;
+            while((scan=strstr(scan,"<<"))!=NULL){
+                /* skip <<< (here-string) */
+                if(*(scan+2)=='<'){ scan+=3; continue; }
+                /* skip if inside $(...) — rough check: count parens before */
+                int paren_depth=0;
+                for(char *q=t;q<scan;q++){ if(*q=='(')paren_depth++; else if(*q==')')paren_depth--; }
+                if(paren_depth>0){ scan+=2; continue; }
+                /* parse delimiter */
+                char *dp=scan+2;
+                int strip_tabs=0;
+                if(*dp=='-'){ strip_tabs=1; dp++; }
+                while(*dp==' '||*dp=='\t') dp++;
+                char delim[128]; int di=0;
+                int quoted=0;
+                if(*dp=='"'||*dp=='\''){
+                    char qc=*dp; dp++; quoted=1;
+                    while(*dp && *dp!=qc && di<(int)sizeof(delim)-1) delim[di++]=*dp++;
+                    if(*dp==qc) dp++;
+                } else {
+                    while(*dp && *dp!=' ' && *dp!='\t' && *dp!=';' && *dp!='&' && *dp!='|' && di<(int)sizeof(delim)-1) delim[di++]=*dp++;
+                }
+                delim[di]=0;
+                if(di==0){ scan+=2; continue; }
+                /* read heredoc body */
+                char hdtext[16384]=""; char hdline[2048];
+                while(fgets(hdline,sizeof(hdline),f)){
+                    lineno++;
+                    hdline[strcspn(hdline,"\r\n")]=0;
+                    char *trimmed = strip_tabs ? ltrim(hdline) : hdline;
+                    /* for strip_tabs, only strip leading tabs, not spaces */
+                    if(strip_tabs){
+                        char *h=hdline;
+                        while(*h=='\t') h++;
+                        trimmed=h;
+                    } else trimmed=hdline;
+                    if(strcmp(trimmed,delim)==0) break;
+                    strncat(hdtext,hdline,sizeof(hdtext)-strlen(hdtext)-2);
+                    strcat(hdtext,"\n");
+                }
+                /* store in table (expand=1 for unquoted, 0 for quoted) */
+                heredoc_store(hdtext, !quoted);
+                /* replace <<DELIM with << in the line so tokenizer sees << */
+                /* shift the rest of the line left */
+                char *rest=dp;
+                /* move rest of line over the delimiter */
+                memmove(scan+2,rest,strlen(rest)+1);
+                scan+=2;
             }
-            *pp=0; rtrim(t);
-            char hdtext[16384]=""; char hdline[2048];
-            while(fgets(hdline,sizeof(hdline),f)){
-                lineno++;
-                hdline[strcspn(hdline,"\r\n")]=0;
-                if(!strcmp(ltrim(hdline),delim)) break;
-                strncat(hdtext,hdline,sizeof(hdtext)-strlen(hdtext)-2);
-                strcat(hdtext,"\n");
-            }
-            Node *nd=new_node(NODE_HEREDOC,lineno);
-            nd->heredoc_text=xstrdup(hdtext);
-            parser_append(nd); continue;
         }
         char linecopy[8192]; strncpy(linecopy,t,8191); linecopy[8191]=0;
         char *toks[512]; int ntoks=tokenize(linecopy,toks,512);
@@ -3081,6 +3232,9 @@ static const char *RT_HEADER =
 "  /* look up env */\n"
 "  const char *v=getenv(vn); if(v) return v;\n"
 "  return \"\";\n"
+"}\n"
+"static const char *__sh_getenv(const char *name){\n"
+"  const char *v=getenv(name); return v?v:\"\";\n"
 "}\n"
 "static const char *__sh_substr(const char *s,int off,int len){\n"
 "  int n=(int)strlen(s);\n"
