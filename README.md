@@ -5,7 +5,7 @@ shell script (bash/sh dialect) and emits a single, self-contained C source file
 that, when compiled, reproduces the script's behavior as a native binary — no
 shell runtime required.
 
-The transpiler itself is a single ~3 400-line C program (`shell2c.c`). It
+The transpiler itself is a single ~4 500-line C program (`shell2c.c`). It
 parses the shell script into an AST and emits C code with a rich embedded
 runtime library of 60+ builtin commands.
 
@@ -84,7 +84,13 @@ the pipe back — instead of trying to run the function as an external command.
 ```bash
 name="World"          # string variable
 count=42              # integer variable (auto-detected)
-arr=(a b c)           # array (limited support)
+arr=(a b c)           # array
+declare -i myint=42   # declare integer
+declare -a myarray    # declare array
+declare -r myconst=x  # declare readonly
+local var=val         # local variable (in function)
+var+=value            # string append
+arr+=(d e f)          # array append
 ```
 
 ### Variable Expansion
@@ -94,6 +100,7 @@ arr=(a b c)           # array (limited support)
 | `$var`             | Simple expansion                         |
 | `${var}`           | Braced expansion                         |
 | `${#var}`          | String length                            |
+| `${#arr[@]}`       | Array element count                      |
 | `${var:-default}`  | Use default if unset/empty               |
 | `${var:=default}`  | Assign default if unset/empty            |
 | `${var:+alt}`      | Use alt if set & non-empty               |
@@ -105,13 +112,20 @@ arr=(a b c)           # array (limited support)
 | `${var%%pat}`      | Remove longest suffix match              |
 | `${var/old/new}`   | Replace first occurrence                 |
 | `${var//old/new}`  | Replace all occurrences                  |
+| `${var^^}`         | Uppercase conversion                     |
+| `${var,,}`         | Lowercase conversion                     |
+| `${arr[@]}`        | All array elements                       |
+| `${arr[*]}`        | All array elements (single word)         |
+| `${arr[@]:1:2}`    | Array slice (elements 1-2)               |
+| `${arr[0]}`        | Single array element                     |
 | `$1`..`$9`         | Positional parameters                    |
 | `$#`               | Argument count                           |
 | `$?`               | Last exit status                         |
 | `$$`               | Process ID                               |
 | `$!`               | Last background PID                      |
+| `` `cmd` ``        | Backtick command substitution            |
 
-### Arithmetic `$((...))`
+### Arithmetic `$((...))` and `(( ))`
 
 All C arithmetic operators are supported:
 
@@ -119,11 +133,15 @@ All C arithmetic operators are supported:
 echo $((a + b))      # addition
 echo $((a * b))      # multiplication
 echo $((a % b))      # modulo
-echo $((a ** 2))     # power (via a*a)
+echo $((a ** 2))     # power (via __sh_pow)
 echo $((a << 2))     # bit shift
 echo $((a & b))      # bitwise and
 echo $((a > b ? 1 : 0))  # ternary
 echo $((x++))        # post-increment
+((y = x * 2))       # arithmetic assignment
+if (( x > 5 )); then # arithmetic test
+    echo "x > 5"
+fi
 ```
 
 ### Conditionals
@@ -187,10 +205,27 @@ cmd 2> file                  # stderr to file
 cmd > file 2>&1              # stdout+stderr to file
 cmd < file                   # stdin from file
 cmd <<< "text"               # here-string
-cmd <<EOF                    # heredoc
+cmd <<EOF                    # heredoc (variables expanded)
 line1
 line2
 EOF
+cmd <<'EOF'                  # heredoc (literal, no expansion)
+$var stays literal
+EOF
+cmd <<-EOF                   # heredoc (strip leading tabs)
+        indented
+EOF
+diff <(cmd1) <(cmd2)         # process substitution
+```
+
+### Brace Expansion
+
+```bash
+echo {a,b,c}                 # → a b c
+echo {1..10}                 # → 1 2 3 4 5 6 7 8 9 10
+echo {a..z}                  # → a b c ... z
+echo pre{x,y}post            # → prexpost preypost
+echo file.{txt,sh,c}         # → file.txt file.sh file.c
 ```
 
 ### Compound Commands
