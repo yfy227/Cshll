@@ -2825,11 +2825,13 @@ static void emit_node(FILE *out, Node *n){
             fprintf(out,"    }\n");
         } else {
             const char *vn=safe_cname(n->for_var);
-            /* Check if the list is a single unquoted $var — if so, word-split it */
-            int do_split = (n->for_len==1 && n->for_list[0][0]=='$'
+            /* Check if the list is a single unquoted $var or $(cmd) — if so, word-split */
+            int do_split_var = (n->for_len==1 && n->for_list[0][0]=='$'
                             && n->for_list[0][1]!='{' && n->for_list[0][1]!='('
                             && get_var_kind(n->for_list[0]+1)==V_STR);
-            if(do_split){
+            int do_split_cmd = (n->for_len==1 && n->for_list[0][0]=='$'
+                            && n->for_list[0][1]=='(');
+            if(do_split_var){
                 const char *vname = safe_cname(n->for_list[0]+1);
                 fprintf(out,"    {\n");
                 fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
@@ -2848,6 +2850,28 @@ static void emit_node(FILE *out, Node *n){
                 emit_node(out,n->body);
                 fprintf(out,"        *__se=__sc; __sv=( *__se?__se:__se);\n");
                 fprintf(out,"        __sv=__se; if(*__sv)__sv++;\n");
+                fprintf(out,"    }\n");
+                fprintf(out,"    }\n");
+            } else if(do_split_cmd){
+                /* $(cmd) — execute, word-split output, iterate */
+                char *w=emit_word(out,n->for_list[0]);
+                fprintf(out,"    {\n");
+                fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",w);
+                free(w);
+                fprintf(out,"    char *__sv=__sbuf;\n");
+                fprintf(out,"    while(*__sv){\n");
+                fprintf(out,"        while(*__sv==' '||*__sv=='\\t'||*__sv=='\\n')__sv++;\n");
+                fprintf(out,"        if(!*__sv)break;\n");
+                fprintf(out,"        char *__se=__sv;\n");
+                fprintf(out,"        while(*__se&&*__se!=' '&&*__se!='\\t'&&*__se!='\\n')__se++;\n");
+                fprintf(out,"        char __sc=*__se; *__se=0;\n");
+                VarKind vk=get_var_kind(n->for_var);
+                if(vk==V_INT)
+                    fprintf(out,"        %s=atoi(__sv);\n",vn);
+                else
+                    fprintf(out,"        strncpy(%s,__sv,sizeof(%s)-1); %s[sizeof(%s)-1]=0;\n",vn,vn,vn,vn);
+                emit_node(out,n->body);
+                fprintf(out,"        *__se=__sc; __sv=__se; if(*__sv)__sv++;\n");
                 fprintf(out,"    }\n");
                 fprintf(out,"    }\n");
             } else {
@@ -3152,10 +3176,66 @@ static void parse_for_header(const char *src,char *var,char ***list,int *len){
     if(strncmp(ls,"in",2)==0) ls+=2;
     while(isspace((unsigned char)*ls))ls++;
     *list=malloc(64*sizeof(char*)); *len=0;
-    char *tok=strtok(ls," \t");
-    while(tok&&strcmp(tok,";")&&strcmp(tok,"do")){
-        (*list)[(*len)++]=xstrdup(tok);
-        tok=strtok(NULL," \t");
+    /* parse list items, handling $(...), $((...)), ${...}, quotes */
+    char *s=ls;
+    while(*s && *len<63){
+        while(*s==' '||*s=='\t') s++;
+        if(!*s || *s==';') break;
+        if(!strncmp(s,"do",2) && (s[2]==' '||s[2]=='\t'||s[2]==0)) break;
+        char item[512]; int il=0;
+        if(*s=='"'){
+            s++;
+            while(*s && *s!='"' && il<(int)sizeof(item)-1){
+                if(*s=='\\' && *(s+1)) s++;
+                item[il++]=*s++;
+            }
+            if(*s=='"') s++;
+        } else if(*s=='\''){
+            s++;
+            while(*s && *s!='\'' && il<(int)sizeof(item)-1) item[il++]=*s++;
+            if(*s=='\'') s++;
+        } else if(*s=='$' && *(s+1)=='('){
+            /* $(...) or $((...)) — read as single unit */
+            item[il++]='$'; s++;
+            item[il++]='('; s++;
+            int d=1;
+            while(*s && d && il<(int)sizeof(item)-1){
+                if(*s=='(') d++;
+                else if(*s==')') d--;
+                item[il++]=*s++;
+            }
+        } else if(*s=='$' && *(s+1)=='{'){
+            /* ${...} — read as single unit */
+            item[il++]='$'; s++;
+            item[il++]='{'; s++;
+            while(*s && *s!='}' && il<(int)sizeof(item)-1) item[il++]=*s++;
+            if(*s=='}') item[il++]=*s++;
+        } else {
+            while(*s && *s!=' ' && *s!='\t' && *s!=';' && il<(int)sizeof(item)-1){
+                if(*s=='$' && *(s+1)=='('){
+                    /* $(...) inside word */
+                    item[il++]='$'; s++;
+                    item[il++]='('; s++;
+                    int d=1;
+                    while(*s && d && il<(int)sizeof(item)-1){
+                        if(*s=='(') d++;
+                        else if(*s==')') d--;
+                        item[il++]=*s++;
+                    }
+                } else if(*s=='$' && *(s+1)=='{'){
+                    item[il++]='$'; s++;
+                    item[il++]='{'; s++;
+                    while(*s && *s!='}' && il<(int)sizeof(item)-1) item[il++]=*s++;
+                    if(*s=='}') item[il++]=*s++;
+                } else {
+                    item[il++]=*s++;
+                }
+            }
+        }
+        item[il]=0;
+        if(il>0){
+            (*list)[(*len)++]=xstrdup(item);
+        }
     }
 }
 
