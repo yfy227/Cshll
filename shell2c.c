@@ -3661,7 +3661,13 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
                         cnd->case_default=NULL;
                         parse_insert=&cnd->case_default;
                     } else {
-                        cnd->case_pats[ci]=xstrdup(toks[0]);
+                        /* Collect all tokens before ) as the pattern */
+                        char pat[512]="";
+                        for(int i=0;i<pp;i++){
+                            if(i>0) strncat(pat,"",sizeof(pat)-strlen(pat)-1);
+                            strncat(pat,toks[i],sizeof(pat)-strlen(pat)-1);
+                        }
+                        cnd->case_pats[ci]=xstrdup(pat);
                         cnd->case_bodies[ci]=NULL;
                         cnd->case_count++;
                         parse_insert=&cnd->case_bodies[ci];
