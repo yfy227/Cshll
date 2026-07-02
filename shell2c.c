@@ -402,6 +402,34 @@ static int tokenize(const char *line, char **toks, int maxtoks){
           while(*p&&*p!=' '&&*p!='\t'&&*p!='"'&&*p!='\''){
               if(*p=='\\'&&*(p+1)){ p+=2; continue; }  /* escape next char */
               if(*p=='#'&&p>s) break;
+              /* check for array index pattern: name[key]= or name[key] */
+              if(*p=='[' && p>s && (isalnum((unsigned char)*(p-1))||*(p-1)=='_')){
+                  /* look for matching ] */
+                  const char *rb=p+1; int bd=1;
+                  while(*rb && bd){
+                      if(*rb=='[') bd++;
+                      else if(*rb==']') bd--;
+                      if(bd) rb++;
+                  }
+                  if(*rb==']' && (*(rb+1)=='='||(*(rb+1)=='+'&&*(rb+2)=='=')||*(rb+1)==0||*(rb+1)==' '||*(rb+1)==';')){
+                      /* array index pattern — skip to after ] */
+                      p=rb+1;
+                      /* if followed by =, include the =value part */
+                      if(*p=='='){
+                          p++;
+                          /* include quoted value */
+                          if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1))p++; p++; } if(*p=='"')p++; }
+                          else if(*p=='\''){ p++; while(*p&&*p!='\'') p++; if(*p=='\'')p++; }
+                          else { while(*p&&*p!=' '&&*p!='\t'&&*p!=';'&&*p!='&'&&*p!='|') p++; }
+                      } else if(*p=='+'&&*(p+1)=='='){
+                          p+=2;
+                          if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1))p++; p++; } if(*p=='"')p++; }
+                          else { while(*p&&*p!=' '&&*p!='\t'&&*p!=';'&&*p!='&'&&*p!='|') p++; }
+                      }
+                      continue;
+                  }
+                  break; /* not an array pattern, break on [ */
+              }
               if(*p==';'||*p=='['||*p==']'||*p=='('||*p==')') break;
               if(*p=='|'&&*(p+1)!='|') break;
               if(*p=='&'&&*(p+1)!='&') break;
@@ -521,6 +549,17 @@ static int expand_braces(char **toks, int ntoks, int maxtoks){
 /* ================================================================== */
 /* L5  Expression translator  ($var, ${...}, $((...)))                */
 /* ================================================================== */
+
+/* Forward declarations for expand_string (defined later in L6) */
+#define EXPAND_MAX_ARGS 64
+typedef struct {
+    char *fmt;
+    char *args[EXPAND_MAX_ARGS];
+    int   nargs;
+    int   arg_is_int[EXPAND_MAX_ARGS];
+} ExpandResult;
+static void expand_string(const char *s, ExpandResult *er);
+static void expand_free(ExpandResult *er);
 
 static char *translate_expr(const char *tok);
 
@@ -755,6 +794,43 @@ static char *expand_cmd_subst(const char *cmd){
 
 static char *translate_expr(const char *tok){
     if(!tok) return xstrdup("0");
+    /* Handle double-quoted strings containing ${...} or $var */
+    if(tok[0]=='"' && tok[strlen(tok)-1]=='"'){
+        int len=(int)strlen(tok);
+        if(len>=2){
+            char inner[1024];
+            int n=len-2; if(n>=(int)sizeof(inner)) n=(int)sizeof(inner)-1;
+            memcpy(inner,tok+1,n); inner[n]=0;
+            /* if inner contains $, use expand_string */
+            if(strchr(inner,'$')){
+                ExpandResult er; expand_string(inner,&er);
+                static char result[8192];
+                int ri=0;
+                ri+=snprintf(result+ri,sizeof(result)-ri,"__sh_fmt(\"");
+                /* escape the format string for C string literal */
+                for(int i=0;er.fmt[i] && ri<(int)sizeof(result)-16;i++){
+                    if(er.fmt[i]=='"') result[ri++]='\\';
+                    if(er.fmt[i]=='\\') result[ri++]='\\';
+                    result[ri++]=er.fmt[i];
+                }
+                result[ri++]='"';
+                for(int i=0;i<er.nargs;i++){
+                    result[ri++]=',';
+                    int al=(int)strlen(er.args[i]);
+                    if(ri+al<(int)sizeof(result)-4){
+                        memcpy(result+ri,er.args[i],al); ri+=al;
+                    }
+                }
+                result[ri++]=')'; result[ri]=0;
+                expand_free(&er);
+                return xstrdup(result);
+            }
+            /* no $ inside — return as literal string */
+            char *r=malloc(n+3);
+            sprintf(r,"\"%s\"",inner);
+            return r;
+        }
+    }
     /* $(( expr )) — arithmetic */
     if(strncmp(tok,"$((",3)==0){
         char buf[4096]; int q=0;
@@ -974,14 +1050,7 @@ static char *translate_expr(const char *tok){
 /* ================================================================== */
 /* L6  String expander (printf-style format synthesis)                */
 /* ================================================================== */
-
-#define EXPAND_MAX_ARGS 64
-typedef struct {
-    char *fmt;
-    char *args[EXPAND_MAX_ARGS];
-    int   nargs;
-    int   arg_is_int[EXPAND_MAX_ARGS];
-} ExpandResult;
+/* ExpandResult and EXPAND_MAX_ARGS defined in L5 section above */
 
 static void expand_free(ExpandResult *er){
     free(er->fmt);
@@ -1048,13 +1117,37 @@ static void expand_string(const char *s, ExpandResult *er){
                             while(*p&&*p!='}') nm[j++]=*p++;
                             nm[j]=0; if(*p) p++;
                             if(j>0){
-                                VarKind vk=get_var_kind(nm);
-                                if(vk==V_STR){
-                                    const char *pre="atoi("; while(*pre)expr[k++]=*pre++;
-                                    const char *cn=safe_cname(nm); while(*cn)expr[k++]=*cn++;
-                                    expr[k++]=')';
+                                /* check for ${#arr[@]} — array count */
+                                if(nm[0]=='#'){
+                                    char arrn[128]; int ai=0; const char *ap=nm+1;
+                                    while(*ap && *ap!='[' && ai<(int)sizeof(arrn)-1) arrn[ai++]=*ap++;
+                                    arrn[ai]=0;
+                                    if(*ap=='[' && (!strcmp(ap,"[@]")||!strcmp(ap,"[*]"))){
+                                        const char *s="__sh_arr_count(__arr_"; while(*s)expr[k++]=*s++;
+                                        const char *cn=safe_cname(arrn); while(*cn)expr[k++]=*cn++;
+                                        expr[k++]=')';
+                                    } else {
+                                        /* ${#var} — string length */
+                                        VarKind vk=get_var_kind(nm+1);
+                                        if(vk==V_INT){
+                                            const char *s="(int)snprintf(NULL,0,\"%d\","; while(*s)expr[k++]=*s++;
+                                            const char *cn=safe_cname(nm+1); while(*cn)expr[k++]=*cn++;
+                                            expr[k++]=')';
+                                        } else {
+                                            const char *s="(int)strlen("; while(*s)expr[k++]=*s++;
+                                            const char *cn=safe_cname(nm+1); while(*cn)expr[k++]=*cn++;
+                                            expr[k++]=')';
+                                        }
+                                    }
                                 } else {
-                                    const char *cn=safe_cname(nm); while(*cn)expr[k++]=*cn++;
+                                    VarKind vk=get_var_kind(nm);
+                                    if(vk==V_STR){
+                                        const char *pre="atoi("; while(*pre)expr[k++]=*pre++;
+                                        const char *cn=safe_cname(nm); while(*cn)expr[k++]=*cn++;
+                                        expr[k++]=')';
+                                    } else {
+                                        const char *cn=safe_cname(nm); while(*cn)expr[k++]=*cn++;
+                                    }
                                 }
                             }
                         } else if(isdigit((unsigned char)*p)){
@@ -1580,8 +1673,42 @@ static char *translate_cond(const char *cond){
         int rp=(int)strlen(tmp)-1;
         while(rp>=0 && (isspace((unsigned char)tmp[rp])||tmp[rp]==']')) tmp[rp--]=0;
         s=tmp;
+        /* Custom token splitter that handles $((...)), $(...), ${...}, quotes */
         char tok1[256]="",op[32]="",tok2[256]="";
-        sscanf(s,"%255s %31s %255s",tok1,op,tok2);
+        char *toks3[4]; int nt3=0;
+        const char *p=s;
+        while(*p && nt3<3){
+            while(*p==' '||*p=='\t') p++;
+            if(!*p) break;
+            char *buf; int bufsz;
+            if(nt3==0){ buf=tok1; bufsz=256; }
+            else if(nt3==1){ buf=op; bufsz=32; }
+            else { buf=tok2; bufsz=256; }
+            int bi=0;
+            while(*p && *p!=' ' && *p!='\t' && bi<bufsz-1){
+                if(*p=='"'||*p=='\''){
+                    char qc=*p; buf[bi++]=*p++;
+                    while(*p && *p!=qc && bi<bufsz-1) buf[bi++]=*p++;
+                    if(*p==qc) buf[bi++]=*p++;
+                } else if(*p=='$' && *(p+1)=='('){
+                    buf[bi++]='$'; buf[bi++]='('; p+=2;
+                    int d=1;
+                    while(*p && d && bi<bufsz-1){
+                        if(*p=='(') d++;
+                        else if(*p==')') d--;
+                        buf[bi++]=*p++;
+                    }
+                } else if(*p=='$' && *(p+1)=='{'){
+                    buf[bi++]='$'; buf[bi++]='{'; p+=2;
+                    while(*p && *p!='}' && bi<bufsz-1) buf[bi++]=*p++;
+                    if(*p=='}') buf[bi++]=*p++;
+                } else {
+                    buf[bi++]=*p++;
+                }
+            }
+            buf[bi]=0;
+            if(bi>0) toks3[nt3++]=buf;
+        }
         static const char *unary[]={"-z","-n","-f","-d","-e","-r","-w","-x","-s","-h","-L","-p","-S","-b","-c","-t","-g","-u","-k","-v","-O","-G","-N",NULL};
         int is_u=0;
         for(int i=0;unary[i];i++) if(strcmp(tok1,unary[i])==0){is_u=1;break;}
@@ -2592,6 +2719,60 @@ static void emit_node(FILE *out, Node *n){
     switch(n->type){
 
     case NODE_ASSIGN:{
+        /* check for array element assignment (lineno=-3) */
+        if(n->lineno==-3 && n->rhs){
+            /* arr[key]=value — rhs is "key\x01value" */
+            add_var(n->lhs,V_ARRAY);
+            const char *sep=strchr(n->rhs,'\x01');
+            char akey[256]; char aval[1024];
+            if(sep){
+                int kl=(int)(sep-n->rhs);
+                if(kl>=255) kl=255;
+                memcpy(akey,n->rhs,kl); akey[kl]=0;
+                strncpy(aval,sep+1,sizeof(aval)-1); aval[sizeof(aval)-1]=0;
+            } else {
+                strncpy(akey,n->rhs,sizeof(akey)-1); akey[sizeof(akey)-1]=0;
+                aval[0]=0;
+            }
+            /* find next free index in array */
+            fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
+            /* if key is numeric, use as index; otherwise just append */
+            int is_num_key=1;
+            for(const char *q=akey;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num_key=0; break; } }
+            if(is_num_key && akey[0]){
+                fprintf(out,"    int __idx=atoi(\"%s\");\n",akey);
+                fprintf(out,"    if(__idx>=64) __idx=63;\n");
+                fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
+            } else {
+                fprintf(out,"    __arr_%s[__ai++]=",safe_cname(n->lhs));
+            }
+            /* emit value */
+            if(aval[0]=='"'){
+                char inner[1024]; int il=0;
+                const char *vp=aval+1;
+                while(*vp && *vp!='"' && il<(int)sizeof(inner)-1) inner[il++]=*vp++;
+                inner[il]=0;
+                if(strchr(inner,'$')){
+                    ExpandResult er; expand_string(inner,&er);
+                    fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                    for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                    fprintf(out,");\n");
+                    expand_free(&er);
+                } else {
+                    fprintf(out,"strdup(\"%s\");\n",inner);
+                }
+            } else if(strchr(aval,'$')){
+                ExpandResult er; expand_string(aval,&er);
+                fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                fprintf(out,");\n");
+                expand_free(&er);
+            } else {
+                fprintf(out,"strdup(\"%s\");\n",aval);
+            }
+            fprintf(out,"    }\n");
+            break;
+        }
         /* check for append (lineno=-1 for array, -2 for string) */
         if(n->lineno==-1 && n->rhs && n->rhs[0]=='('){
             /* array append: arr+=(elem1 elem2) */
@@ -2989,11 +3170,47 @@ static void emit_node(FILE *out, Node *n){
     }
 
     case NODE_WHILE:{
-        char *c=translate_cond(n->while_cond);
-        if(n->while_negate) fprintf(out,"    while(!(%s)){\n",c);
-        else                fprintf(out,"    while(%s){\n",c);
-        emit_node(out,n->while_body);
-        fprintf(out,"    }\n"); break;
+        /* Check if condition is a read command (while read -r line) */
+        if(n->while_cond && !strncmp(n->while_cond,"read",4) &&
+           (n->while_cond[4]==' '||n->while_cond[4]==0)){
+            /* Parse read variables from condition */
+            char vars[8][128]; int nv=0;
+            const char *p=n->while_cond+4;
+            while(*p && nv<8){
+                while(*p==' '||*p=='\t') p++;
+                if(!*p) break;
+                if(*p=='-'){ p++; while(*p&&*p!=' ')p++; continue; }
+                int vl=0;
+                while(*p && *p!=' ' && *p!='\t' && vl<127) vars[nv][vl++]=*p++;
+                vars[nv][vl]=0;
+                if(vl>0) nv++;
+            }
+            fprintf(out,"    { char __rb[4096];\n");
+            if(n->while_negate){
+                fprintf(out,"    while(!fgets(__rb,sizeof(__rb),stdin)){\n");
+            } else {
+                fprintf(out,"    while(fgets(__rb,sizeof(__rb),stdin)){\n");
+            }
+            fprintf(out,"    int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;\n");
+            if(nv==1){
+                fprintf(out,"    strncpy(%s,__rb,sizeof(%s)-1);\n",safe_cname(vars[0]),safe_cname(vars[0]));
+            } else if(nv>1){
+                fprintf(out,"    char *__sp=__rb; int __vi=0; char *__tok=strtok(__sp,\" \\t\");\n");
+                fprintf(out,"    while(__tok&&__vi<%d){ switch(__vi){\n",nv);
+                for(int i=0;i<nv;i++)
+                    fprintf(out,"    case %d: strncpy(%s,__tok,sizeof(%s)-1); break;\n",i,safe_cname(vars[i]),safe_cname(vars[i]));
+                fprintf(out,"    } __vi++; __tok=strtok(NULL,\" \\t\"); }\n");
+            }
+            emit_node(out,n->while_body);
+            fprintf(out,"    }\n    }\n");
+        } else {
+            char *c=translate_cond(n->while_cond);
+            if(n->while_negate) fprintf(out,"    while(!(%s)){\n",c);
+            else                fprintf(out,"    while(%s){\n",c);
+            emit_node(out,n->while_body);
+            fprintf(out,"    }\n");
+        }
+        break;
     }
 
     case NODE_FUNC: break;
@@ -3063,7 +3280,7 @@ static void emit_node(FILE *out, Node *n){
 
     case NODE_CASE:{
         char *cv=n->case_var?n->case_var:(char*)"\"\"";
-        VarKind cvk=get_var_kind(n->case_var?n->case_var:"");
+        /* cv is already a C expression from translate_expr, don't use safe_cname */
         for(int ci=0;ci<n->case_count;ci++){
             const char *pat=n->case_pats[ci];
             if(ci==0) fprintf(out,"    ");
@@ -3076,8 +3293,13 @@ static void emit_node(FILE *out, Node *n){
                 int first=1;
                 while(tok){
                     if(!first) fprintf(out,"||");
-                    if(cvk==V_INT) fprintf(out,"(%s==%s)",safe_cname(cv),tok);
-                    else fprintf(out,"(strcmp(%s,\"%s\")==0)",safe_cname(cv),tok);
+                    /* check if pattern has wildcards for fnmatch */
+                    int has_glob = (strchr(tok,'*')||strchr(tok,'?')||strchr(tok,'['));
+                    if(has_glob){
+                        fprintf(out,"(fnmatch(\"%s\",%s,0)==0)",tok,cv);
+                    } else {
+                        fprintf(out,"(strcmp(%s,\"%s\")==0)",cv,tok);
+                    }
                     first=0; tok=strtok(NULL,"|");
                 }
                 fprintf(out,"){\n");
@@ -3217,6 +3439,42 @@ static int is_append_assign(const char *t){
         return 1;
     }
     return 0;
+}
+
+/* Check if token is an array element assignment: arr[key]=value or arr[key]="value" */
+static int is_array_assignment(const char *t){
+    /* pattern: name[...]=... */
+    const char *lb=strchr(t,'[');
+    if(!lb || lb==t) return 0;
+    /* name part must be alphanumeric/underscore */
+    for(const char *q=t;q<lb;q++)
+        if(!isalnum((unsigned char)*q)&&*q!='_') return 0;
+    /* find matching ] */
+    const char *rb=strchr(lb,']');
+    if(!rb) return 0;
+    /* after ] must be = or += */
+    if(*rb!=']') return 0;
+    const char *eq=rb+1;
+    if(*eq=='+'&&*(eq+1)=='=') eq++;
+    if(*eq!='=') return 0;
+    return 1;
+}
+
+/* Extract array name from arr[key]=value */
+static void extract_array_assign(const char *t, char *name, int name_sz, char *key, int key_sz, char *val, int val_sz, int *is_append){
+    const char *lb=strchr(t,'[');
+    const char *rb=strchr(lb,']');
+    int nl=(int)(lb-t);
+    if(nl>=name_sz) nl=name_sz-1;
+    memcpy(name,t,nl); name[nl]=0;
+    int kl=(int)(rb-lb-1);
+    if(kl>=key_sz) kl=key_sz-1;
+    memcpy(key,lb+1,kl); key[kl]=0;
+    const char *eq=rb+1;
+    *is_append=0;
+    if(*eq=='+'){ *is_append=1; eq++; }
+    eq++; /* skip = */
+    strncpy(val,eq,val_sz-1); val[val_sz-1]=0;
 }
 
 static int find_op(char **toks,int n,const char *op){
@@ -3499,7 +3757,12 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
             char cb[2048]="";
             for(int i=1;i<ntoks;i++){
                 if(!strcmp(toks[i],"do")||!strcmp(toks[i],";")) break;
-                if(i>1) strcat(cb," ");
+                /* skip VAR=VALUE prefixes (e.g. IFS= read -r line) */
+                if(is_assignment(toks[i]) && i<ntoks-1 && strcmp(toks[i+1],"do")!=0 && strcmp(toks[i+1],";")!=0){
+                    /* this is a prefix assignment, skip it */
+                    continue;
+                }
+                if(cb[0]) strcat(cb," ");
                 strncat(cb,toks[i],sizeof(cb)-strlen(cb)-1);
             }
             Node *nd=new_node(NODE_WHILE,lineno);
@@ -3649,6 +3912,33 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
             parser_append(nd); return;
         }
 
+        /* array element assignment: arr[key]=value */
+        if(is_array_assignment(toks[0])){
+            char aname[128], akey[256], aval[1024]; int aapp=0;
+            extract_array_assign(toks[0],aname,sizeof(aname),akey,sizeof(akey),aval,sizeof(aval),&aapp);
+            add_var(aname,V_ARRAY);
+            Node *nd=new_node(NODE_ASSIGN,lineno);
+            nd->lhs=xstrdup(aname);
+            /* store key and value in rhs as "key\x01value" */
+            char rhs[1280];
+            snprintf(rhs,sizeof(rhs),"%s\x01%s",akey,aval);
+            nd->rhs=xstrdup(rhs);
+            nd->lineno = -3; /* signal array element assignment */
+            /* collect remaining tokens for value if needed */
+            if(!aval[0] && ntoks>1){
+                char fullval[1024]="";
+                for(int i=1;i<ntoks;i++){
+                    if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
+                    if(fullval[0]) strncat(fullval," ",sizeof(fullval)-strlen(fullval)-1);
+                    strncat(fullval,toks[i],sizeof(fullval)-strlen(fullval)-1);
+                }
+                snprintf(rhs,sizeof(rhs),"%s\x01%s",akey,fullval);
+                free(nd->rhs);
+                nd->rhs=xstrdup(rhs);
+            }
+            parser_append(nd); return;
+        }
+
         /* assignment */
         if(is_assignment(toks[0])){
             /* detect += -= *= /= %= */
@@ -3747,6 +4037,27 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
         /* pipe — build left-associative chain: ((a|b)|c)|d */
         { int pp=find_op(toks,ntoks,"|");
           if(pp>=0){
+              /* Check if any stage starts with a block keyword (while, for, etc.)
+               * If so, don't create a pipe — let the block keyword handler parse it.
+               * The pipe input will be handled by the block's stdin. */
+              int has_block_kw=0;
+              {
+                  int start=0;
+                  for(int i=0;i<=ntoks;i++){
+                      if(i==ntoks || (i>0 && !strcmp(toks[i],"|"))){
+                          if(start<ntoks){
+                              const char *kw=toks[start];
+                              if(!strcmp(kw,"while")||!strcmp(kw,"until")||
+                                 !strcmp(kw,"for")||!strcmp(kw,"if")||
+                                 !strcmp(kw,"case")||!strcmp(kw,"{")){
+                                  has_block_kw=1; break;
+                              }
+                          }
+                          start=i+1;
+                      }
+                  }
+              }
+              if(!has_block_kw){
               Node *stages[32]; int ns=0;
               int start=0;
               while(start<ntoks && ns<32){
@@ -3768,6 +4079,7 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
                   result=pipe;
               }
               parser_append(result); return;
+              }
           }
         }
 
