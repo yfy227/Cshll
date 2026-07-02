@@ -645,7 +645,20 @@ static char *translate_brace_expansion(const char *body){
         while(*p && *p!='}') def[d++]=*p++;
         def[d]=0;
         char r[512];
-        const char *cn=safe_cname(name);
+        /* Determine the C expression for the variable */
+        const char *cn;
+        char cnbuf[300];
+        if(isdigit((unsigned char)name[0])){
+            /* positional parameter: $1 -> __sh_arg1 */
+            snprintf(cnbuf,sizeof(cnbuf),"__sh_arg%s",name);
+            cn=cnbuf;
+        } else if(is_known_var(name)){
+            cn=safe_cname(name);
+        } else {
+            /* unknown variable — use getenv */
+            snprintf(cnbuf,sizeof(cnbuf),"(__sh_getenv(\"%s\"))",name);
+            cn=cnbuf;
+        }
         switch(op){
             case '-': snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def); break;
             case '=': snprintf(r,sizeof(r),"(%s[0]?%s:(strncpy(%s,\"%s\",sizeof(%s)-1),%s))",cn,cn,cn,def,cn,cn); break;
@@ -1710,6 +1723,32 @@ static char *translate_cond(const char *cond){
             if(bi>0) nt3++;
         }
         static const char *unary[]={"-z","-n","-f","-d","-e","-r","-w","-x","-s","-h","-L","-p","-S","-b","-c","-t","-g","-u","-k","-v","-O","-G","-N",NULL};
+        /* Handle [ ! ... ] — negation */
+        if(!strcmp(tok1,"!") && op[0]){
+            /* shift: tok1=op, op=tok2, tok2="" */
+            char t[256]; strncpy(t,tok1,255); t[255]=0;
+            strncpy(tok1,op,255); tok1[255]=0;
+            strncpy(op,tok2,31); op[31]=0;
+            tok2[0]=0;
+            /* re-check unary */
+            int is_u2=0;
+            for(int i=0;unary[i];i++) if(strcmp(tok1,unary[i])==0){is_u2=1;break;}
+            if(is_u2){
+                char tmp[256]; strncpy(tmp,op,255); tmp[255]=0;
+                strncpy(op,tok1,31); op[31]=0;
+                strncpy(tok1,tmp,255); tok1[255]=0; tok2[0]=0;
+            }
+            if(op[0]){
+                char *r=translate_test_unary(op,tok1);
+                snprintf(buf,sizeof(buf),"(!%s)",r);
+                return buf;
+            }
+            /* bare [ ! string ] */
+            char *e=translate_expr(tok1);
+            snprintf(buf,sizeof(buf),"(!(%s[0]!='\\0'))",e);
+            free(e);
+            return buf;
+        }
         int is_u=0;
         for(int i=0;unary[i];i++) if(strcmp(tok1,unary[i])==0){is_u=1;break;}
         if(is_u){
@@ -1804,10 +1843,19 @@ static char *emit_word(FILE *out, const char *word){
         return r;
     }
     char inner[4096];
-    if((word[0]=='"'||word[0]=='\'')&&strlen(word)>=2){
+    /* Single-quoted strings are literal — no variable expansion */
+    if(word[0]=='\'' && strlen(word)>=2){
         strncpy(inner,word+1,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
         int l=(int)strlen(inner);
-        if(l>0&&(inner[l-1]=='"'||inner[l-1]=='\'')) inner[--l]=0;
+        if(l>0 && inner[l-1]=='\'') inner[--l]=0;
+        char *r=malloc(strlen(inner)+3);
+        sprintf(r,"\"%s\"",inner);
+        return r;
+    }
+    if((word[0]=='"')&&strlen(word)>=2){
+        strncpy(inner,word+1,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
+        int l=(int)strlen(inner);
+        if(l>0&&inner[l-1]=='"') inner[--l]=0;
     } else {
         strncpy(inner,word,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
     }
@@ -2535,8 +2583,9 @@ static void emit_command(FILE *out, char **argv, int ac, int id){
     }
     if(!strcmp(cmd,"[")){
         /* [ ... ] — last arg should be ] */
-        char buf[1024]=""; int bl=0;
-        for(int i=1;i<ac-1;i++){ if(i>1) bl+=snprintf(buf+bl,sizeof(buf)-bl," "); bl+=snprintf(buf+bl,sizeof(buf)-bl,"%s",argv[i]); }
+        char buf[1024]="["; int bl=1;
+        for(int i=1;i<ac-1;i++){ bl+=snprintf(buf+bl,sizeof(buf)-bl," %s",argv[i]); }
+        bl+=snprintf(buf+bl,sizeof(buf)-bl," ]");
         char *c=translate_cond(buf);
         fprintf(out,"    __exit_status=(%s)?0:1;\n",c);
         return;
@@ -3812,7 +3861,13 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
             BlkFrame fr={BLK_FOR,nd,&nd->body,_pi};
             parser_push(fr); parse_insert=&nd->body; return;
         }
-        if(!strcmp(kw,"do")) return;
+        if(!strcmp(kw,"do")){
+            /* If there are more tokens after 'do', dispatch them as body */
+            if(ntoks>1){
+                dispatch_segment(toks+1,ntoks-1,lineno);
+            }
+            return;
+        }
         if(!strcmp(kw,"while")||!strcmp(kw,"until")){
             char cb[2048]="";
             for(int i=1;i<ntoks;i++){
@@ -4538,10 +4593,16 @@ static const char *RT_HEADER =
 "  if(path)fclose(f);\n"
 "}\n"
 "static void __attribute__((unused)) __b_tr(const char *s1,const char *s2){\n"
-"  int c; int l1=(int)strlen(s1), l2=(int)strlen(s2);\n"
+"  /* Expand ranges like a-z, A-Z, 0-9 in s1 and s2 */\n"
+"  char exp1[256], exp2[256]; int e1=0, e2=0;\n"
+"  for(int i=0;s1[i]&&e1<255;i++){ if(s1[i]=='-'&&i>0&&s1[i+1]&&e1>0){ char lo=exp1[e1-1], hi=s1[i+1]; for(char c=lo+1;c<=hi&&e1<255;c++) exp1[e1++]=c; i++; } else exp1[e1++]=s1[i]; }\n"
+"  exp1[e1]=0;\n"
+"  for(int i=0;s2[i]&&e2<255;i++){ if(s2[i]=='-'&&i>0&&s2[i+1]&&e2>0){ char lo=exp2[e2-1], hi=s2[i+1]; for(char c=lo+1;c<=hi&&e2<255;c++) exp2[e2++]=c; i++; } else exp2[e2++]=s2[i]; }\n"
+"  exp2[e2]=0;\n"
+"  int c; int l2=e2;\n"
 "  while((c=fgetc(stdin))!=EOF){\n"
-"    const char *p=strchr(s1,c);\n"
-"    if(p){ int idx=(int)(p-s1); putchar(idx<l2?s2[idx]:(l2>0?s2[l2-1]:c)); }\n"
+"    const char *p=strchr(exp1,c);\n"
+"    if(p){ int idx=(int)(p-exp1); putchar(idx<l2?exp2[idx]:(l2>0?exp2[l2-1]:c)); }\n"
 "    else putchar(c);\n"
 "  }\n"
 "}\n"
