@@ -362,6 +362,20 @@ static int tokenize(const char *line, char **toks, int maxtoks){
             if(*(p+2)=='<'){ toks[n++]=(char*)"<<<"; p+=3; continue; }
             toks[n++]=(char*)"<<"; p+=2; continue;
         }
+        /* process substitution: <(...) or >(...) */
+        if((*p=='<'||*p=='>')&&*(p+1)=='('){
+            char ps_buf[2048]; int pi=0;
+            ps_buf[pi++]=*p++; ps_buf[pi++]='('; p++; /* skip the ( */
+            int d=1;
+            while(*p && d && pi<(int)sizeof(ps_buf)-2){
+                if(*p=='(') d++;
+                else if(*p==')'){ d--; if(d==0) break; }
+                ps_buf[pi++]=*p++;
+            }
+            if(*p==')') p++;
+            ps_buf[pi++]=')'; ps_buf[pi]=0;
+            toks[n++]=pool_dup(ps_buf,pi); continue;
+        }
         if(*p=='>'&&*(p+1)=='>'){ toks[n++]=(char*)">>"; p+=2; continue; }
         if(*p=='<'&&*(p+1)=='>'){ toks[n++]=(char*)"<>"; p+=2; continue; }
         if(*p=='&'&&*(p+1)=='>'){ toks[n++]=(char*)"&>"; p+=2; continue; }
@@ -372,8 +386,8 @@ static int tokenize(const char *line, char **toks, int maxtoks){
         if(*p==']'&&*(p+1)==']'){ toks[n++]=(char*)"]]"; p+=2; continue; }
         if(*p=='['){             toks[n++]=(char*)"[";  p++;  continue; }
         if(*p==']'){             toks[n++]=(char*)"]";  p++;  continue; }
-        if(*p=='{'){             toks[n++]=(char*)"{";  p++;  continue; }
-        if(*p=='}'){             toks[n++]=(char*)"}";  p++;  continue; }
+        /* { and } are NOT separate tokens — they're part of words for brace expansion.
+         * Standalone { and } (surrounded by spaces) will be bare word tokens. */
         if(*p=='('&&*(p+1)=='('){ toks[n++]=(char*)"(("; p+=2; continue; }
         if(*p==')'&&*(p+1)==')'){ toks[n++]=(char*)"))"; p+=2; continue; }
         if(*p=='('){             toks[n++]=(char*)"(";  p++;  continue; }
@@ -387,7 +401,7 @@ static int tokenize(const char *line, char **toks, int maxtoks){
           while(*p&&*p!=' '&&*p!='\t'&&*p!='"'&&*p!='\''){
               if(*p=='\\'&&*(p+1)){ p+=2; continue; }  /* escape next char */
               if(*p=='#'&&p>s) break;
-              if(*p==';'||*p=='['||*p==']'||*p=='{'||*p=='}'||*p=='('||*p==')') break;
+              if(*p==';'||*p=='['||*p==']'||*p=='('||*p==')') break;
               if(*p=='|'&&*(p+1)!='|') break;
               if(*p=='&'&&*(p+1)!='&') break;
               if(*p=='<'||*p=='>') break;
@@ -414,6 +428,93 @@ static int tokenize(const char *line, char **toks, int maxtoks){
         }
     }
     toks[n]=NULL; return n;
+}
+
+/* Expand brace patterns in a token list.
+ * Handles: {a,b,c}, {1..10}, {a..z}, prefix{a,b}suffix */
+static int expand_braces(char **toks, int ntoks, int maxtoks){
+    char *out[1024]; int no=0;
+    for(int i=0;i<ntoks && no<1024;i++){
+        char *t=toks[i];
+        /* find { in the token (but not ${) */
+        char *bp=NULL;
+        for(char *p=t;*p;p++){
+            if(*p=='{' && (p==t||*(p-1)!='$')){
+                /* check for matching } */
+                int d=1; char *q=p+1;
+                while(*q && d){ if(*q=='{')d++; else if(*q=='}')d--; if(d)q++; }
+                if(*q=='}'){ bp=p; break; }
+            }
+        }
+        if(!bp){ out[no++]=t; continue; }
+        /* find matching } */
+        char *ep=bp+1; int d=1;
+        while(*ep && d){ if(*ep=='{')d++; else if(*ep=='}')d--; if(d)ep++; }
+        /* extract prefix, body, suffix */
+        char prefix[512]; int plen=(int)(bp-t);
+        memcpy(prefix,t,plen); prefix[plen]=0;
+        char suffix[512]; strcpy(suffix,ep+1);
+        char body[512]; int blen=(int)(ep-bp-1);
+        memcpy(body,bp+1,blen); body[blen]=0;
+        /* check for range: {1..10} or {a..z} */
+        char *dotdot=strstr(body,"..");
+        if(dotdot){
+            char start[64]; int sl=(int)(dotdot-body);
+            memcpy(start,body,sl); start[sl]=0;
+            char *end=dotdot+2;
+            if(start[0] && end[0]){
+                /* numeric range */
+                if(isdigit((unsigned char)start[0]) && isdigit((unsigned char)end[0])){
+                    int s=atoi(start), e=atoi(end);
+                    if(s<=e){ for(int v=s;v<=e&&no<1024;v++){
+                        char buf[600]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
+                        out[no++]=pool_dup(buf,(int)strlen(buf));
+                    } continue; }
+                    else { for(int v=s;v>=e&&no<1024;v--){
+                        char buf[600]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
+                        out[no++]=pool_dup(buf,(int)strlen(buf));
+                    } continue; }
+                }
+                /* alpha range */
+                if(strlen(start)==1 && strlen(end)==1){
+                    char s=start[0], e=end[0];
+                    if(s<=e){ for(char c=s;c<=e&&no<1024;c++){
+                        char buf[600]; snprintf(buf,sizeof(buf),"%s%c%s",prefix,c,suffix);
+                        out[no++]=pool_dup(buf,(int)strlen(buf));
+                    } continue; }
+                }
+            }
+        }
+        /* comma-separated list: {a,b,c} */
+        {
+            char *items[64]; int ni=0;
+            char *p=body; char *start=p;
+            int dd=0;
+            while(*p){
+                if(*p=='{') dd++;
+                else if(*p=='}') dd--;
+                else if(*p==',' && dd==0){
+                    if(ni<63){ items[ni++]=start; *p=0; }
+                    start=p+1;
+                }
+                p++;
+            }
+            if(ni<63) items[ni++]=start;
+            if(ni>1 || (ni==1 && strlen(items[0])>0)){
+                for(int j=0;j<ni&&no<1024;j++){
+                    char buf[1024]; snprintf(buf,sizeof(buf),"%s%s%s",prefix,items[j],suffix);
+                    out[no++]=pool_dup(buf,(int)strlen(buf));
+                }
+                continue;
+            }
+        }
+        out[no++]=t;
+    }
+    /* copy back */
+    int result = no<maxtoks?no:maxtoks;
+    for(int i=0;i<result;i++) toks[i]=out[i];
+    toks[result]=NULL;
+    return result;
 }
 
 /* ================================================================== */
@@ -1347,6 +1448,15 @@ static char *translate_cond(const char *cond){
         char *e=translate_expr(s);
         snprintf(buf,sizeof(buf),"(%s)",e); free(e); return buf;
     }
+    /* ((expr)) as condition — arithmetic test */
+    if(starts_with(s,"((")){
+        char inner[2048]; strncpy(inner,s+2,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
+        int l=(int)strlen(inner);
+        if(l>=2 && inner[l-1]==')' && inner[l-2]==')') inner[l-2]=0;
+        char arith[2100]; snprintf(arith,sizeof(arith),"$((%s))",inner);
+        char *e=translate_expr(arith);
+        snprintf(buf,sizeof(buf),"((%s)!=0)",e); free(e); return buf;
+    }
     /* true / false as condition */
     if(!strcmp(s,"true")||!strcmp(s,":")) return (char*)"1";
     if(!strcmp(s,"false")) return (char*)"0";
@@ -1374,6 +1484,29 @@ static void emit_block(FILE *out, Node *n);
 /* Emit a word as a C string expression. Returns heap string naming a C lvalue/expression. */
 static char *emit_word(FILE *out, const char *word){
     if(!word) return xstrdup("\"\"");
+    /* process substitution: <(cmd) or >(cmd) */
+    if((word[0]=='<'||word[0]=='>')&&word[1]=='('){
+        char dir=word[0]; /* '<' for input, '>' for output */
+        char cmd[2048]; int ci=0;
+        const char *p=word+2; int d=1;
+        while(*p && d && ci<(int)sizeof(cmd)-1){
+            if(*p=='(') d++;
+            else if(*p==')'){ d--; if(d==0) break; }
+            cmd[ci++]=*p++;
+        }
+        cmd[ci]=0;
+        /* escape for C string */
+        char esc[2100]; int ei=0;
+        for(int i=0;cmd[i]&&ei<(int)sizeof(esc)-4;i++){
+            if(cmd[i]=='"'||cmd[i]=='\\') esc[ei++]='\\';
+            esc[ei++]=cmd[i];
+        }
+        esc[ei]=0;
+        int id=tmp_id++;
+        fprintf(out,"    char __ps_%d[128]; snprintf(__ps_%d,sizeof(__ps_%d),\"%%s\",__sh_proc_subst(\"%s\",'%c'));\n",id,id,id,esc,dir);
+        char *r=malloc(32); snprintf(r,32,"__ps_%d",id);
+        return r;
+    }
     char inner[4096];
     if((word[0]=='"'||word[0]=='\'')&&strlen(word)>=2){
         strncpy(inner,word+1,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
@@ -1550,6 +1683,11 @@ static void emit_pipe(FILE *out, Node *n){
 /* Dispatch a single command word to its builtin or function call. */
 static void emit_command(FILE *out, char **argv, int ac, int id){
     const char *cmd=argv[0];
+    /* internal: arithmetic command from (( expr )) */
+    if(!strcmp(cmd,"__arith")&&ac>=2){
+        fprintf(out,"    __exit_status=((%s)!=0);\n",argv[1]);
+        return;
+    }
     if(!strcmp(cmd,"echo")){ emit_echo(out,argv,ac); return; }
     if(!strcmp(cmd,"printf")){
         if(ac>=2){
@@ -2389,6 +2527,10 @@ static void emit_node(FILE *out, Node *n){
                 const char *nx=n->argv[i+1];
                 if(nx[0]=='>'||nx[0]=='<'){ prefix_fd=atoi(t); t=nx; i++; skip=0; }
             }
+            /* skip process substitution <(cmd) and >(cmd) — they're arguments */
+            if((t[0]=='<'||t[0]=='>')&&t[1]=='('){
+                argv[ac++]=n->argv[i]; continue;
+            }
             if(t[0]=='>'||t[0]=='<'||(t[0]=='2'&&t[1]=='>')||(t[0]=='&'&&t[1]=='>')||!strcmp(t,">>")||!strcmp(t,"<<<")||!strcmp(t,">&")||!strcmp(t,"<<")){
                 int fd=1,append=0,dup_fd=-1,is_hs=0,is_hd=0; const char *file=NULL;
                 const char *op=t;
@@ -2815,6 +2957,48 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
             if(!parse_insert) return;
         }
 
+        /* (( expr )) — standalone arithmetic command (assignment or test) */
+        if(!strcmp(kw,"((")){
+            char expr[2048]="";
+            for(int i=1;i<ntoks;i++){
+                if(!strcmp(toks[i],"))")) break;
+                if(i>1) strcat(expr," ");
+                strncat(expr,toks[i],sizeof(expr)-strlen(expr)-1);
+            }
+            /* scan for var= or var++ or var-- and register as int */
+            {
+                const char *p=expr;
+                while(*p){
+                    if(isalpha((unsigned char)*p)||*p=='_'){
+                        char vn[128]; int vi=0;
+                        while(isalnum((unsigned char)*p)||*p=='_'){
+                            if(vi<(int)sizeof(vn)-1) vn[vi++]=*p;
+                            p++;
+                        }
+                        vn[vi]=0;
+                        /* skip whitespace before checking for = */
+                        const char *np=p;
+                        while(*np==' '||*np=='\t') np++;
+                        if(*np=='='&&*(np+1)!='=' || *np=='+'||*np=='-'){
+                            add_var(vn,V_INT);
+                        }
+                    } else p++;
+                }
+            }
+            /* translate as arithmetic expression, set __exit_status */
+            char arith[2100];
+            snprintf(arith,sizeof(arith),"$((%s))",expr);
+            char *e=translate_expr(arith);
+            Node *nd=new_node(NODE_CMD,lineno);
+            nd->argv=malloc(2*sizeof(char*));
+            nd->argv[0]=xstrdup("__arith");
+            nd->argv[1]=xstrdup(e);
+            nd->argc=2;
+            nd->argv[2]=NULL;
+            free(e);
+            parser_append(nd); return;
+        }
+
         if(!strcmp(kw,"if")){
             char cb[2048]="";
             for(int i=1;i<ntoks;i++){
@@ -3179,6 +3363,8 @@ static Node *parse_script(FILE *f){
         char linecopy[8192]; strncpy(linecopy,t,8191); linecopy[8191]=0;
         char *toks[512]; int ntoks=tokenize(linecopy,toks,512);
         if(!ntoks) continue;
+        /* expand brace patterns */
+        ntoks=expand_braces(toks,ntoks,512);
         /* split on top-level ';' and dispatch each segment */
         {
             int __ss=0;
@@ -3309,6 +3495,22 @@ static const char *RT_HEADER =
 "  if(n>0 && __sh_fn_out_buf[n-1]=='\\n') n--;\n"
 "  __sh_fn_out_buf[n]=0;\n"
 "  return __sh_fn_out_buf;\n"
+"}\n"
+"/* Process substitution: <(cmd) or >(cmd).\n"
+" * Returns a /dev/fd/N path string. For <(cmd), cmd's stdout is connected\n"
+" * to the read end. For >(cmd), cmd's stdin is connected to the write end. */\n"
+"static char __sh_ps_buf[64];\n"
+"static const char *__sh_proc_subst(const char *cmd, char dir){\n"
+"  int pfd[2]; if(pipe(pfd)<0) return \"/dev/null\";\n"
+"  pid_t pid=fork();\n"
+"  if(pid==0){\n"
+"    if(dir=='<'){ close(pfd[0]); dup2(pfd[1],1); close(pfd[1]); }\n"
+"    else { close(pfd[1]); dup2(pfd[0],0); close(pfd[0]); }\n"
+"    execl(\"/bin/sh\",\"sh\",\"-c\",cmd,(char*)NULL); _exit(127);\n"
+"  }\n"
+"  if(dir=='<'){ close(pfd[1]); snprintf(__sh_ps_buf,sizeof(__sh_ps_buf),\"/dev/fd/%d\",pfd[0]); }\n"
+"  else { close(pfd[0]); snprintf(__sh_ps_buf,sizeof(__sh_ps_buf),\"/dev/fd/%d\",pfd[1]); }\n"
+"  return __sh_ps_buf;\n"
 "}\n"
 "static void __sh_echo_escape(const char *s){\n"
 "  while(*s){ if(*s=='\\\\' && *(s+1)){ s++; switch(*s){ case 'n':putchar('\\n');break; case 't':putchar('\\t');break; case 'r':putchar('\\r');break; case '\\\\':putchar('\\\\');break; case '0':putchar('\\0');break; default:putchar(*s);break; } s++; } else putchar(*s++); }\n"
