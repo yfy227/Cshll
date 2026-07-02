@@ -1,0 +1,10 @@
+shell2c
+tests/*.c
+tests/test1
+tests/test2
+tests/test3
+tests/test4
+tests/twopipe
+*.o
+*.out
+__pycache__/
