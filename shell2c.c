@@ -574,13 +574,27 @@ static char *translate_brace_expansion(const char *body){
         p++; char idx[64]; int k=0;
         while(*p && *p!=']') idx[k++]=*p++;
         idx[k]=0; if(*p) p++;
-        /* skip } */
-        if(*p=='}') p++;
         char r[512];
         /* [@] or [*] — all elements */
         if(!strcmp(idx,"@")||!strcmp(idx,"*")){
-            snprintf(r,sizeof(r),"__sh_arr_join(__arr_%s)",safe_cname(name));
+            /* check for slice: ${arr[@]:offset:length} */
+            if(*p==':'){
+                p++; char off[32]; int oi=0;
+                while(*p && *p!=':' && *p!='}') off[oi++]=*p++;
+                off[oi]=0;
+                char len[32]=""; 
+                if(*p==':'){ p++; int li=0; while(*p&&*p!='}') len[li++]=*p++; len[li]=0; }
+                if(*p=='}') p++;
+                if(len[0])
+                    snprintf(r,sizeof(r),"__sh_arr_slice(__arr_%s,%s,%s)",safe_cname(name),off,len);
+                else
+                    snprintf(r,sizeof(r),"__sh_arr_slice(__arr_%s,%s,-1)",safe_cname(name),off);
+            } else {
+                if(*p=='}') p++;
+                snprintf(r,sizeof(r),"__sh_arr_join(__arr_%s)",safe_cname(name));
+            }
         } else {
+            if(*p=='}') p++;
             snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
         }
         return xstrdup(r);
@@ -818,9 +832,31 @@ static char *translate_expr(const char *tok){
                 }
             } else {
                 /* translate shell arithmetic ops to C */
-                if(*s=='*'&&*(s+1)=='*'){ 
-                    /* ** → treat as * for now (power not fully supported) */
-                    buf[q++]='*'; s+=2; continue; 
+                if(*s=='*'&&*(s+1)=='*'){
+                    /* ** → power operator. Use __sh_pow.
+                     * We emit a marker and close it at the next operator/space.
+                     * For simple cases like x ** 2, this works. */
+                    /* Find the base: last token in buf */
+                    int bs=q;
+                    while(bs>0 && (isalnum((unsigned char)buf[bs-1])||buf[bs-1]=='_')) bs--;
+                    if(bs<q){
+                        char base[256]; int bl=q-bs;
+                        memcpy(base,buf+bs,bl); base[bl]=0;
+                        q=bs;
+                        const char *fn="__sh_pow("; while(*fn) buf[q++]=*fn++;
+                        for(int bi=0;base[bi];bi++) buf[q++]=base[bi];
+                        buf[q++]=',';
+                        s+=2;
+                        /* now read the exponent */
+                        while(*s==' ') s++;
+                        while(*s && *s!=')' && *s!=' ' && *s!='+' && *s!='-' && *s!='*' && *s!='/' && *s!='%' && q<(int)sizeof(buf)-4){
+                            buf[q++]=*s++;
+                        }
+                        buf[q++]=')';
+                    } else {
+                        buf[q++]='*'; s+=2;
+                    }
+                    continue;
                 }
                 /* ++ -- += -= etc. pass through */
                 buf[q++]=*s++;
@@ -1079,8 +1115,27 @@ static void expand_string(const char *s, ExpandResult *er){
                         }
                     }
                     else if(*p=='*'&&*(p+1)=='*'){
-                        /* ** → * (power not fully supported) */
-                        expr[k++]='*'; p+=2;
+                        /* ** → power operator, use __sh_pow */
+                        /* skip trailing spaces in expr to find base */
+                        int bs=k;
+                        while(bs>0 && expr[bs-1]==' ') bs--;
+                        while(bs>0 && (isalnum((unsigned char)expr[bs-1])||expr[bs-1]=='_')) bs--;
+                        if(bs<k){
+                            char base[256]; int bl=k-bs;
+                            memcpy(base,expr+bs,bl); base[bl]=0;
+                            k=bs;
+                            const char *fn="__sh_pow("; while(*fn) expr[k++]=*fn++;
+                            for(int bi=0;base[bi];bi++) expr[k++]=base[bi];
+                            expr[k++]=',';
+                            p+=2;
+                            while(*p==' ') p++;
+                            while(*p && *p!=')' && *p!=' ' && *p!='+' && *p!='-' && *p!='*' && *p!='/' && *p!='%' && k<(int)sizeof(expr)-4){
+                                expr[k++]=*p++;
+                            }
+                            expr[k++]=')';
+                        } else {
+                            expr[k++]='*'; p+=2;
+                        }
                     }
                     else { expr[k++]=*p++; }
                     if(k>=(int)sizeof(expr)-2) break;
@@ -2831,7 +2886,39 @@ static void emit_node(FILE *out, Node *n){
                             && get_var_kind(n->for_list[0]+1)==V_STR);
             int do_split_cmd = (n->for_len==1 && n->for_list[0][0]=='$'
                             && n->for_list[0][1]=='(');
-            if(do_split_var){
+            /* Check for ${arr[@]} or ${arr[*]} — array iteration */
+            int do_array_iter = 0;
+            char arr_name[128];
+            if(n->for_len==1){
+                const char *item=n->for_list[0];
+                /* check for "${arr[@]}" (quoted) or ${arr[@]} (unquoted) */
+                const char *p=item;
+                if(*p=='"') p++; /* skip opening quote */
+                if(*p=='$' && *(p+1)=='{'){
+                    p+=2;
+                    int aj=0;
+                    while(*p && *p!='[' && *p!='}' && aj<(int)sizeof(arr_name)-1) arr_name[aj++]=*p++;
+                    arr_name[aj]=0;
+                    if(*p=='[' && (!strcmp(p,"[@]}")||!strcmp(p,"[@]\"}")||!strcmp(p,"[*]}")||!strcmp(p,"[*]\"}"))){
+                        if(get_var_kind(arr_name)==V_ARRAY){
+                            do_array_iter=1;
+                        }
+                    }
+                }
+            }
+            if(do_array_iter){
+                /* iterate over array elements directly */
+                fprintf(out,"    {\n");
+                fprintf(out,"    for(int __ai=0;__arr_%s[__ai];__ai++){\n",safe_cname(arr_name));
+                VarKind vk=get_var_kind(n->for_var);
+                if(vk==V_INT)
+                    fprintf(out,"    %s=atoi(__arr_%s[__ai]);\n",vn,safe_cname(arr_name));
+                else
+                    fprintf(out,"    strncpy(%s,__arr_%s[__ai],sizeof(%s)-1);\n",vn,safe_cname(arr_name),vn);
+                emit_node(out,n->body);
+                fprintf(out,"    }\n");
+                fprintf(out,"    }\n");
+            } else if(do_split_var){
                 const char *vname = safe_cname(n->for_list[0]+1);
                 fprintf(out,"    {\n");
                 fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
@@ -3858,6 +3945,18 @@ static const char *RT_HEADER =
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
 "  int n=0; while(arr[n]) n++; return n;\n"
+"}\n"
+"static long __sh_pow(long base,long exp){\n"
+"  if(exp<0) return 0;\n"
+"  long r=1; while(exp-->0) r*=base; return r;\n"
+"}\n"
+"static const char *__sh_arr_slice(const char **arr,int off,int len){\n"
+"  int n=0; while(arr[n]) n++;\n"
+"  if(off<0) off+=n; if(off<0) off=0; if(off>n) off=n;\n"
+"  int end=(len<0)?n:off+len; if(end>n) end=n;\n"
+"  __sh_arr_buf[0]=0;\n"
+"  for(int i=off;i<end;i++){ if(i>off) strncat(__sh_arr_buf,\" \",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); strncat(__sh_arr_buf,arr[i]?arr[i]:\"\",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); }\n"
+"  return __sh_arr_buf;\n"
 "}\n"
 "static const char *__sh_substr(const char *s,int off,int len){\n"
 "  int n=(int)strlen(s);\n"
