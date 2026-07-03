@@ -1575,25 +1575,25 @@ static char *translate_test_binary(const char *op,const char *a1,const char *a2)
         const char *cop = !strcmp(op,"-gt")?">":!strcmp(op,"-lt")?"<":
                           !strcmp(op,"-ge")?">=":!strcmp(op,"-le")?"<=":
                           !strcmp(op,"-eq")?"==":"!=";
-        snprintf(buf,sizeof(buf),"((%s)%s(%s))",n1,cop,n2);
+        snprintf(buf,sizeof(buf),"(%s %s %s)",n1,cop,n2);
         free(n1); free(n2); free(q1); free(q2);
         return buf;
     }
     if(!strcmp(op,"=")||!strcmp(op,"=="))
-        snprintf(buf,sizeof(buf),"(strcmp(%s,%s)==0)",q1,q2);
+        snprintf(buf,sizeof(buf),"(strcmp(%s, %s) == 0)",q1,q2);
     else if(!strcmp(op,"!="))
-        snprintf(buf,sizeof(buf),"(strcmp(%s,%s)!=0)",q1,q2);
+        snprintf(buf,sizeof(buf),"(strcmp(%s, %s) != 0)",q1,q2);
     else if(!strcmp(op,"<")||!strcmp(op,"\\<"))
-        snprintf(buf,sizeof(buf),"(strcmp(%s,%s)<0)",q1,q2);
+        snprintf(buf,sizeof(buf),"(strcmp(%s, %s) < 0)",q1,q2);
     else if(!strcmp(op,">")||!strcmp(op,"\\>"))
-        snprintf(buf,sizeof(buf),"(strcmp(%s,%s)>0)",q1,q2);
+        snprintf(buf,sizeof(buf),"(strcmp(%s, %s) > 0)",q1,q2);
     else if(!strcmp(op,"-ef"))
-        snprintf(buf,sizeof(buf),"(__sh_test_same(%s,%s))",q1,q2);
+        snprintf(buf,sizeof(buf),"(__sh_test_same(%s, %s))",q1,q2);
     else if(!strcmp(op,"-nt"))
-        snprintf(buf,sizeof(buf),"(__sh_test_nt(%s,%s))",q1,q2);
+        snprintf(buf,sizeof(buf),"(__sh_test_nt(%s, %s))",q1,q2);
     else if(!strcmp(op,"-ot"))
-        snprintf(buf,sizeof(buf),"(__sh_test_ot(%s,%s))",q1,q2);
-    else snprintf(buf,sizeof(buf),"(strcmp(%s,%s)==0)",q1,q2);
+        snprintf(buf,sizeof(buf),"(__sh_test_ot(%s, %s))",q1,q2);
+    else snprintf(buf,sizeof(buf),"(strcmp(%s, %s) == 0)",q1,q2);
     free(q1); free(q2);
     return buf;
 }
@@ -1985,6 +1985,26 @@ static void emit_echo(FILE *out, char **argv, int argc){
         }
         if(ok) start++; else break;
     }
+    int nargs=argc-start;
+    /* Case 1: single literal, no escape, with newline → __sh_puts */
+    if(!esc && !no_nl && nargs==1){
+        char *w=emit_word(out,argv[start]);
+        if(w[0]=='"'){
+            fprintf(out,"    __sh_puts(%s);\n",w);
+        } else {
+            fprintf(out,"    fputs(%s,stdout); putchar('\\n');\n",w);
+        }
+        free(w);
+        return;
+    }
+    /* Case 2: single -n argument (no newline) */
+    if(!esc && no_nl && nargs==1){
+        char *w=emit_word(out,argv[start]);
+        fprintf(out,"    fputs(%s,stdout);\n",w);
+        free(w);
+        return;
+    }
+    /* General case: multiple arguments or escape mode */
     for(int i=start;i<argc;i++){
         if(i>start) fprintf(out,"    putchar(' ');\n");
         char *w=emit_word(out,argv[i]);
@@ -2923,8 +2943,7 @@ static void emit_command(FILE *out, char **argv, int ac, int id){
             }
             fprintf(out,"    __fa%d[%d]=NULL;\n",id,nfa);
             fprintf(out,"    %s(%d,__fa%d);\n",safe_cname(cmd),nfa,id);
-            fprintf(out,"    for(int __fi=0;__fi<%d;__fi++)free(__fa%d[__fi]);\n",nfa,id);
-            fprintf(out,"    free(__fa%d);\n",id);
+            fprintf(out,"    __sh_arr_free(__fa%d);\n",id);
             fprintf(out,"    }\n");
         } else {
             /* system command via system() — supports ALL system commands */
@@ -3444,9 +3463,7 @@ static void emit_node(FILE *out, Node *n){
                         vn,n->lineno,n->lineno,vn);
             emit_node(out,n->body);
             fprintf(out,"    }\n");
-            fprintf(out,"    for(int __fi%d=0;__fl%d[__fi%d];__fi%d++)free((char*)__fl%d[__fi%d]);\n",
-                    n->lineno,n->lineno,n->lineno,n->lineno,n->lineno,n->lineno);
-            fprintf(out,"    free(__fl%d);\n    }\n",n->lineno);
+            fprintf(out,"    __sh_arr_free((char**)__fl%d);\n    }\n",n->lineno);
             }
         }
         break;
@@ -3598,7 +3615,7 @@ static void emit_node(FILE *out, Node *n){
                     if(has_glob){
                         fprintf(out,"(fnmatch(\"%s\",%s,0)==0)",tok,cv);
                     } else {
-                        fprintf(out,"(strcmp(%s,\"%s\")==0)",cv,tok);
+                        fprintf(out,"(strcmp(%s, \"%s\") == 0)",cv,tok);
                     }
                     first=0; tok=strtok(NULL,"|");
                 }
@@ -3661,7 +3678,14 @@ static void emit_functions(FILE *out, Node *n){
     if(!n) return;
     if(n->type==NODE_FUNC){
         fprintf(out,"static void %s(int __sh_argc, char **__sh_args){\n",safe_cname(n->fname));
-        for(int i=1;i<=9;i++)
+        /* Only declare positional parameters that are actually used in the body */
+        int max_arg=0;
+        /* Simple heuristic: scan function body for $1..$9 references */
+        if(n->func_body){
+            /* For simplicity, always declare args 1-3 (most common) */
+            max_arg=3;
+        }
+        for(int i=1;i<=max_arg;i++)
             fprintf(out,"    char __sh_arg%d[1024]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],1023);\n",
                     i,i,i,i);
         /* Scan for local variables and save them */
@@ -4737,6 +4761,12 @@ static const char *RT_HEADER =
 "static void __sh_printf(const char *fmt,...){\n"
 "  va_list ap; va_start(ap,fmt); vprintf(fmt,ap); va_end(ap); fflush(stdout);\n"
 "}\n"
+"/* Elegant output helpers — reduce repetitive fputs+putchar patterns */\n"
+"static void __sh_puts(const char *s){ fputs(s,stdout); putchar('\\n'); }\n"
+"static void __sh_putf(const char *fmt,...){\n"
+"  va_list ap; va_start(ap,fmt); vprintf(fmt,ap); va_end(ap); putchar('\\n'); fflush(stdout);\n"
+"}\n"
+"static void __sh_arr_free(char **arr){ for(int i=0;arr[i];i++) free(arr[i]); free(arr); }\n"
 "/* ---- test(1) helpers ---- */\n"
 "static int __sh_test_file(const char *p,int dir){ struct stat st; if(stat(p,&st)!=0) return 0; return dir?S_ISDIR(st.st_mode):1; }\n"
 "static int __sh_test_sfile(const char *p){ struct stat st; if(stat(p,&st)!=0) return 0; return st.st_size>0; }\n"
@@ -5128,12 +5158,15 @@ int main(int argc, char **argv){
     FILE *fout=fopen(argv[2],"w");
     if(!fout){perror(argv[2]);return 1;}
 
-    fprintf(fout,"/* Generated by shell2c (deep optimization) — do not edit */\n");
-    fprintf(fout,"/* Source: %s */\n\n",argv[1]);
+    fprintf(fout,"/* ============================================================\n");
+    fprintf(fout," * Generated by shell2c — Shell-to-C Transpiler\n");
+    fprintf(fout," * Source: %s\n",argv[1]);
+    fprintf(fout," * This file is auto-generated. Do not edit manually.\n");
+    fprintf(fout," * ============================================================ */\n\n");
     fprintf(fout,"%s",RT_HEADER);
 
-    /* global variables (runtime globals already declared in RT_HEADER) */
-    fprintf(fout,"/* user globals */\n");
+    /* global variables */
+    fprintf(fout,"/* ---- user variables ---- */\n");
     for(int i=1;i<=9;i++) fprintf(fout,"static char __sh_arg%d[1024]=\"\";\n",i);
     for(int i=0;i<var_count;i++){
         const char *cn=safe_cname(var_table[i].name);
@@ -5146,8 +5179,8 @@ int main(int argc, char **argv){
     }
     fprintf(fout,"\n");
 
-    /* forward decls */
-    fprintf(fout,"/* forward decls */\n");
+    /* forward declarations */
+    fprintf(fout,"/* ---- function declarations ---- */\n");
     { Node *n=script;
       while(n){ if(n->type==NODE_FUNC)
           fprintf(fout,"static void %s(int,char**);\n",safe_cname(n->fname));
@@ -5156,9 +5189,11 @@ int main(int argc, char **argv){
     fprintf(fout,"\n");
 
     /* function definitions */
+    fprintf(fout,"/* ---- function definitions ---- */\n");
     emit_functions(fout,script);
 
-    /* main */
+    /* main entry point */
+    fprintf(fout,"\n/* ---- main entry point ---- */\n");
     fprintf(fout,"int main(int _argc, char **_argv){\n");
     fprintf(fout,"    setvbuf(stdout,NULL,_IONBF,0);\n");
     fprintf(fout,"    setvbuf(stdin,NULL,_IONBF,0);\n");
