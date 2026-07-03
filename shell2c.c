@@ -712,12 +712,23 @@ static char *translate_brace_expansion(const char *body){
         char old[128]; int k=0;
         while(*p && *p!='/' && *p!='}') old[k++]=*p++;
         old[k]=0;
-        char newp[128]=""; 
+        char newp[128]="";
         if(*p=='/'){ p++; int l=0; while(*p&&*p!='}') newp[l++]=*p++; newp[l]=0; }
         if(*p=='}') p++;
         char r[512];
+        const char *cn;
+        char cnbuf[300];
+        if(isdigit((unsigned char)name[0])){
+            snprintf(cnbuf,sizeof(cnbuf),"__sh_arg%s",name);
+            cn=cnbuf;
+        } else if(is_known_var(name)){
+            cn=safe_cname(name);
+        } else {
+            snprintf(cnbuf,sizeof(cnbuf),"(__sh_getenv(\"%s\"))",name);
+            cn=cnbuf;
+        }
         snprintf(r,sizeof(r),"__sh_replace(%s,\"%s\",\"%s\",%d,%d,%d)",
-                 safe_cname(name),old,newp,global,anchor_start,anchor_end);
+                 cn,old,newp,global,anchor_start,anchor_end);
         return xstrdup(r);
     }
     /* ${var^^}  ${var,,} — case conversion */
@@ -1814,6 +1825,8 @@ static char *translate_cond(const char *cond){
 static int tmp_id=0;
 static void emit_node(FILE *out, Node *n);
 static void emit_block(FILE *out, Node *n);
+static Node *pending_pipe_cmd=NULL;
+static int pipe_restore_needed=0;
 
 /* Emit a word as a C string expression. Returns heap string naming a C lvalue/expression. */
 static char *emit_word(FILE *out, const char *word){
@@ -2870,19 +2883,57 @@ static void emit_node(FILE *out, Node *n){
                 if(*p==')') break;
                 char *q=items[ni]; int k=0;
                 while(*p && *p!=' ' && *p!='\t' && *p!=')'){
-                    if(*p=='"'){ p++; while(*p&&*p!='"') q[k++]=*p++; if(*p)p++; }
+                    if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1))p++; q[k++]=*p++; } if(*p)p++; }
                     else if(*p=='\''){ p++; while(*p&&*p!='\'') q[k++]=*p++; if(*p)p++; }
+                    else if(*p=='$' && (*(p+1)=='{' || *(p+1)=='(')){
+                        /* ${...} or $(...) — read as single unit */
+                        char open=*(p+1); char close=(open=='{')?'}':')';
+                        q[k++]=*p++;
+                        q[k++]=*p++;
+                        int d=1;
+                        while(*p && d && k<255){
+                            if(*p==open) d++;
+                            else if(*p==close) d--;
+                            q[k++]=*p++;
+                        }
+                    }
                     else q[k++]=*p++;
                 }
-                q[k]=0; if(k>0) ni++;
+                q[k]=0; if(k>0){ ni++; }
             }
             fprintf(out,"    /* array %s */\n",safe_cname(n->lhs));
-            fprintf(out,"    { const char *__ai%d[]={",n->lineno);
-            for(int i=0;i<ni;i++) fprintf(out,"\"%s\"%s",items[i],i<ni-1?",":"");
-            fprintf(out,",NULL};\n");
-            fprintf(out,"      int __an%d=%d;\n",n->lineno,ni);
-            fprintf(out,"      memcpy(__arr_%s,__ai%d,(__an%d+1)*sizeof(char*)); }\n",
-                    safe_cname(n->lhs),n->lineno,n->lineno);
+            fprintf(out,"    {\n");
+            fprintf(out,"    int __an%d=0;\n",n->lineno);
+            for(int i=0;i<ni;i++){
+                /* Check if item is an unquoted $... expansion — needs word-splitting */
+                if(items[i][0]=='$' && items[i][0]!='"' && items[i][0]!='\''){
+                    /* Unquoted variable expansion — word-split at runtime */
+                    ExpandResult er; expand_string(items[i],&er);
+                    int id=tmp_id++;
+                    fprintf(out,"    { char __tw_%d[4096]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                    fprintf(out,");\n");
+                    expand_free(&er);
+                    fprintf(out,"    char *__sp=__tw_%d;\n",id);
+                    fprintf(out,"    while(*__sp){ while(*__sp==' '||*__sp=='\\t')__sp++; if(!*__sp)break;\n");
+                    fprintf(out,"    char *__se=__sp; while(*__se&&*__se!=' '&&*__se!='\\t')__se++;\n");
+                    fprintf(out,"    char __sc=*__se; *__se=0; __arr_%s[__an%d++]=strdup(__sp); *__se=__sc; __sp=__se; if(*__sp)__sp++; }\n",safe_cname(n->lhs),n->lineno);
+                    fprintf(out,"    }\n");
+                } else if(strchr(items[i],'$')){
+                    /* Quoted or mixed item with $ — expand as single element */
+                    ExpandResult er; expand_string(items[i],&er);
+                    int id=tmp_id++;
+                    fprintf(out,"    char __tw_%d[4096]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
+                    fprintf(out,");\n");
+                    expand_free(&er);
+                    fprintf(out,"    __arr_%s[__an%d++]=strdup(__tw_%d);\n",safe_cname(n->lhs),n->lineno,id);
+                } else {
+                    fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,items[i]);
+                }
+            }
+            fprintf(out,"    __arr_%s[__an%d]=NULL;\n",safe_cname(n->lhs),n->lineno);
+            fprintf(out,"    }\n");
         } else if(n->rhs && strncmp(n->rhs,"$((",3)==0){
             add_var(n->lhs,V_INT);
             char *e=translate_expr(n->rhs);
@@ -3218,6 +3269,18 @@ static void emit_node(FILE *out, Node *n){
     }
 
     case NODE_WHILE:{
+        /* Check for pending pipe command (cmd | while ...) */
+        if(pending_pipe_cmd){
+            fprintf(out,"    { int __ppfd[2]; if(pipe(__ppfd)<0){perror(\"pipe\");exit(1);}\n");
+            fprintf(out,"    pid_t __ppid=fork();\n");
+            fprintf(out,"    if(__ppid==0){ close(__ppfd[0]); dup2(__ppfd[1],1); close(__ppfd[1]);\n");
+            emit_node(out,pending_pipe_cmd);
+            fprintf(out,"    fflush(stdout); _exit(0); }\n");
+            fprintf(out,"    close(__ppfd[1]); int __psi=dup(0); dup2(__ppfd[0],0); close(__ppfd[0]); clearerr(stdin);\n");
+            pending_pipe_cmd=NULL;
+            pipe_restore_needed=1;
+            /* fall through to normal while handling, but mark for restore */
+        }
         /* Check if condition is a read command (while read -r line) */
         if(n->while_cond && !strncmp(n->while_cond,"read",4) &&
            (n->while_cond[4]==' '||n->while_cond[4]==0)){
@@ -3231,7 +3294,7 @@ static void emit_node(FILE *out, Node *n){
                 int vl=0;
                 while(*p && *p!=' ' && *p!='\t' && vl<127) vars[nv][vl++]=*p++;
                 vars[nv][vl]=0;
-                if(vl>0) nv++;
+                if(vl>0){ add_var(vars[nv],V_STR); nv++; }
             }
             fprintf(out,"    { char __rb[4096];\n");
             if(n->while_negate){
@@ -3257,6 +3320,11 @@ static void emit_node(FILE *out, Node *n){
             else                fprintf(out,"    while(%s){\n",c);
             emit_node(out,n->while_body);
             fprintf(out,"    }\n");
+        }
+        if(pipe_restore_needed){
+            fprintf(out,"    fflush(stdout); dup2(__psi,0); close(__psi); clearerr(stdin); waitpid(__ppid,NULL,0);\n");
+            fprintf(out,"    }\n");
+            pipe_restore_needed=0;
         }
         break;
     }
@@ -3461,6 +3529,7 @@ static BlkFrame blk_stack[STACK_MAX];
 static int blk_top=0;
 static Node *parse_root=NULL;
 static Node **parse_insert=NULL;
+/* pending_pipe_cmd and pipe_restore_needed declared in L8 emitter section */
 
 static Node **chain_tail(Node **hp){
     if(!hp) return NULL;
@@ -3873,8 +3942,15 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
                 if(!strcmp(toks[i],"do")||!strcmp(toks[i],";")) break;
                 /* skip VAR=VALUE prefixes (e.g. IFS= read -r line) */
                 if(is_assignment(toks[i]) && i<ntoks-1 && strcmp(toks[i+1],"do")!=0 && strcmp(toks[i+1],";")!=0){
-                    /* this is a prefix assignment, skip it */
                     continue;
+                }
+                /* register read variables */
+                if(!strcmp(toks[i],"read")){
+                    for(int j=i+1;j<ntoks;j++){
+                        if(!strcmp(toks[j],"do")||!strcmp(toks[j],";")) break;
+                        if(toks[j][0]=='-') continue;
+                        add_var(toks[j],V_STR);
+                    }
                 }
                 if(cb[0]) strcat(cb," ");
                 strncat(cb,toks[i],sizeof(cb)-strlen(cb)-1);
@@ -4151,27 +4227,24 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
         /* pipe — build left-associative chain: ((a|b)|c)|d */
         { int pp=find_op(toks,ntoks,"|");
           if(pp>=0){
-              /* Check if any stage starts with a block keyword (while, for, etc.)
-               * If so, don't create a pipe — let the block keyword handler parse it.
-               * The pipe input will be handled by the block's stdin. */
-              int has_block_kw=0;
-              {
-                  int start=0;
-                  for(int i=0;i<=ntoks;i++){
-                      if(i==ntoks || (i>0 && !strcmp(toks[i],"|"))){
-                          if(start<ntoks){
-                              const char *kw=toks[start];
-                              if(!strcmp(kw,"while")||!strcmp(kw,"until")||
-                                 !strcmp(kw,"for")||!strcmp(kw,"if")||
-                                 !strcmp(kw,"case")||!strcmp(kw,"{")){
-                                  has_block_kw=1; break;
-                              }
-                          }
-                          start=i+1;
-                      }
+              /* Check if the stage after | starts with a block keyword */
+              int block_start=-1;
+              for(int i=pp+1;i<ntoks;i++){
+                  if(!strcmp(toks[i],"while")||!strcmp(toks[i],"until")||
+                     !strcmp(toks[i],"for")){
+                      block_start=i;
+                      break;
                   }
+                  if(!strcmp(toks[i],"|")) break; /* another pipe, not block */
               }
-              if(!has_block_kw){
+              if(block_start>=0){
+                  /* cmd | while/until/for ... — set up pipe and parse block */
+                  pending_pipe_cmd = make_cmd(toks,pp,lineno);
+                  dispatch_segment(toks+block_start,ntoks-block_start,lineno);
+                  return;
+              }
+              /* Check if any stage starts with a block keyword */
+              {
               Node *stages[32]; int ns=0;
               int start=0;
               while(start<ntoks && ns<32){
@@ -4765,7 +4838,19 @@ static const char *RT_HEADER =
 "  }\n"
 "  fclose(fa); fclose(fb);\n"
 "}\n"
-"static void __attribute__((unused)) __b_diff(const char *a,const char *b){ char cmd[8192]; snprintf(cmd,sizeof(cmd),\"diff \\\"%s\\\" \\\"%s\\\"\",a,b); system(cmd); }\n"
+"static void __attribute__((unused)) __b_diff(const char *a,const char *b){\n"
+"  FILE *fa=fopen(a,\"r\"), *fb=fopen(b,\"r\");\n"
+"  if(!fa||!fb){ if(fa)fclose(fa); if(fb)fclose(fb); __exit_status=2; return; }\n"
+"  int la=0,lb=0,ca,cb,diff=0;\n"
+"  while(1){\n"
+"    ca=fgetc(fa); cb=fgetc(fb);\n"
+"    if(ca==EOF&&cb==EOF) break;\n"
+"    if(ca!=cb){ diff=1; break; }\n"
+"    if(ca=='\\n') la++; if(cb=='\\n') lb++;\n"
+"  }\n"
+"  fclose(fa); fclose(fb);\n"
+"  __exit_status=diff?1:0;\n"
+"}\n"
 "\n"
 "/* ---- search builtins ---- */\n"
 "static void __attribute__((unused)) __b_find(const char *first,...){\n"
