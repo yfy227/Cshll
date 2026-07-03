@@ -1878,7 +1878,7 @@ static char *emit_word(FILE *out, const char *word){
     }
     ExpandResult er; expand_string(word,&er);
     int id=tmp_id++;
-    fprintf(out,"    char __tw_%d[4096]; snprintf(__tw_%d, sizeof(__tw_%d), \"%s\"",
+    fprintf(out,"    char __tw_%d[1024]; snprintf(__tw_%d, sizeof(__tw_%d), \"%s\"",
             id,id,id,er.fmt);
     for(int i=0;i<er.nargs;i++) fprintf(out,", %s",er.args[i]);
     fprintf(out,");\n");
@@ -2935,19 +2935,34 @@ static void emit_command(FILE *out, char **argv, int ac, int id){
     /* ---- fallback: user-defined function call OR system command ---- */
     {
         if(is_user_func(cmd)){
-            /* user-defined function call */
+            /* user-defined function call — use stack array for small arg counts */
             int nfa=ac-1;
-            fprintf(out,"    {\n");
-            fprintf(out,"    char **__fa%d=(char**)malloc(%d*sizeof(char*));\n",id,nfa+1);
-            for(int i=0;i<nfa;i++){
-                char *w=emit_word(out,argv[i+1]);
-                fprintf(out,"    __fa%d[%d]=strdup(%s);\n",id,i,w);
-                free(w);
+            if(nfa<=8){
+                /* Stack-allocated: no malloc/strdup/free overhead */
+                fprintf(out,"    {\n");
+                fprintf(out,"    char *__fa%d[%d];\n",id,nfa+1);
+                for(int i=0;i<nfa;i++){
+                    char *w=emit_word(out,argv[i+1]);
+                    fprintf(out,"    __fa%d[%d] = (char*)%s;\n",id,i,w);
+                    free(w);
+                }
+                fprintf(out,"    __fa%d[%d] = NULL;\n",id,nfa);
+                fprintf(out,"    %s(%d, __fa%d);\n",safe_cname(cmd),nfa,id);
+                fprintf(out,"    }\n");
+            } else {
+                /* Heap-allocated for large arg counts */
+                fprintf(out,"    {\n");
+                fprintf(out,"    char **__fa%d = (char**)malloc(%d * sizeof(char*));\n",id,nfa+1);
+                for(int i=0;i<nfa;i++){
+                    char *w=emit_word(out,argv[i+1]);
+                    fprintf(out,"    __fa%d[%d] = strdup(%s);\n",id,i,w);
+                    free(w);
+                }
+                fprintf(out,"    __fa%d[%d] = NULL;\n",id,nfa);
+                fprintf(out,"    %s(%d, __fa%d);\n",safe_cname(cmd),nfa,id);
+                fprintf(out,"    __sh_arr_free(__fa%d);\n",id);
+                fprintf(out,"    }\n");
             }
-            fprintf(out,"    __fa%d[%d]=NULL;\n",id,nfa);
-            fprintf(out,"    %s(%d,__fa%d);\n",safe_cname(cmd),nfa,id);
-            fprintf(out,"    __sh_arr_free(__fa%d);\n",id);
-            fprintf(out,"    }\n");
         } else {
             /* system command via system() — supports ALL system commands */
             fprintf(out,"    { char __cmd%d[8192]; int __cl=0;\n",id);
@@ -3448,25 +3463,26 @@ static void emit_node(FILE *out, Node *n){
                 fprintf(out,"    }\n");
                 fprintf(out,"    }\n");
             } else {
+            /* For-loop with literal list: use stack-allocated array, no malloc/strdup */
             fprintf(out,"    {\n");
-            fprintf(out,"    const char **__fl%d=(const char**)malloc(%d*sizeof(char*));\n",
-                    n->lineno,n->for_len+1);
+            fprintf(out,"    const char *__fl%d[] = {",n->lineno);
             for(int i=0;i<n->for_len;i++){
                 char *w=emit_word(out,n->for_list[i]);
-                fprintf(out,"    __fl%d[%d]=strdup(%s);\n",n->lineno,i,w); free(w);
+                fprintf(out,"%s%s",(i>0?", ":""),w);
+                free(w);
             }
-            fprintf(out,"    __fl%d[%d]=NULL;\n",n->lineno,n->for_len);
-            fprintf(out,"    for(int __fi%d=0;__fl%d[__fi%d];__fi%d++){\n",
+            fprintf(out,", NULL};\n");
+            fprintf(out,"    for (int __fi%d = 0; __fl%d[__fi%d]; __fi%d++) {\n",
                     n->lineno,n->lineno,n->lineno,n->lineno);
             VarKind vk=get_var_kind(n->for_var);
             if(vk==V_INT)
-                fprintf(out,"    %s=atoi(__fl%d[__fi%d]);\n",vn,n->lineno,n->lineno);
+                fprintf(out,"        %s = atoi(__fl%d[__fi%d]);\n",vn,n->lineno,n->lineno);
             else
-                fprintf(out,"    strncpy(%s,__fl%d[__fi%d],sizeof(%s)-1);\n",
+                fprintf(out,"        strncpy(%s, __fl%d[__fi%d], sizeof(%s) - 1);\n",
                         vn,n->lineno,n->lineno,vn);
             emit_node(out,n->body);
             fprintf(out,"    }\n");
-            fprintf(out,"    __sh_arr_free((char**)__fl%d);\n    }\n",n->lineno);
+            fprintf(out,"    }\n");
             }
         }
         break;
