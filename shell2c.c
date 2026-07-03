@@ -1878,9 +1878,9 @@ static char *emit_word(FILE *out, const char *word){
     }
     ExpandResult er; expand_string(word,&er);
     int id=tmp_id++;
-    fprintf(out,"    char __tw_%d[4096]; snprintf(__tw_%d,4096,\"%s\"",
-            id,id,er.fmt);
-    for(int i=0;i<er.nargs;i++) fprintf(out,",%s",er.args[i]);
+    fprintf(out,"    char __tw_%d[4096]; snprintf(__tw_%d, sizeof(__tw_%d), \"%s\"",
+            id,id,id,er.fmt);
+    for(int i=0;i<er.nargs;i++) fprintf(out,", %s",er.args[i]);
     fprintf(out,");\n");
     expand_free(&er);
     char *r=malloc(32); snprintf(r,32,"__tw_%d",id);
@@ -1991,8 +1991,11 @@ static void emit_echo(FILE *out, char **argv, int argc){
         char *w=emit_word(out,argv[start]);
         if(w[0]=='"'){
             fprintf(out,"    __sh_puts(%s);\n",w);
+        } else if(strncmp(w,"__tw_",5)==0){
+            /* temp buffer from variable expansion — use __sh_putf */
+            fprintf(out,"    __sh_putf(\"%%s\", %s);\n",w);
         } else {
-            fprintf(out,"    fputs(%s,stdout); putchar('\\n');\n",w);
+            fprintf(out,"    __sh_putf(\"%%s\", %s);\n",w);
         }
         free(w);
         return;
@@ -5195,11 +5198,11 @@ int main(int argc, char **argv){
     /* main entry point */
     fprintf(fout,"\n/* ---- main entry point ---- */\n");
     fprintf(fout,"int main(int _argc, char **_argv){\n");
-    fprintf(fout,"    setvbuf(stdout,NULL,_IONBF,0);\n");
-    fprintf(fout,"    setvbuf(stdin,NULL,_IONBF,0);\n");
-    fprintf(fout,"    __sh_argc=_argc-1;\n");
+    fprintf(fout,"    setvbuf(stdout, NULL, _IONBF, 0);\n");
+    fprintf(fout,"    setvbuf(stdin, NULL, _IONBF, 0);\n");
+    fprintf(fout,"    __sh_argc = _argc - 1;\n");
     for(int i=1;i<=9;i++)
-        fprintf(fout,"    if(_argc>%d)strncpy(__sh_arg%d,_argv[%d],1023);\n",i,i,i);
+        fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 1023);\n",i,i,i);
     fprintf(fout,"\n");
     emit_node(fout,script);
     fprintf(fout,"    return __exit_status;\n}\n");
