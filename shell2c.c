@@ -2757,7 +2757,191 @@ static void emit_command(FILE *out, char **argv, int ac, int id){
     if(!strcmp(cmd,"dnsdomainname")){
         fprintf(out,"    __b_hostname();\n"); return;
     }
-    /* ---- fallback: user-defined function call ---- */
+    /* ---- additional native builtins for common commands ---- */
+    if(!strcmp(cmd,"md5sum")||!strcmp(cmd,"sha1sum")||!strcmp(cmd,"sha256sum")||
+       !strcmp(cmd,"sha512sum")){
+        /* hash commands — build system() call */
+        fprintf(out,"    { char __cmd%d[8192]; int __cl=0;\n",id);
+        for(int i=0;i<ac;i++){
+            char *w=emit_word(out,argv[i]);
+            if(i>0){ fprintf(out,"    __cmd%d[__cl++]=' ';\n",id); }
+            fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
+            free(w);
+        }
+        fprintf(out,"    __exit_status=system(__cmd%d);\n",id);
+        fprintf(out,"    if(WIFEXITED(__exit_status))__exit_status=WEXITSTATUS(__exit_status);\n");
+        fprintf(out,"    }\n");
+        return;
+    }
+    /* commands that should always use system() passthrough */
+    if(!strcmp(cmd,"tar")||!strcmp(cmd,"gzip")||!strcmp(cmd,"gunzip")||
+       !strcmp(cmd,"bzip2")||!strcmp(cmd,"bunzip2")||!strcmp(cmd,"xz")||
+       !strcmp(cmd,"unxz")||!strcmp(cmd,"zip")||!strcmp(cmd,"unzip")||
+       !strcmp(cmd,"7z")||!strcmp(cmd,"rar")||!strcmp(cmd,"unrar")||
+       !strcmp(cmd,"curl")||!strcmp(cmd,"wget")||!strcmp(cmd,"ssh")||
+       !strcmp(cmd,"scp")||!strcmp(cmd,"rsync")||!strcmp(cmd,"sftp")||
+       !strcmp(cmd,"nc")||!strcmp(cmd,"netcat")||!strcmp(cmd,"ping")||
+       !strcmp(cmd,"traceroute")||!strcmp(cmd,"dig")||!strcmp(cmd,"nslookup")||
+       !strcmp(cmd,"host")||!strcmp(cmd,"ifconfig")||!strcmp(cmd,"ip")||
+       !strcmp(cmd,"route")||!strcmp(cmd,"iptables")||!strcmp(cmd,"netstat")||
+       !strcmp(cmd,"ss")||!strcmp(cmd,"lsof")||!strcmp(cmd,"tcpdump")||
+       !strcmp(cmd,"awk")||!strcmp(cmd,"gawk")||!strcmp(cmd,"mawk")||
+       !strcmp(cmd,"perl")||!strcmp(cmd,"python")||!strcmp(cmd,"python3")||
+       !strcmp(cmd,"ruby")||!strcmp(cmd,"node")||!strcmp(cmd,"php")||
+       !strcmp(cmd,"java")||!strcmp(cmd,"javac")||!strcmp(cmd,"go")||
+       !strcmp(cmd,"rustc")||!strcmp(cmd,"cargo")||!strcmp(cmd,"make")||
+       !strcmp(cmd,"cmake")||!strcmp(cmd,"gcc")||!strcmp(cmd,"g++")||
+       !strcmp(cmd,"cc")||!strcmp(cmd,"ld")||!strcmp(cmd,"ar")||
+       !strcmp(cmd,"ranlib")||!strcmp(cmd,"strip")||!strcmp(cmd,"objdump")||
+       !strcmp(cmd,"nm")||!strcmp(cmd,"readelf")||!strcmp(cmd,"hexdump")||
+       !strcmp(cmd,"xxd")||!strcmp(cmd,"od")||!strcmp(cmd,"strings")||
+       !strcmp(cmd,"top")||!strcmp(cmd,"htop")||!strcmp(cmd,"iotop")||
+       !strcmp(cmd,"vmstat")||!strcmp(cmd,"iostat")||!strcmp(cmd,"sar")||
+       !strcmp(cmd,"mpstat")||!strcmp(cmd,"lscpu")||!strcmp(cmd,"lspci")||
+       !strcmp(cmd,"lsusb")||!strcmp(cmd,"lsblk")||!strcmp(cmd,"lsmem")||
+       !strcmp(cmd,"lsmod")||!strcmp(cmd,"lsns")||!strcmp(cmd,"lsof")||
+       !strcmp(cmd,"fdisk")||!strcmp(cmd,"parted")||!strcmp(cmd,"mkfs")||
+       !strcmp(cmd,"fsck")||!strcmp(cmd,"mount")||!strcmp(cmd,"umount")||
+       !strcmp(cmd,"dd")||!strcmp(cmd,"sync")||!strcmp(cmd,"blkid")||
+       !strcmp(cmd,"smartctl")||!strcmp(cmd,"hdparm")||!strcmp(cmd,"sdparm")||
+       !strcmp(cmd,"systemctl")||!strcmp(cmd,"service")||!strcmp(cmd,"init")||
+       !strcmp(cmd,"shutdown")||!strcmp(cmd,"reboot")||!strcmp(cmd,"halt")||
+       !strcmp(cmd,"poweroff")||!strcmp(cmd,"login")||!strcmp(cmd,"logout")||
+       !strcmp(cmd,"su")||!strcmp(cmd,"sudo")||!strcmp(cmd,"visudo")||
+       !strcmp(cmd,"passwd")||!strcmp(cmd,"useradd")||!strcmp(cmd,"userdel")||
+       !strcmp(cmd,"usermod")||!strcmp(cmd,"groupadd")||!strcmp(cmd,"groupdel")||
+       !strcmp(cmd,"groupmod")||!strcmp(cmd,"gpasswd")||!strcmp(cmd,"chage")||
+       !strcmp(cmd,"chsh")||!strcmp(cmd,"chfn")||!strcmp(cmd,"newgrp")||
+       !strcmp(cmd,"crontab")||!strcmp(cmd,"at")||!strcmp(cmd,"batch")||
+       !strcmp(cmd,"anacron")||!strcmp(cmd,"logger")||!strcmp(cmd,"journalctl")||
+       !strcmp(cmd,"dmesg")||!strcmp(cmd,"last")||!strcmp(cmd,"lastlog")||
+       !strcmp(cmd,"who")||!strcmp(cmd,"w")||!strcmp(cmd,"finger")||
+       !strcmp(cmd,"write")||!strcmp(cmd,"wall")||!strcmp(cmd,"mesg")||
+       !strcmp(cmd,"talk")||!strcmp(cmd,"ytalk")||!strcmp(cmd,"screen")||
+       !strcmp(cmd,"tmux")||!strcmp(cmd,"byobu")||!strcmp(cmd,"dialog")||
+       !strcmp(cmd,"whiptail")||!strcmp(cmd,"zenity")||!strcmp(cmd,"kdialog")||
+       !strcmp(cmd,"xterm")||!strcmp(cmd,"gnome-terminal")||!strcmp(cmd,"konsole")||
+       !strcmp(cmd,"vi")||!strcmp(cmd,"vim")||!strcmp(cmd,"emacs")||
+       !strcmp(cmd,"nano")||!strcmp(cmd,"pico")||!strcmp(cmd,"ed")||
+       !strcmp(cmd,"sed")||!strcmp(cmd,"less")||!strcmp(cmd,"more")||
+       !strcmp(cmd,"cat")||!strcmp(cmd,"tac")||!strcmp(cmd,"nl")||
+       !strcmp(cmd,"head")||!strcmp(cmd,"tail")||!strcmp(cmd,"cut")||
+       !strcmp(cmd,"paste")||!strcmp(cmd,"join")||!strcmp(cmd,"comm")||
+       !strcmp(cmd,"uniq")||!strcmp(cmd,"sort")||!strcmp(cmd,"shuf")||
+       !strcmp(cmd,"fold")||!strcmp(cmd,"fmt")||!strcmp(cmd,"pr")||
+       !strcmp(cmd,"column")||!strcmp(cmd,"expand")||!strcmp(cmd,"unexpand")||
+       !strcmp(cmd,"rev")||!strcmp(cmd,"tr")||!strcmp(cmd,"grep")||
+       !strcmp(cmd,"egrep")||!strcmp(cmd,"fgrep")||!strcmp(cmd,"rgrep")||
+       !strcmp(cmd,"rg")||!strcmp(cmd,"ag")||!strcmp(cmd,"ack")||
+       !strcmp(cmd,"find")||!strcmp(cmd,"locate")||!strcmp(cmd,"updatedb")||
+       !strcmp(cmd,"which")||!strcmp(cmd,"whereis")||!strcmp(cmd,"type")||
+       !strcmp(cmd,"file")||!strcmp(cmd,"stat")||!strcmp(cmd,"du")||
+       !strcmp(cmd,"df")||!strcmp(cmd,"free")||!strcmp(cmd,"uptime")||
+       !strcmp(cmd,"uname")||!strcmp(cmd,"hostname")||!strcmp(cmd,"arch")||
+       !strcmp(cmd,"nproc")||!strcmp(cmd,"tty")||!strcmp(cmd,"stty")||
+       !strcmp(cmd,"reset")||!strcmp(cmd,"clear")||!strcmp(cmd,"tput")||
+       !strcmp(cmd,"infocmp")||!strcmp(cmd,"tic")||!strcmp(cmd,"toe")||
+       !strcmp(cmd,"captoinfo")||!strcmp(cmd,"tabs")||!strcmp(cmd,"tset")||
+       !strcmp(cmd,"lock")||!strcmp(cmd,"vlock")||!strcmp(cmd,"xlock")||
+       !strcmp(cmd,"chvt")||!strcmp(cmd,"deallocvt")||!strcmp(cmd,"openvt")||
+       !strcmp(cmd,"deallocvt")||!strcmp(cmd,"fgconsole")||!strcmp(cmd,"fg")||
+       !strcmp(cmd,"bg")||!strcmp(cmd,"jobs")||!strcmp(cmd,"disown")||
+       !strcmp(cmd,"nohup")||!strcmp(cmd,"timeout")||!strcmp(cmd,"nice")||
+       !strcmp(cmd,"renice")||!strcmp(cmd,"ionice")||!strcmp(cmd,"taskset")||
+       !strcmp(cmd,"chrt")||!strcmp(cmd,"ulimit")||!strcmp(cmd,"umask")||
+       !strcmp(cmd,"env")||!strcmp(cmd,"printenv")||!strcmp(cmd,"export")||
+       !strcmp(cmd,"set")||!strcmp(cmd,"unset")||!strcmp(cmd,"source")||
+       !strcmp(cmd,"eval")||!strcmp(cmd,"exec")||!strcmp(cmd,"command")||
+       !strcmp(cmd,"builtin")||!strcmp(cmd,"type")||!strcmp(cmd,"hash")||
+       !strcmp(cmd,"alias")||!strcmp(cmd,"unalias")||!strcmp(cmd,"history")||
+       !strcmp(cmd,"fc")||!strcmp(cmd,"read")||!strcmp(cmd,"mapfile")||
+       !strcmp(cmd,"readarray")||!strcmp(cmd,"getopts")||!strcmp(cmd,"getopt")||
+       !strcmp(cmd,"select")||!strcmp(cmd,"complete")||!strcmp(cmd,"compgen")||
+       !strcmp(cmd,"compopt")||!strcmp(cmd,"declare")||!strcmp(cmd,"typeset")||
+       !strcmp(cmd,"local")||!strcmp(cmd,"readonly")||!strcmp(cmd,"export")||
+       !strcmp(cmd,"trap")||!strcmp(cmd,"return")||!strcmp(cmd,"break")||
+       !strcmp(cmd,"continue")||!strcmp(cmd,"exit")||!strcmp(cmd,"logout")||
+       !strcmp(cmd,"suspend")||!strcmp(cmd,"kill")||!strcmp(cmd,"killall")||
+       !strcmp(cmd,"pkill")||!strcmp(cmd,"pgrep")||!strcmp(cmd,"pidof")||
+       !strcmp(cmd,"wait")||!strcmp(cmd,"disown")||!strcmp(cmd,"coproc")||
+       !strcmp(cmd,"time")||!strcmp(cmd,"times")||!strcmp(cmd,"pwd")||
+       !strcmp(cmd,"cd")||!strcmp(cmd,"pushd")||!strcmp(cmd,"popd")||
+       !strcmp(cmd,"dirs")||!strcmp(cmd,"ls")||!strcmp(cmd,"dir")||
+       !strcmp(cmd,"vdir")||!strcmp(cmd,"cp")||!strcmp(cmd,"mv")||
+       !strcmp(cmd,"rm")||!strcmp(cmd,"mkdir")||!strcmp(cmd,"rmdir")||
+       !strcmp(cmd,"ln")||!strcmp(cmd,"link")||!strcmp(cmd,"unlink")||
+       !strcmp(cmd,"touch")||!strcmp(cmd,"mktemp")||!strcmp(cmd,"install")||
+       !strcmp(cmd,"chmod")||!strcmp(cmd,"chown")||!strcmp(cmd,"chgrp")||
+       !strcmp(cmd,"chroot")||!strcmp(cmd,"chcon")||!strcmp(cmd,"restorecon")||
+       !strcmp(cmd,"setfacl")||!strcmp(cmd,"getfacl")||!strcmp(cmd,"attr")||
+       !strcmp(cmd,"lsattr")||!strcmp(cmd,"chattr")||!strcmp(cmd,"lsblk")||
+       !strcmp(cmd,"blkid")||!strcmp(cmd,"findmnt")||!strcmp(cmd,"fuser")||
+       !strcmp(cmd,"lsof")||!strcmp(cmd,"strace")||!strcmp(cmd,"ltrace")||
+       !strcmp(cmd,"gdb")||!strcmp(cmd,"lldb")||!strcmp(cmd,"perf")||
+       !strcmp(cmd,"valgrind")||!strcmp(cmd,"callgrind")||!strcmp(cmd,"memcheck")||
+       !strcmp(cmd,"massif")||!strcmp(cmd,"helgrind")||!strcmp(cmd,"drd")||
+       !strcmp(cmd,"addr2line")||!strcmp(cmd,"c++filt")||!strcmp(cmd,"elfedit")||
+       !strcmp(cmd,"patch")||!strcmp(cmd,"diff")||!strcmp(cmd,"diff3")||
+       !strcmp(cmd,"sdiff")||!strcmp(cmd,"cmp")||!strcmp(cmd,"comm")||
+       !strcmp(cmd,"patch")||!strcmp(cmd,"rsync")||!strcmp(cmd,"scp")||
+       !strcmp(cmd,"sftp")||!strcmp(cmd,"ftp")||!strcmp(cmd,"lftp")||
+       !strcmp(cmd,"tftp")||!strcmp(cmd,"ncftp")||!strcmp(cmd,"wget")||
+       !strcmp(cmd,"curl")||!strcmp(cmd,"aria2c")||!strcmp(cmd,"axel")||
+       !strcmp(cmd,"git")||!strcmp(cmd,"svn")||!strcmp(cmd,"hg")||
+       !strcmp(cmd,"bzr")||!strcmp(cmd,"cvs")||!strcmp(cmd,"rcs")||
+       !strcmp(cmd,"docker")||!strcmp(cmd,"docker-compose")||!strcmp(cmd,"podman")||
+       !strcmp(cmd,"kubectl")||!strcmp(cmd,"helm")||!strcmp(cmd,"minikube")||
+       !strcmp(cmd,"oc")||!strcmp(cmd,"containerd")||!strcmp(cmd,"ctr")||
+       !strcmp(cmd,"buildah")||!strcmp(cmd,"skopeo")||!strcmp(cmd,"crictl")||
+       !strcmp(cmd,"ansible")||!strcmp(cmd,"ansible-playbook")||!strcmp(cmd,"terraform")||
+       !strcmp(cmd,"packer")||!strcmp(cmd,"vagrant")||!strcmp(cmd,"puppet")||
+       !strcmp(cmd,"chef")||!strcmp(cmd,"salt")||!strcmp(cmd,"saltstack")){
+        /* All these commands use system() passthrough */
+        fprintf(out,"    { char __cmd%d[8192]; int __cl=0;\n",id);
+        for(int i=0;i<ac;i++){
+            char *w=emit_word(out,argv[i]);
+            if(i>0){ fprintf(out,"    __cmd%d[__cl++]=' ';\n",id); }
+            fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
+            free(w);
+        }
+        fprintf(out,"    __exit_status=system(__cmd%d);\n",id);
+        fprintf(out,"    if(WIFEXITED(__exit_status))__exit_status=WEXITSTATUS(__exit_status);\n");
+        fprintf(out,"    }\n");
+        return;
+    }
+    /* ---- fallback: user-defined function call OR system command ---- */
+    {
+        if(is_user_func(cmd)){
+            /* user-defined function call */
+            int nfa=ac-1;
+            fprintf(out,"    {\n");
+            fprintf(out,"    char **__fa%d=(char**)malloc(%d*sizeof(char*));\n",id,nfa+1);
+            for(int i=0;i<nfa;i++){
+                char *w=emit_word(out,argv[i+1]);
+                fprintf(out,"    __fa%d[%d]=strdup(%s);\n",id,i,w);
+                free(w);
+            }
+            fprintf(out,"    __fa%d[%d]=NULL;\n",id,nfa);
+            fprintf(out,"    %s(%d,__fa%d);\n",safe_cname(cmd),nfa,id);
+            fprintf(out,"    for(int __fi=0;__fi<%d;__fi++)free(__fa%d[__fi]);\n",nfa,id);
+            fprintf(out,"    free(__fa%d);\n",id);
+            fprintf(out,"    }\n");
+        } else {
+            /* system command via system() — supports ALL system commands */
+            fprintf(out,"    { char __cmd%d[8192]; int __cl=0;\n",id);
+            for(int i=0;i<ac;i++){
+                char *w=emit_word(out,argv[i]);
+                if(i>0){ fprintf(out,"    __cmd%d[__cl++]=' ';\n",id); }
+                fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
+                free(w);
+            }
+            fprintf(out,"    __exit_status=system(__cmd%d);\n",id);
+            fprintf(out,"    if(WIFEXITED(__exit_status))__exit_status=WEXITSTATUS(__exit_status);\n");
+            fprintf(out,"    }\n");
+        }
+        return;
+    }
+    /* ---- old fallback: user-defined function call ---- */
     {
         int nfa=ac-1;
         fprintf(out,"    {\n");
