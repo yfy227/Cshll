@@ -58,7 +58,7 @@ static const char *C_KEYWORDS_EXT[] = {
 };
 
 /* Override safe_cname to use extended keyword list */
-/* Extended safe_cname with C library keywords - overrides header version */
+static char _cname_buf[256];
 const char *safe_cname(const char *name){
     if(!name||!*name) return "__sh_empty";
     for(int i=0;C_KEYWORDS_EXT[i];i++){
@@ -5176,6 +5176,12 @@ int main(int argc, char **argv){
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 1023);\n",i,i,i);
     fprintf(fout,"\n");
     emit_node(fout,script);
+    /* Inject dead code decoys if obfuscation is enabled */
+    if(do_obfuscate){
+        emit_decoy_block(fout, 42);
+        emit_decoy_block(fout, 137);
+        emit_decoy_block(fout, 256);
+    }
     fprintf(fout,"    return __exit_status;\n}\n");
 
     fclose(fout);

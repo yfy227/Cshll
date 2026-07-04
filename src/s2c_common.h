@@ -35,15 +35,7 @@ static int starts_with(const char *s,const char *p){
 }
 
 /* ---- C keyword safe-naming ---- */
-static const char *C_KEYWORDS[] = {
-    "auto","break","case","char","const","continue","default","do","double",
-    "else","enum","extern","float","for","goto","if","inline","int","long",
-    "register","restrict","return","short","signed","sizeof","static","struct",
-    "switch","typedef","union","unsigned","void","volatile","while",
-    "and","or","not","true","false","NULL",
-    NULL
-};
-static char _cname_buf[256];
+/* C_KEYWORDS and safe_cname are defined in shell2c.c with extended list */
 const char *safe_cname(const char *name); /* defined in shell2c.c */
 
 #endif /* S2C_COMMON_H */
