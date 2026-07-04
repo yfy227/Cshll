@@ -1,63 +1,47 @@
 /*
- * shell2c.c — Deep Shell-to-C Transpiler
+ * shell2c.c — Deep Shell-to-C Transpiler (Modular Entry Point)
  *
- * Original by 爱摸鱼的狐狸 (by.爱摸鱼的狐狸)
- * Deep optimization: multi-layered architecture, 60+ builtin commands,
- * rich variable expansion, full test(1) operator set, [[ ]] support,
- * multi-stage pipes, proper fd save/restore, here-strings, arithmetic
- * with all C operators, local function variables, trap/set support.
+ * Author: 爱摸鱼的狐狸 🦊
  *
- * Build:  gcc -O2 -Wall -o shell2c shell2c.c
- * Use:    ./shell2c input.sh output.c [--makefile] [--run]
+ * Modular architecture with code obfuscation for generated C output.
+ * Headers in src/ define the module interfaces; this file contains
+ * the full implementation compiled as a single translation unit for
+ * simplicity (amalgamation build).
  *
- * Layers:
- *   L1 Tokenizer        — word splitting with quotes, operators, $((..))
- *   L2 Preprocessor     — line continuation, heredoc, here-string
- *   L3 Parser           — recursive block assembly (if/for/while/case/func)
- *   L4 AST              — typed nodes with redirect metadata
- *   L5 Symbol table     — variable kind tracking (int/str/array) + scope
- *   L6 Expr translator  — $var, ${...} family, $((...)) arithmetic
- *   L7 String expander  — printf-style format synthesis for words
- *   L8 Cond translator  — [ ], [[ ]] with full operator matrix
- *   L9 Code emitter     — C codegen with fd save/restore discipline
- *   L10 Runtime library — 60+ builtin functions emitted into output
+ * Build:  gcc -O2 -Wall -o shell2c shell2c.c src/s2c_obfuscate.c
+ * Use:    ./shell2c input.sh output.c [--makefile] [--run] [--obfuscate]
+ *
+ * Modules:
+ *   s2c_common.h    — shared types, utilities, safe-naming
+ *   s2c_symtab.h    — variable/function/heredoc tables
+ *   s2c_ast.h       — AST node types and Redir struct
+ *   s2c_emit.h      — code emitter interface
+ *   s2c_parse.h     — parser and tokenizer interface
+ *   s2c_obfuscate.h — anti-analysis code generation
  */
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/wait.h>
-#include <errno.h>
+#include "src/s2c_common.h"
+#include "src/s2c_symtab.h"
+#include "src/s2c_ast.h"
+#include "src/s2c_emit.h"
+#include "src/s2c_parse.h"
+#include "src/s2c_obfuscate.h"
 
 /* ================================================================== */
-/* L0  Utility                                                        */
+/* L0  Utility — definitions now in s2c_common.h                       */
 /* ================================================================== */
 
-static char *xstrdup(const char *s){ return s ? strdup(s) : strdup(""); }
-
-static char *ltrim(char *s){ while(isspace((unsigned char)*s))s++; return s; }
-static char *rtrim(char *s){
-    int l=(int)strlen(s);
-    while(l>0&&isspace((unsigned char)s[l-1]))s[--l]=0;
-    return s;
-}
-static char *trim(char *s) __attribute__((unused));
-static char *trim(char *s){ return rtrim(ltrim(s)); }
-
-static int starts_with(const char *s,const char *p){
-    return strncmp(s,p,strlen(p))==0;
-}
-
-/* ================================================================== */
-/* L1  C keyword safe-naming                                          */
+/* xstrdup, ltrim, rtrim, trim, starts_with, C_KEYWORDS, safe_cname
+ * are defined in src/s2c_common.h as static inline */
 /* ================================================================== */
 
-static const char *C_KEYWORDS[] = {
+/* All L0/L1 definitions (xstrdup, ltrim, rtrim, trim, starts_with,
+ * C_KEYWORDS, safe_cname) are now in src/s2c_common.h.
+ * The C_KEYWORDS list below is the full version with C library names. */
+
+/* Extended C keyword list (includes C library function names) */
+#undef C_KEYWORDS
+static const char *C_KEYWORDS_EXT[] = {
     "auto","break","case","char","const","continue","default","do","double",
     "else","enum","extern","float","for","goto","if","inline","int","long",
     "register","restrict","return","short","signed","sizeof","static","struct",
@@ -73,23 +57,20 @@ static const char *C_KEYWORDS[] = {
     NULL
 };
 
-static char _cname_buf[256];
-static const char *safe_cname(const char *name){
+/* Override safe_cname to use extended keyword list */
+/* Extended safe_cname with C library keywords - overrides header version */
+const char *safe_cname(const char *name){
     if(!name||!*name) return "__sh_empty";
-    for(int i=0;C_KEYWORDS[i];i++){
-        if(strcmp(name,C_KEYWORDS[i])==0){
+    for(int i=0;C_KEYWORDS_EXT[i];i++){
+        if(strcmp(name,C_KEYWORDS_EXT[i])==0){
             snprintf(_cname_buf,sizeof(_cname_buf),"_sh_%s",name);
             return _cname_buf;
         }
-    }
-    if(!isalpha((unsigned char)name[0] && name[0]!='_')){
-        /* first char must be letter or underscore */
     }
     if(!isalpha((unsigned char)name[0]) && name[0]!='_'){
         snprintf(_cname_buf,sizeof(_cname_buf),"_sh_%s",name);
         return _cname_buf;
     }
-    /* sanitize remaining chars */
     int dirty=0;
     for(const char *p=name;*p;p++){
         if(!isalnum((unsigned char)*p) && *p!='_'){ dirty=1; break; }
@@ -107,58 +88,19 @@ static const char *safe_cname(const char *name){
 }
 
 /* ================================================================== */
-/* L2  Symbol table                                                   */
+/* L2  Symbol table — types in s2c_symtab.h, definitions here          */
 /* ================================================================== */
 
-typedef enum { V_INT, V_STR, V_ARRAY, V_UNKNOWN } VarKind;
-typedef struct { char name[128]; VarKind kind; int is_local; } VarInfo;
+/* VarKind, VarInfo, var_table, var_count declared in s2c_symtab.h */
+VarInfo var_table[MAX_VARS];
+int var_count = 0;
 
-#define MAX_VARS 4096
-static VarInfo var_table[MAX_VARS];
-static int var_count = 0;
-
-/* User-defined function table (for $(fn ...) command substitution) */
-#define MAX_FUNCS 512
-static char *func_table[MAX_FUNCS];
-static int func_count = 0;
-static void register_func(const char *name){
-    if(!name||!*name) return;
-    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return;
-    if(func_count<MAX_FUNCS) func_table[func_count++]=xstrdup(name);
-}
-static int is_user_func(const char *name){
-    if(!name||!*name) return 0;
-    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return 1;
-    return 0;
-}
-
-/* Pending heredoc table — stores heredoc bodies read during pre-scan,
- * indexed by order of appearance. The redirect parser looks them up. */
-#define MAX_HEREDOCS 64
-typedef struct { char *text; int expand; } HeredocEntry;
-static HeredocEntry heredoc_table[MAX_HEREDOCS];
-static int heredoc_count = 0;
-static int heredoc_next = 0;  /* index for redirect parser to consume */
-
-static int heredoc_store(const char *text, int expand){
-    if(heredoc_count>=MAX_HEREDOCS) return -1;
-    heredoc_table[heredoc_count].text = xstrdup(text);
-    heredoc_table[heredoc_count].expand = expand;
-    return heredoc_count++;
-}
-static const char *heredoc_consume(int *expand){
-    if(heredoc_next>=heredoc_count){ if(expand)*expand=1; return ""; }
-    if(expand) *expand = heredoc_table[heredoc_next].expand;
-    return heredoc_table[heredoc_next++].text;
-}
-
-static void add_var(const char *name, VarKind k){
+void add_var(const char *name, VarKind k){
     if(!name||!*name) return;
     for(int i=0;i<var_count;i++){
         if(strcmp(var_table[i].name,name)==0){
             if(k==V_ARRAY) var_table[i].kind=V_ARRAY;
-            else if(k==V_INT) var_table[i].kind=V_INT;  /* allow upgrade to int, don't downgrade */
-            /* V_STR doesn't override V_INT or V_ARRAY */
+            else if(k==V_INT) var_table[i].kind=V_INT;
             return;
         }
     }
@@ -169,59 +111,66 @@ static void add_var(const char *name, VarKind k){
     var_table[var_count].is_local=0;
     var_count++;
 }
-static VarKind get_var_kind(const char *name){
+VarKind get_var_kind(const char *name){
     if(!name) return V_STR;
     for(int i=0;i<var_count;i++)
         if(strcmp(var_table[i].name,name)==0) return var_table[i].kind;
     return V_STR;
 }
-/* Check if a variable is known (declared in var_table) */
-static int is_known_var(const char *name){
+int is_known_var(const char *name){
     if(!name) return 0;
     for(int i=0;i<var_count;i++)
         if(strcmp(var_table[i].name,name)==0) return 1;
     return 0;
 }
-/* Get C expression for a variable reference.
- * Known vars use their C name; unknown vars use getenv("name"). */
-static const char *var_c_expr(const char *name){
+const char *var_c_expr(const char *name){
     if(is_known_var(name)) return safe_cname(name);
-    /* unknown — use getenv at runtime */
     static char buf[256];
     snprintf(buf,sizeof(buf),"(__sh_getenv(\"%s\"))",name);
     return buf;
 }
 
+/* Function table */
+char *func_table[MAX_FUNCS];
+int func_count = 0;
+void register_func(const char *name){
+    if(!name||!*name) return;
+    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return;
+    if(func_count<MAX_FUNCS) func_table[func_count++]=xstrdup(name);
+}
+int is_user_func(const char *name){
+    if(!name||!*name) return 0;
+    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return 1;
+    return 0;
+}
+
+/* Heredoc table */
+HeredocEntry heredoc_table[MAX_HEREDOCS];
+int heredoc_count = 0;
+int heredoc_next = 0;
+int heredoc_store(const char *text, int expand){
+    if(heredoc_count>=MAX_HEREDOCS) return -1;
+    heredoc_table[heredoc_count].text = xstrdup(text);
+    heredoc_table[heredoc_count].expand = expand;
+    return heredoc_count++;
+}
+const char *heredoc_consume(int *expand){
+    if(heredoc_next>=heredoc_count){ if(expand)*expand=1; return ""; }
+    if(expand) *expand = heredoc_table[heredoc_next].expand;
+    return heredoc_table[heredoc_next++].text;
+}
+
 /* ================================================================== */
-/* L3  AST                                                            */
+/* L3  AST — types in s2c_ast.h, constructors here                     */
 /* ================================================================== */
 
-typedef enum {
-    NODE_CMD, NODE_ASSIGN, NODE_IF, NODE_FOR, NODE_WHILE,
-    NODE_FUNC, NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_EXIT,
-    NODE_PIPE, NODE_HEREDOC, NODE_BACKGROUND, NODE_CASE,
-    NODE_AND, NODE_OR, NODE_NOT, NODE_SUBSHELL, NODE_GROUP,
-    NODE_LOCAL, NODE_EXPORT, NODE_UNSET, NODE_SOURCE, NODE_EVAL,
-    NODE_TRAP, NODE_SET
-} NodeType;
-
-typedef struct Redir {
-    int fd;              /* target fd (0,1,2,...) */
-    char *file;          /* filename (NULL for heredoc/herestring) */
-    char *heredoc;       /* heredoc text or here-string content */
-    int append;          /* >> flag */
-    int dup_fd;          /* for >&N: dup source fd, -1 otherwise */
-    int is_heredoc;      /* << EOF */
-    int is_herestr;      /* <<< "str" */
-    int hd_expand;       /* heredoc: expand variables (1) or literal (0) */
-    int fd_high;         /* stashed unique redirect-group id for save/restore */
-    struct Redir *next;
-} Redir;
-
-typedef struct Node {
+/* NodeType, Redir, Node are declared in s2c_ast.h.
+ * The local Node struct has extra fields (set_opts) not in the header,
+ * so we use a local extension. */
+typedef struct NodeExt {
     NodeType type;
     int lineno;
-    struct Node *next;
+    struct NodeExt *next;
     /* assign */
     char *lhs, *rhs;
     /* cmd / background / subshell / group */
@@ -229,39 +178,42 @@ typedef struct Node {
     Redir *redirs;
     /* if */
     char *cond;
-    struct Node *then_blk, *else_blk;
-    struct Node *elif_conds[16]; struct Node *elif_blks[16]; int elif_count;
+    struct NodeExt *then_blk, *else_blk;
+    struct NodeExt *elif_conds[16]; struct NodeExt *elif_blks[16]; int elif_count;
     /* for */
-    char *for_var; char **for_list; int for_len; struct Node *body;
-    int for_c_style;        /* for ((i=0;i<n;i++)) */
+    char *for_var; char **for_list; int for_len; struct NodeExt *body;
+    int for_c_style;
     char *for_init, *for_cond, *for_update;
     /* while */
-    char *while_cond; int while_negate; struct Node *while_body;
+    char *while_cond; int while_negate; struct NodeExt *while_body;
     /* func */
-    char *fname; struct Node *func_body;
+    char *fname; struct NodeExt *func_body;
     /* exit/return */
     int exit_code; char *exit_str;
     /* pipe / and / or */
-    struct Node *left, *right;
+    struct NodeExt *left, *right;
     /* heredoc */
     char *heredoc_text;
     /* case */
     char *case_var;
-    char *case_pats[64]; struct Node *case_bodies[64]; int case_count;
-    struct Node *case_default;
+    char *case_pats[64]; struct NodeExt *case_bodies[64]; int case_count;
+    struct NodeExt *case_default;
     /* trap */
     char *trap_action; int trap_sig;
     /* set */
     char *set_opts;
-} Node;
+} NodeExt;
 
-static Node *new_node(NodeType t, int ln){
+/* Use NodeExt as Node throughout this file */
+#define Node NodeExt
+
+Node *new_node(NodeType t, int ln){
     Node *n=calloc(1,sizeof(Node));
     n->type=t; n->lineno=ln;
     return n;
 }
 
-static Redir *new_redir(int fd,const char *file,int append,
+Redir *new_redir(int fd,const char *file,int append,
                         int dup_fd,int is_hd,int is_hs,const char *hdtext){
     Redir *r=calloc(1,sizeof(Redir));
     r->fd=fd;
@@ -290,7 +242,7 @@ static char *pool_dup(const char *s,int len){
 }
 
 /* Multi-char operators recognized by the tokenizer */
-static int tokenize(const char *line, char **toks, int maxtoks){
+int tokenize(const char *line, char **toks, int maxtoks){
     _tok_pool_pos=0;
     int n=0; const char *p=line;
     while(*p && n<maxtoks-1){
@@ -461,7 +413,7 @@ static int tokenize(const char *line, char **toks, int maxtoks){
 
 /* Expand brace patterns in a token list.
  * Handles: {a,b,c}, {1..10}, {a..z}, prefix{a,b}suffix */
-static int expand_braces(char **toks, int ntoks, int maxtoks){
+int expand_braces(char **toks, int ntoks, int maxtoks){
     char *out[1024]; int no=0;
     for(int i=0;i<ntoks && no<1024;i++){
         char *t=toks[i];
@@ -551,21 +503,15 @@ static int expand_braces(char **toks, int ntoks, int maxtoks){
 /* ================================================================== */
 
 /* Forward declarations for expand_string (defined later in L6) */
-#define EXPAND_MAX_ARGS 64
-typedef struct {
-    char *fmt;
-    char *args[EXPAND_MAX_ARGS];
-    int   nargs;
-    int   arg_is_int[EXPAND_MAX_ARGS];
-} ExpandResult;
-static void expand_string(const char *s, ExpandResult *er);
-static void expand_free(ExpandResult *er);
+/* ExpandResult defined in s2c_emit.h */
+void expand_string(const char *s, ExpandResult *er);
+void expand_free(ExpandResult *er);
 
-static char *translate_expr(const char *tok);
+char *translate_expr(const char *tok);
 
 /* Translate ${...} body (without the braces) into a C expression string.
  * Returns heap string. */
-static char *translate_brace_expansion(const char *body){
+char *translate_brace_expansion(const char *body){
     /* body is the content between { and } */
     char name[128]; int j=0;
     const char *p=body;
@@ -815,7 +761,7 @@ static char *expand_cmd_subst(const char *cmd){
     return result;
 }
 
-static char *translate_expr(const char *tok){
+char *translate_expr(const char *tok){
     if(!tok) return xstrdup("0");
     /* Handle double-quoted strings containing ${...} or $var */
     if(tok[0]=='"' && tok[strlen(tok)-1]=='"'){
@@ -1075,12 +1021,12 @@ static char *translate_expr(const char *tok){
 /* ================================================================== */
 /* ExpandResult and EXPAND_MAX_ARGS defined in L5 section above */
 
-static void expand_free(ExpandResult *er){
+void expand_free(ExpandResult *er){
     free(er->fmt);
     for(int i=0;i<er->nargs;i++) free(er->args[i]);
 }
 
-static void expand_string(const char *s, ExpandResult *er){
+void expand_string(const char *s, ExpandResult *er){
     memset(er,0,sizeof(*er));
     char fmt[8192]; int fi=0;
     const char *p=s;
@@ -1416,10 +1362,10 @@ static void expand_string(const char *s, ExpandResult *er){
 /* L7  Condition translator  ([ ], [[ ]])                             */
 /* ================================================================== */
 
-static char *translate_cond(const char *cond);
+char *translate_cond(const char *cond);
 
 /* Translate a single test operand to a C expression string (heap). */
-static char *translate_operand(const char *tok){
+char *translate_operand(const char *tok){
     if(!tok||!*tok) return xstrdup("\"\"");
     int len=(int)strlen(tok);
     /* double-quoted: strip quotes, translate inner; if inner is a pure
@@ -1467,7 +1413,7 @@ static char *quote_if_path(const char *c){
     return xstrdup(c);
 }
 
-static char *translate_test_unary(const char *op,const char *a1){
+char *translate_test_unary(const char *op,const char *a1){
     static char buf[1024];
     char *c1=translate_operand(a1);
     char *q1=quote_if_path(c1); free(c1);
@@ -1500,7 +1446,7 @@ static char *translate_test_unary(const char *op,const char *a1){
 
 /* Translate an operand for a NUMERIC comparison context.
  * Returns a C expression of type int (no atoi wrapping needed). */
-static char *translate_num_operand(const char *tok){
+char *translate_num_operand(const char *tok){
     if(!tok||!*tok) return xstrdup("0");
     /* $(( expr )) — arithmetic, already int */
     if(strncmp(tok,"$((",3)==0) return translate_expr(tok);
@@ -1561,7 +1507,7 @@ static char *translate_num_operand(const char *tok){
     sprintf(r,"atoi(%s)",e); free(e); return r;
 }
 
-static char *translate_test_binary(const char *op,const char *a1,const char *a2){
+char *translate_test_binary(const char *op,const char *a1,const char *a2){
     static char buf[2048];
     char *c1=translate_operand(a1);
     char *c2=translate_operand(a2);
@@ -1598,7 +1544,7 @@ static char *translate_test_binary(const char *op,const char *a1,const char *a2)
     return buf;
 }
 
-static char *translate_cond(const char *cond){
+char *translate_cond(const char *cond){
     static char buf[4096];
     const char *s=cond;
     while(isspace((unsigned char)*s)) s++;
@@ -1822,14 +1768,14 @@ static char *translate_cond(const char *cond){
 /* L8  Code emitter                                                   */
 /* ================================================================== */
 
-static int tmp_id=0;
-static void emit_node(FILE *out, Node *n);
+int tmp_id=0;
+void emit_node(FILE *out, Node *n);
 static void emit_block(FILE *out, Node *n);
-static Node *pending_pipe_cmd=NULL;
-static int pipe_restore_needed=0;
+Node *pending_pipe_cmd=NULL;
+int pipe_restore_needed=0;
 
 /* Emit a word as a C string expression. Returns heap string naming a C lvalue/expression. */
-static char *emit_word(FILE *out, const char *word){
+char *emit_word(FILE *out, const char *word){
     if(!word) return xstrdup("\"\"");
     /* process substitution: <(cmd) or >(cmd) */
     if((word[0]=='<'||word[0]=='>')&&word[1]=='('){
@@ -1889,9 +1835,9 @@ static char *emit_word(FILE *out, const char *word){
 
 /* Emit redirects: returns number of saved-fd statements emitted.
  * Each saved fd is named __sfd_<id>_<fd>. Caller must emit restore after. */
-static int __redir_counter = 0;
+int __redir_counter = 0;
 
-static int emit_redirs_save(FILE *out, Redir *r, int id){
+int emit_redirs_save(FILE *out, Redir *r, int id){
     (void)id;
     int myid = __redir_counter++;
     int count=0;
@@ -1904,7 +1850,7 @@ static int emit_redirs_save(FILE *out, Redir *r, int id){
     return count;
 }
 
-static void emit_redirs_apply(FILE *out, Redir *r, int id){
+void emit_redirs_apply(FILE *out, Redir *r, int id){
     (void)id;
     for(Redir *p=r;p;p=p->next){
         if(p->is_herestr){
@@ -1960,7 +1906,7 @@ static void emit_redirs_apply(FILE *out, Redir *r, int id){
     }
 }
 
-static void emit_redirs_restore(FILE *out, Redir *r, int id){
+void emit_redirs_restore(FILE *out, Redir *r, int id){
     (void)id;
     int myid = r ? r->fd_high : 0;
     /* restore in reverse order */
@@ -2060,7 +2006,7 @@ static void emit_pipe(FILE *out, Node *n){
 }
 
 /* Dispatch a single command word to its builtin or function call. */
-static void emit_command(FILE *out, char **argv, int ac, int id){
+void emit_command(FILE *out, char **argv, int ac, int id){
     const char *cmd=argv[0];
     /* internal: arithmetic command from (( expr )) */
     if(!strcmp(cmd,"__arith")&&ac>=2){
@@ -2996,7 +2942,7 @@ static void emit_command(FILE *out, char **argv, int ac, int id){
     }
 }
 
-static void emit_node(FILE *out, Node *n){
+void emit_node(FILE *out, Node *n){
     if(!n) return;
     switch(n->type){
 
@@ -3666,7 +3612,7 @@ static void emit_block(FILE *out, Node *n){
 }
 
 /* Scan a node tree for local variable declarations */
-static void scan_locals(Node *n, char locals[][128], int *nloc, int max){
+void scan_locals(Node *n, char locals[][128], int *nloc, int max){
     if(!n || *nloc>=max) return;
     if(n->type==NODE_LOCAL){
         for(int i=0;i<n->argc;i++){
@@ -3693,7 +3639,7 @@ static void scan_locals(Node *n, char locals[][128], int *nloc, int max){
     if(n->func_body) scan_locals(n->func_body,locals,nloc,max);
 }
 
-static void emit_functions(FILE *out, Node *n){
+void emit_functions(FILE *out, Node *n){
     if(!n) return;
     if(n->type==NODE_FUNC){
         fprintf(out,"static void %s(int __sh_argc, char **__sh_args){\n",safe_cname(n->fname));
@@ -3743,19 +3689,12 @@ static void emit_functions(FILE *out, Node *n){
 /* L9  Parser                                                         */
 /* ================================================================== */
 
-#define STACK_MAX 128
-typedef struct {
-    enum { BLK_IF_THEN,BLK_IF_ELIF,BLK_IF_ELSE,
-           BLK_FOR,BLK_WHILE,BLK_FUNC,BLK_CASE,BLK_SUBSHELL,BLK_GROUP } kind;
-    Node *node;
-    Node **insert;
-    Node **parent_insert;
-} BlkFrame;
-
-static BlkFrame blk_stack[STACK_MAX];
-static int blk_top=0;
-static Node *parse_root=NULL;
-static Node **parse_insert=NULL;
+/* BlkFrame, BlkKind, blk_stack, blk_top, parse_root, parse_insert
+ * are declared in s2c_parse.h. Definitions here: */
+BlkFrame blk_stack[STACK_MAX];
+int blk_top=0;
+Node *parse_root=NULL;
+Node **parse_insert=NULL;
 /* pending_pipe_cmd and pipe_restore_needed declared in L8 emitter section */
 
 static Node **chain_tail(Node **hp){
@@ -3787,7 +3726,7 @@ static void parser_pop(void){
     }
 }
 
-static void strip_comment(char *line){
+void strip_comment(char *line){
     int dq=0,sq=0,brace=0;
     for(int i=0;line[i];i++){
         if(line[i]=='"'&&!sq) dq=!dq;
@@ -3806,7 +3745,7 @@ static void strip_comment(char *line){
     }
 }
 
-static int is_assignment(const char *t){
+int is_assignment(const char *t){
     /* Check for = += -= *= /= %= */
     const char *eq=NULL;
     const char *p=t;
@@ -3828,8 +3767,8 @@ static int is_assignment(const char *t){
 }
 
 /* Check if token is an append assignment (+=, -=, etc.) */
-static int is_append_assign(const char *t) __attribute__((unused));
-static int is_append_assign(const char *t){
+int is_append_assign(const char *t) __attribute__((unused));
+int is_append_assign(const char *t){
     const char *p=strstr(t,"+=");
     if(p && p>t){
         for(const char *q=t;q<p;q++)
@@ -3840,7 +3779,7 @@ static int is_append_assign(const char *t){
 }
 
 /* Check if token is an array element assignment: arr[key]=value or arr[key]="value" */
-static int is_array_assignment(const char *t){
+int is_array_assignment(const char *t){
     /* pattern: name[...]=... */
     const char *lb=strchr(t,'[');
     if(!lb || lb==t) return 0;
@@ -3859,7 +3798,7 @@ static int is_array_assignment(const char *t){
 }
 
 /* Extract array name from arr[key]=value */
-static void extract_array_assign(const char *t, char *name, int name_sz, char *key, int key_sz, char *val, int val_sz, int *is_append){
+void extract_array_assign(const char *t, char *name, int name_sz, char *key, int key_sz, char *val, int val_sz, int *is_append){
     const char *lb=strchr(t,'[');
     const char *rb=strchr(lb,']');
     int nl=(int)(lb-t);
@@ -3875,7 +3814,7 @@ static void extract_array_assign(const char *t, char *name, int name_sz, char *k
     strncpy(val,eq,val_sz-1); val[val_sz-1]=0;
 }
 
-static int find_op(char **toks,int n,const char *op){
+int find_op(char **toks,int n,const char *op){
     int d=0;
     for(int i=0;i<n;i++){
         if(!strcmp(toks[i],"[")||!strcmp(toks[i],"[[")||!strcmp(toks[i],"(")) d++;
@@ -3885,7 +3824,7 @@ static int find_op(char **toks,int n,const char *op){
     return -1;
 }
 
-static Node *make_cmd(char **toks,int n,int ln){
+Node *make_cmd(char **toks,int n,int ln){
     Node *nd=new_node(NODE_CMD,ln);
     nd->argv=malloc((n+1)*sizeof(char*)); nd->argc=n;
     for(int i=0;i<n;i++) nd->argv[i]=xstrdup(toks[i]);
@@ -3908,7 +3847,7 @@ static Node *make_cmd(char **toks,int n,int ln){
     return nd;
 }
 
-static void parse_for_header(const char *src,char *var,char ***list,int *len){
+void parse_for_header(const char *src,char *var,char ***list,int *len){
     char tmp[1024]; strncpy(tmp,src,1023); tmp[1023]=0;
     char *p;
     if((p=strstr(tmp,"; do")))*p=0;
@@ -3985,7 +3924,7 @@ static void parse_for_header(const char *src,char *var,char ***list,int *len){
 
 /* Process one logical line (a segment between ; separators).
  * Handles block keywords, assignments, &&/||, pipes, redirects, plain cmds. */
-static void dispatch_segment(char **toks, int ntoks, int lineno){
+void dispatch_segment(char **toks, int ntoks, int lineno){
     if(ntoks<=0) return;
         const char *kw=toks[0];
 
@@ -4530,7 +4469,7 @@ static void dispatch_segment(char **toks, int ntoks, int lineno){
         parser_append(make_cmd(toks,ntoks,lineno));
 }
 
-static Node *parse_script(FILE *f){
+Node *parse_script(FILE *f){
     char line[8192]; int lineno=0;
     blk_top=0; parse_root=NULL; parse_insert=NULL;
     while(fgets(line,sizeof(line),f)){
@@ -4629,7 +4568,7 @@ static Node *parse_script(FILE *f){
 /* L10 Runtime library (emitted into output C file)                  */
 /* ================================================================== */
 
-static const char *RT_HEADER =
+const char *RT_HEADER =
 "/* ---- shell2c runtime (deep optimization) ---- */\n"
 "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
 "#include <ctype.h>\n#include <unistd.h>\n#include <dirent.h>\n"
@@ -5159,13 +5098,21 @@ static const char *RT_HEADER =
 /* ================================================================== */
 
 int main(int argc, char **argv){
+    int do_obfuscate = 0;
+    /* Check for --obfuscate flag */
+    for(int i=3;i<argc;i++){
+        if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
+    }
+
     if(argc<3){
         fprintf(stderr,
-            "shell2c — Shell-to-C Transpiler (deep optimization)\n\n"
-            "Usage: %s input.sh output.c [--makefile] [--run]\n\n"
+            "shell2c — Shell-to-C Transpiler (modular + obfuscation)\n\n"
+            "Author: 爱摸鱼的狐狸 🦊\n\n"
+            "Usage: %s input.sh output.c [--makefile] [--run] [--obfuscate]\n\n"
             "Options:\n"
             "  --makefile   Also emit a Makefile for the output\n"
-            "  --run        Compile and run the output immediately\n",
+            "  --run        Compile and run the output immediately\n"
+            "  --obfuscate  Generate obfuscated C code (anti-analysis)\n",
             argv[0]);
         return 1;
     }
@@ -5179,10 +5126,18 @@ int main(int argc, char **argv){
 
     fprintf(fout,"/* ============================================================\n");
     fprintf(fout," * Generated by shell2c — Shell-to-C Transpiler\n");
+    fprintf(fout," * Author: 爱摸鱼的狐狸\n");
     fprintf(fout," * Source: %s\n",argv[1]);
+    if(do_obfuscate)
+        fprintf(fout," * Mode: obfuscated (anti-analysis enabled)\n");
     fprintf(fout," * This file is auto-generated. Do not edit manually.\n");
     fprintf(fout," * ============================================================ */\n\n");
     fprintf(fout,"%s",RT_HEADER);
+
+    /* Emit obfuscation runtime if requested */
+    if(do_obfuscate){
+        emit_obfuscation_runtime(fout);
+    }
 
     /* global variables */
     fprintf(fout,"/* ---- user variables ---- */\n");
