@@ -26,6 +26,7 @@
 #include "src/s2c_emit.h"
 #include "src/s2c_parse.h"
 #include "src/s2c_obfuscate.h"
+#include "src/s2c_mangle.h"
 
 /* ================================================================== */
 /* L0  Utility — definitions now in s2c_common.h                       */
@@ -5104,6 +5105,9 @@ int main(int argc, char **argv){
         if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
     }
 
+    /* Initialize name mangler */
+    mangle_init(do_obfuscate);
+
     if(argc<3){
         fprintf(stderr,
             "shell2c — Shell-to-C Transpiler (modular + obfuscation)\n\n"
@@ -5132,7 +5136,14 @@ int main(int argc, char **argv){
         fprintf(fout," * Mode: obfuscated (anti-analysis enabled)\n");
     fprintf(fout," * This file is auto-generated. Do not edit manually.\n");
     fprintf(fout," * ============================================================ */\n\n");
-    fprintf(fout,"%s",RT_HEADER);
+    /* Emit runtime header — mangle names if obfuscation is on */
+    if(do_obfuscate){
+        /* Mangle the entire RT_HEADER string */
+        const char *mangled_header = mangle_string(RT_HEADER);
+        fprintf(fout, "%s", mangled_header);
+    } else {
+        fprintf(fout, "%s", RT_HEADER);
+    }
 
     /* Emit obfuscation runtime if requested */
     if(do_obfuscate){
@@ -5184,7 +5195,31 @@ int main(int argc, char **argv){
     }
     fprintf(fout,"    return __exit_status;\n}\n");
 
-    fclose(fout);
+    /* Post-process: if obfuscation is on, mangle all names in the output file */
+    if(do_obfuscate){
+        fclose(fout);
+        /* Re-read, mangle, and re-write */
+        FILE *fin2 = fopen(argv[2], "r");
+        if(fin2){
+            fseek(fin2, 0, SEEK_END);
+            long fsize = ftell(fin2);
+            fseek(fin2, 0, SEEK_SET);
+            char *content = malloc(fsize + 1);
+            fread(content, 1, fsize, fin2);
+            content[fsize] = 0;
+            fclose(fin2);
+
+            const char *mangled = mangle_string(content);
+            fout = fopen(argv[2], "w");
+            if(fout){
+                fprintf(fout, "%s", mangled);
+                fclose(fout);
+            }
+            free(content);
+        }
+    } else {
+        fclose(fout);
+    }
     printf("[OK] %s -> %s\n",argv[1],argv[2]);
 
     int make_run=0;
