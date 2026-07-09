@@ -4373,21 +4373,34 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             parser_append(nd); return;
         }
 
-        /* && and || at top level */
+        /* && and || at top level — left-associative chaining */
         {
             int ai=find_op(toks,ntoks,"&&");
             int oi=find_op(toks,ntoks,"||");
             if(ai>=0 && (oi<0 || ai<oi)){
                 Node *nd=new_node(NODE_AND,lineno);
                 nd->left=make_cmd(toks,ai,lineno);
-                nd->right=make_cmd(toks+ai+1,ntoks-ai-1,lineno);
-                parser_append(nd); return;
+                /* Right side may contain more && or || — dispatch recursively */
+                Node **_pi=parse_insert;
+                parser_append(nd);
+                BlkFrame fr={BLK_IF_THEN,nd,&nd->right,_pi};
+                parser_push(fr);
+                parse_insert=&nd->right;
+                dispatch_segment(toks+ai+1,ntoks-ai-1,lineno);
+                parser_pop();
+                return;
             }
             if(oi>=0){
                 Node *nd=new_node(NODE_OR,lineno);
                 nd->left=make_cmd(toks,oi,lineno);
-                nd->right=make_cmd(toks+oi+1,ntoks-oi-1,lineno);
-                parser_append(nd); return;
+                Node **_pi=parse_insert;
+                parser_append(nd);
+                BlkFrame fr={BLK_IF_ELSE,nd,&nd->right,_pi};
+                parser_push(fr);
+                parse_insert=&nd->right;
+                dispatch_segment(toks+oi+1,ntoks-oi-1,lineno);
+                parser_pop();
+                return;
             }
         }
 
@@ -4447,9 +4460,29 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             }
             if(end>1){
                 Node *nd=new_node(NODE_SUBSHELL,lineno);
-                /* parse inner as a sub-script? For simplicity, treat as a group cmd */
-                nd->left=make_cmd(toks+1,end-1,lineno);
-                parser_append(nd); return;
+                /* Parse inner content as multiple segments (handle ; inside) */
+                nd->left=NULL;
+                Node **_pi=parse_insert;
+                parser_append(nd);
+                BlkFrame fr={BLK_IF_THEN,nd,&nd->left,_pi};
+                parser_push(fr);
+                parse_insert=&nd->left;
+                /* Split inner tokens on ; and dispatch each */
+                int inner_start=1;
+                for(int i=1;i<=end;i++){
+                    if(i==end || !strcmp(toks[i],";")){
+                        if(i>inner_start){
+                            dispatch_segment(toks+inner_start,i-inner_start,lineno);
+                        }
+                        inner_start=i+1;
+                    }
+                }
+                parser_pop();
+                /* If there are tokens after ), handle them */
+                if(end+1<ntoks){
+                    dispatch_segment(toks+end+1,ntoks-end-1,lineno);
+                }
+                return;
             }
         }
 
