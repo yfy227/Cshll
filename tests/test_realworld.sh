@@ -18,7 +18,7 @@ EOF
 # Heredoc without expansion (quoted delimiter)
 cat <<'NOEXPAND'
 $TODAY stays literal
-EOF
+NOEXPAND
 
 # Heredoc to variable
 VAR=$(cat <<HEREDOC

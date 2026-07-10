@@ -418,10 +418,12 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
     char *out[1024]; int no=0;
     for(int i=0;i<ntoks && no<1024;i++){
         char *t=toks[i];
-        /* find { in the token (but not ${) */
+        /* find { in the token (but not ${, and not inside double quotes) */
         char *bp=NULL;
+        int in_dq=0;
         for(char *p=t;*p;p++){
-            if(*p=='{' && (p==t||*(p-1)!='$')){
+            if(*p=='"' && (p==t||*(p-1)!='\\')) in_dq=!in_dq;
+            if(!in_dq && *p=='{' && (p==t||*(p-1)!='$')){
                 /* check for matching } */
                 int d=1; char *q=p+1;
                 while(*q && d){ if(*q=='{')d++; else if(*q=='}')d--; if(d)q++; }
@@ -594,23 +596,46 @@ char *translate_brace_expansion(const char *body){
         char r[2048];
         const char *cn;
         char cnbuf[300];
+        /* For := operator, auto-register unknown vars as V_STR */
+        if(op=='=' && !isdigit((unsigned char)name[0]) && !is_known_var(name)){
+            add_var(name,V_STR);
+        }
+        VarKind vk = get_var_kind(name);
         if(isdigit((unsigned char)name[0])){
             /* positional parameter: $1 -> __sh_arg1 */
             snprintf(cnbuf,sizeof(cnbuf),"__sh_arg%s",name);
             cn=cnbuf;
+            vk = V_STR; /* positional params are strings */
         } else if(is_known_var(name)){
             cn=safe_cname(name);
         } else {
             /* unknown variable — use getenv */
             snprintf(cnbuf,sizeof(cnbuf),"(__sh_getenv(\"%s\"))",name);
             cn=cnbuf;
+            vk = V_STR;
         }
-        switch(op){
-            case '-': snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def); break;
-            case '=': snprintf(r,sizeof(r),"(%s[0]?%s:(strncpy(%s,\"%s\",sizeof(%s)-1),%s))",cn,cn,cn,def,cn,cn); break;
-            case '+': snprintf(r,sizeof(r),"(%s[0]?\"%s\":\"\")",cn,def); break;
-            case '?': snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%s\\n\"),exit(1),\"\"))",cn,cn,def); break;
-            default:  snprintf(r,sizeof(r),"%s",cn); break;
+        if(vk == V_INT){
+            /* int variables are always "set" in C — use string representation */
+            switch(op){
+                case '-': snprintf(r,sizeof(r),"__sh_fmt(\"%%d\",%s)",cn); break;
+                case '=': snprintf(r,sizeof(r),"__sh_fmt(\"%%d\",%s)",cn); break;
+                case '+': snprintf(r,sizeof(r),"\"%s\"",def); break;
+                case '?': snprintf(r,sizeof(r),"__sh_fmt(\"%%d\",%s)",cn); break;
+                default:  snprintf(r,sizeof(r),"__sh_fmt(\"%%d\",%s)",cn); break;
+            }
+        } else {
+            switch(op){
+                case '-': snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def); break;
+                case '=':
+                    if(is_known_var(name))
+                        snprintf(r,sizeof(r),"(%s[0]?%s:(strncpy(%s,\"%s\",sizeof(%s)-1),%s))",cn,cn,cn,def,cn,cn);
+                    else
+                        snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def);
+                    break;
+                case '+': snprintf(r,sizeof(r),"(%s[0]?\"%s\":\"\")",cn,def); break;
+                case '?': snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%s\\n\"),exit(1),\"\"))",cn,cn,def); break;
+                default:  snprintf(r,sizeof(r),"%s",cn); break;
+            }
         }
         return xstrdup(r);
     }
@@ -762,6 +787,130 @@ static char *expand_cmd_subst(const char *cmd){
     return result;
 }
 
+/* Translate a shell arithmetic expression (as used in for ((init;cond;update)))
+ * into a C expression string. Returns heap string.
+ * For string variables, uses atoi() for reads and snprintf() for writes. */
+char *translate_arith(const char *expr);
+char *translate_arith(const char *expr){
+    if(!expr || !*expr) return xstrdup("");
+    char buf[2048]; int q=0;
+    const char *s=expr;
+    while(*s==' '||*s=='\t') s++;
+    while(*s && q<(int)sizeof(buf)-8){
+        if(isalpha((unsigned char)*s)||*s=='_'){
+            char nm[128]; int j=0;
+            while(isalnum((unsigned char)*s)||*s=='_'){
+                if(j<(int)sizeof(nm)-1) nm[j++]=*s;
+                s++;
+            }
+            nm[j]=0;
+            const char *cn=safe_cname(nm);
+            VarKind vk=get_var_kind(nm);
+            /* check for = assignment (not ==, <=, >=, !=) */
+            const char *np=s; while(*np==' '||*np=='\t') np++;
+            if(*np=='='&&*(np+1)!='='){
+                /* assignment: var = expr */
+                if(vk==V_STR){
+                    /* snprintf(var, sizeof(var), "%d", (expr)) */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"snprintf(%s,sizeof(%s),\"%%d\",",cn,cn);
+                } else {
+                    if(!is_known_var(nm)) add_var(nm,V_INT);
+                    cn=safe_cname(nm);
+                    while(*cn) buf[q++]=*cn++;
+                    buf[q++]='=';
+                }
+                /* skip the = */
+                s=np+1;
+                /* read the RHS expression */
+                while(*s==' '||*s=='\t') s++;
+                while(*s && *s!=';' && q<(int)sizeof(buf)-4){
+                    if(isalpha((unsigned char)*s)||*s=='_'){
+                        char nm2[128]; int j2=0;
+                        while(isalnum((unsigned char)*s)||*s=='_'){
+                            if(j2<(int)sizeof(nm2)-1) nm2[j2++]=*s;
+                            s++;
+                        }
+                        nm2[j2]=0;
+                        const char *cn2=safe_cname(nm2);
+                        VarKind vk2=get_var_kind(nm2);
+                        if(vk2==V_STR){
+                            const char *pre="atoi("; while(*pre) buf[q++]=*pre++;
+                            while(*cn2) buf[q++]=*cn2++;
+                            buf[q++]=')';
+                        } else {
+                            while(*cn2) buf[q++]=*cn2++;
+                        }
+                    } else {
+                        buf[q++]=*s++;
+                    }
+                }
+                if(vk==V_STR) buf[q++]=')';
+                continue;
+            }
+            /* check for ++ or -- */
+            if(*np=='+'&&*(np+1)=='+'){
+                if(vk==V_STR){
+                    q+=snprintf(buf+q,sizeof(buf)-q,"snprintf(%s,sizeof(%s),\"%%d\",atoi(%s)+1)",cn,cn,cn);
+                } else {
+                    while(*cn) buf[q++]=*cn++;
+                    buf[q++]='+'; buf[q++]='+';
+                }
+                s=np+2;
+                continue;
+            }
+            if(*np=='-'&&*(np+1)=='-'){
+                if(vk==V_STR){
+                    q+=snprintf(buf+q,sizeof(buf)-q,"snprintf(%s,sizeof(%s),\"%%d\",atoi(%s)-1)",cn,cn,cn);
+                } else {
+                    while(*cn) buf[q++]=*cn++;
+                    buf[q++]='-'; buf[q++]='-';
+                }
+                s=np+2;
+                continue;
+            }
+            /* read context */
+            if(vk==V_STR){
+                const char *pre="atoi("; while(*pre) buf[q++]=*pre++;
+                while(*cn) buf[q++]=*cn++;
+                buf[q++]=')';
+            } else {
+                while(*cn) buf[q++]=*cn++;
+            }
+        } else if(*s=='$'){
+            s++;
+            if(*s=='{'){
+                s++;
+                char nm[128]; int j=0;
+                while(*s && *s!='}') nm[j++]=*s++;
+                nm[j]=0; if(*s) s++;
+                char *e=translate_brace_expansion(nm);
+                int el=(int)strlen(e);
+                if(q+el<(int)sizeof(buf)-2){ memcpy(buf+q,e,el); q+=el; }
+                free(e);
+            } else if(isalpha((unsigned char)*s)||*s=='_'){
+                char nm[128]; int j=0;
+                while(isalnum((unsigned char)*s)||*s=='_') nm[j++]=*s++;
+                nm[j]=0;
+                const char *cn=safe_cname(nm);
+                VarKind vk=get_var_kind(nm);
+                if(vk==V_STR){
+                    const char *pre="atoi("; while(*pre) buf[q++]=*pre++;
+                    while(*cn) buf[q++]=*cn++;
+                    buf[q++]=')';
+                } else {
+                    while(*cn) buf[q++]=*cn++;
+                }
+            }
+        } else {
+            buf[q++]=*s++;
+        }
+    }
+    buf[q]=0;
+    /* trim trailing whitespace */
+    while(q>0 && (buf[q-1]==' '||buf[q-1]=='\t')) buf[--q]=0;
+    return xstrdup(buf);
+}
+
 char *translate_expr(const char *tok){
     if(!tok) return xstrdup("0");
     /* Handle double-quoted strings containing ${...} or $var */
@@ -856,6 +1005,14 @@ char *translate_expr(const char *tok){
                 nm[j]=0;
                 VarKind vk=get_var_kind(nm);
                 const char *cn=safe_cname(nm);
+                /* check for = assignment (not ==) — register as int var */
+                {
+                    const char *np=s; while(*np==' '||*np=='\t') np++;
+                    if(*np=='='&&*(np+1)!='='){
+                        add_var(nm,V_INT);
+                        vk=V_INT; cn=safe_cname(nm);
+                    }
+                }
                 /* check for ++ or -- after variable (post-increment/decrement) */
                 if(vk==V_STR && (*s=='+'&&*(s+1)=='+')){
                     /* var++ → (atoi(var), snprintf(var,...,"%d",atoi(var)+1), atoi(var)-1) */
@@ -889,7 +1046,7 @@ char *translate_expr(const char *tok){
                         char base[256]; int bl=q-bs;
                         memcpy(base,buf+bs,bl); base[bl]=0;
                         q=bs;
-                        const char *fn="__sh_pow("; while(*fn) buf[q++]=*fn++;
+                        const char *fn="(int)__sh_pow("; while(*fn) buf[q++]=*fn++;
                         for(int bi=0;base[bi];bi++) buf[q++]=base[bi];
                         buf[q++]=',';
                         s+=2;
@@ -1054,13 +1211,15 @@ void expand_string(const char *s, ExpandResult *er){
         if(*p=='\\'){
             p++;
             switch(*p){
-                case 'n': fmt[fi++]='\\'; fmt[fi++]='n'; break;
-                case 't': fmt[fi++]='\\'; fmt[fi++]='t'; break;
-                case 'r': fmt[fi++]='\\'; fmt[fi++]='r'; break;
-                case '\\': fmt[fi++]='\\'; fmt[fi++]='\\'; break;
-                case '"': fmt[fi++]='\\'; fmt[fi++]='"'; break;
-                case '\'': fmt[fi++]='\\'; fmt[fi++]='\''; break;
-                case '0': fmt[fi++]='\\'; fmt[fi++]='0'; break;
+                case 'n': fmt[fi++]='\n'; break;
+                case 't': fmt[fi++]='\t'; break;
+                case 'r': fmt[fi++]='\r'; break;
+                case '\\': fmt[fi++]='\\'; break;
+                case '"': fmt[fi++]='"'; break;
+                case '\'': fmt[fi++]='\''; break;
+                case '0': fmt[fi++]='\0'; break;
+                case '$': fmt[fi++]='$'; break;
+                case '`': fmt[fi++]='`'; break;
                 default:  if(*p) fmt[fi++]=*p; break;
             }
             if(*p) p++;
@@ -1160,6 +1319,14 @@ void expand_string(const char *s, ExpandResult *er){
                         nm[j]=0;
                         VarKind vk=get_var_kind(nm);
                         const char *cn=safe_cname(nm);
+                        /* check for = assignment (not ==) — register as int var */
+                        {
+                            const char *np=p; while(*np==' '||*np=='\t') np++;
+                            if(*np=='='&&*(np+1)!='='){
+                                add_var(nm,V_INT);
+                                vk=V_INT; cn=safe_cname(nm);
+                            }
+                        }
                         /* handle ++ and -- for string variables */
                         if(vk==V_STR && (*p=='+'&&*(p+1)=='+')){
                             p+=2;
@@ -1187,7 +1354,7 @@ void expand_string(const char *s, ExpandResult *er){
                             char base[256]; int bl=k-bs;
                             memcpy(base,expr+bs,bl); base[bl]=0;
                             k=bs;
-                            const char *fn="__sh_pow("; while(*fn) expr[k++]=*fn++;
+                            const char *fn="(int)__sh_pow("; while(*fn) expr[k++]=*fn++;
                             for(int bi=0;base[bi];bi++) expr[k++]=base[bi];
                             expr[k++]=',';
                             p+=2;
@@ -1553,8 +1720,12 @@ char *translate_cond(const char *cond){
     if(starts_with(s,"[[")){
         s+=2; while(isspace((unsigned char)*s)) s++;
         char tmp[2048]; strncpy(tmp,s,sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
-        int rp=(int)strlen(tmp)-1;
-        while(rp>=0 && (isspace((unsigned char)tmp[rp])||tmp[rp]==']')) tmp[rp--]=0;
+        int rp=(int)strlen(tmp);
+        /* strip trailing whitespace */
+        while(rp>0 && isspace((unsigned char)tmp[rp-1])) tmp[--rp]=0;
+        /* strip trailing ]] (exactly 2 brackets) */
+        if(rp>=2 && tmp[rp-1]==']' && tmp[rp-2]==']'){ tmp[--rp]=0; tmp[--rp]=0; }
+        else if(rp>=1 && tmp[rp-1]==']'){ tmp[--rp]=0; } /* single ] */
         s=tmp;
         /* tokenize on spaces, handle && || ! */
         /* simple approach: split into words, build expression */
@@ -1583,7 +1754,23 @@ char *translate_cond(const char *cond){
                     !strcmp(words[wi+1],"-ef")||!strcmp(words[wi+1],"-nt")||
                     !strcmp(words[wi+1],"-ot"))){
                     if(!strcmp(words[wi+1],"=~")){
-                        bi+=snprintf(buf+bi,sizeof(buf)-bi,"(__sh_regex(%s,%s))",words[wi],words[wi+2]);
+                        /* regex pattern: merge remaining words into one pattern
+                         * (tokenizer may have split [a-z] etc.)
+                         * Join without spaces for regex patterns */
+                        char patbuf[512]; int pi=0;
+                        char *lhs=translate_operand(words[wi]);
+                        /* Start from words[wi+2], merge until end */
+                        for(int j=wi+2; j<nw && pi<(int)sizeof(patbuf)-4; j++){
+                            for(const char *c=words[j]; *c && pi<(int)sizeof(patbuf)-4; c++){
+                                if(*c=='"'||*c=='\\') patbuf[pi++]='\\';
+                                patbuf[pi++]=*c;
+                            }
+                        }
+                        patbuf[pi]=0;
+                        bi+=snprintf(buf+bi,sizeof(buf)-bi,"(__sh_regex(%s,\"%s\"))",lhs,patbuf);
+                        free(lhs);
+                        wi=nw; /* consume rest */
+                        continue;
                     } else if(!strcmp(words[wi+1],"==")||!strcmp(words[wi+1],"!=")){
                         /* check if right side is a glob pattern (unquoted with * ? [) */
                         const char *rhs=words[wi+2];
@@ -1623,11 +1810,30 @@ char *translate_cond(const char *cond){
                     bi+=snprintf(buf+bi,sizeof(buf)-bi,"%s",r);
                     wi+=2;
                 } else {
-                    /* bare word — truthiness */
-                    char *e=translate_expr(words[wi]);
-                    bi+=snprintf(buf+bi,sizeof(buf)-bi,"(%s[0]!='\\0')",e);
-                    free(e);
-                    wi++;
+                    /* Check if this is a user-defined function call */
+                    if(is_user_func(words[wi])){
+                        /* merge remaining words as function args */
+                        char fargs[1024]; int fai=0;
+                        fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"__exit_status=0; int __save_argc=__sh_argc; char *__av[]={");
+                        int fnargs=0;
+                        int j;
+                        for(j=wi+1; j<nw; j++){
+                            /* stop at && || ! */
+                            if(!strcmp(words[j],"&&")||!strcmp(words[j],"||")||!strcmp(words[j],"!")) break;
+                            fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"\"%s\",",words[j]);
+                            fnargs++;
+                        }
+                        fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"NULL}; __sh_argc=%d; %s(__sh_argc,__av); __sh_argc=__save_argc; (__exit_status==0);",
+                            fnargs,safe_cname(words[wi]));
+                        bi+=snprintf(buf+bi,sizeof(buf)-bi,"(int)({%s})",fargs);
+                        wi=j;
+                    } else {
+                        /* bare word — truthiness */
+                        char *e=translate_expr(words[wi]);
+                        bi+=snprintf(buf+bi,sizeof(buf)-bi,"(%s[0]!='\\0')",e);
+                        free(e);
+                        wi++;
+                    }
                 }
             }
         }
@@ -1752,6 +1958,44 @@ char *translate_cond(const char *cond){
     /* true / false as condition */
     if(!strcmp(s,"true")||!strcmp(s,":")) return (char*)"1";
     if(!strcmp(s,"false")) return (char*)"0";
+    /* user-defined function as condition (with optional ! prefix) */
+    {
+        /* skip leading ! */
+        const char *fs=s;
+        int negate=0;
+        while(*fs=='!'){ negate=!negate; fs++; while(*fs==' '||*fs=='\t') fs++; }
+        /* extract first word (function name) */
+        char fname[128]; int fi=0;
+        const char *p=fs;
+        while(*p && *p!=' ' && *p!='\t' && fi<(int)sizeof(fname)-1) fname[fi++]=*p++;
+        fname[fi]=0;
+        if(fi>0 && is_user_func(fname)){
+            /* call the function and check __exit_status */
+            char args[2048]; int ai=0; int nargs=0;
+            ai+=snprintf(args+ai,sizeof(args)-ai,"__exit_status=0; char *__av[]={");
+            /* build argv */
+            /* skip function name */
+            p=fs;
+            while(*p && *p!=' ' && *p!='\t') p++;
+            while(*p){
+                while(*p==' '||*p=='\t') p++;
+                if(!*p) break;
+                char arg[256]; int al=0;
+                if(*p=='"'){ p++; while(*p && *p!='"' && al<(int)sizeof(arg)-1) arg[al++]=*p++; if(*p=='"')p++; }
+                else if(*p=='\''){ p++; while(*p && *p!='\'' && al<(int)sizeof(arg)-1) arg[al++]=*p++; if(*p=='\'')p++; }
+                else { while(*p && *p!=' ' && *p!='\t' && al<(int)sizeof(arg)-1) arg[al++]=*p++; }
+                arg[al]=0;
+                ai+=snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                nargs++;
+            }
+            ai+=snprintf(args+ai,sizeof(args)-ai,"NULL}; int __save_argc=__sh_argc; __sh_argc=%d; %s(__sh_argc,__av); __sh_argc=__save_argc; (__exit_status==0);",nargs,safe_cname(fname));
+            if(negate)
+                snprintf(buf,sizeof(buf),"! (int)({%s})",args);
+            else
+                snprintf(buf,sizeof(buf),"(int)({%s})",args);
+            return buf;
+        }
+    }
     /* command as condition — non-empty output = true */
     {
         char esc[2048]; int e=0;
@@ -1819,14 +2063,33 @@ char *emit_word(FILE *out, const char *word){
         strncpy(inner,word,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
     }
     if(!strchr(inner,'$')&&!strchr(inner,'\\')){
-        char *r=malloc(strlen(inner)+3);
-        sprintf(r,"\"%s\"",inner);
+        /* Escape embedded newlines/tabs for C string literal */
+        char esc[8192]; int ei=0;
+        for(int i=0;inner[i]&&ei<(int)sizeof(esc)-4;i++){
+            if(inner[i]=='\n'){ esc[ei++]='\\'; esc[ei++]='n'; }
+            else if(inner[i]=='\t'){ esc[ei++]='\\'; esc[ei++]='t'; }
+            else if(inner[i]=='\r'){ esc[ei++]='\\'; esc[ei++]='r'; }
+            else if(inner[i]=='"'){ esc[ei++]='\\'; esc[ei++]='"'; }
+            else esc[ei++]=inner[i];
+        }
+        esc[ei]=0;
+        char *r=malloc(strlen(esc)+3);
+        sprintf(r,"\"%s\"",esc);
         return r;
     }
     ExpandResult er; expand_string(word,&er);
     int id=tmp_id++;
-    fprintf(out,"    char __tw_%d[1024]; snprintf(__tw_%d, sizeof(__tw_%d), \"%s\"",
-            id,id,id,er.fmt);
+    /* Escape newlines/tabs in fmt for C string literal */
+    fprintf(out,"    char __tw_%d[1024]; snprintf(__tw_%d, sizeof(__tw_%d), \"",id,id,id);
+    for(const char *c=er.fmt;*c;c++){
+        if(*c=='\n') fprintf(out,"\\n");
+        else if(*c=='\t') fprintf(out,"\\t");
+        else if(*c=='\r') fprintf(out,"\\r");
+        else if(*c=='"') fprintf(out,"\\\"");
+        else if(*c=='\\') fprintf(out,"\\\\");
+        else fprintf(out,"%c",*c);
+    }
+    fprintf(out,"\"");
     for(int i=0;i<er.nargs;i++) fprintf(out,", %s",er.args[i]);
     fprintf(out,");\n");
     expand_free(&er);
@@ -2100,13 +2363,39 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     if(!strcmp(cmd,"cut")){
         char delim=' '; const char *fields=NULL; const char *files[16]; int nf=0;
         for(int i=1;i<ac;i++){
-            if(!strcmp(argv[i],"-d")&&i+1<ac) delim=argv[++i][0];
+            if(!strcmp(argv[i],"-d")&&i+1<ac){
+                const char *dv=argv[++i];
+                /* handle single-quoted delimiter: 'x' → x */
+                if(dv[0]=='\'' && dv[1] && dv[2]=='\'') delim=dv[1];
+                else if(dv[0]=='\\') delim=dv[1]; /* escaped char */
+                else if(dv[0]=='"' && dv[strlen(dv)-1]=='"'){
+                    /* double-quoted delimiter */
+                    char tmp[32]; strncpy(tmp,dv+1,sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
+                    int tl=(int)strlen(tmp); if(tl>0&&tmp[tl-1]=='"') tmp[--tl]=0;
+                    delim=tmp[0];
+                }
+                else delim=dv[0];
+            }
             else if(!strcmp(argv[i],"-f")&&i+1<ac) fields=argv[++i];
+            else if(!strncmp(argv[i],"-f",2)) fields=argv[i]+2; /* -f2 style */
+            else if(!strncmp(argv[i],"-d",2)){
+                /* -d' ' combined option */
+                const char *dv=argv[i]+2;
+                if(dv[0]=='\'' && dv[1] && dv[2]=='\'') delim=dv[1];
+                else if(dv[0]=='\\') delim=dv[1];
+                else delim=dv[0];
+            }
             else if(nf<15) files[nf++]=argv[i];
         }
         char *fw=fields?emit_word(out,fields):xstrdup("\"\"");
-        if(nf==0) fprintf(out,"    __b_cut(%s,'%c',NULL);\n",fw,delim);
-        else for(int i=0;i<nf;i++){ char *w=emit_word(out,files[i]); fprintf(out,"    __b_cut(%s,'%c',%s);\n",fw,delim,w); free(w); }
+        /* Handle special characters in delim that break C char literal */
+        if(delim=='\'') fprintf(out,"    __b_cut(%s,'\\'',NULL);\n",fw);
+        else if(delim=='\\') fprintf(out,"    __b_cut(%s,'\\\\',NULL);\n",fw);
+        else if(delim==0) fprintf(out,"    __b_cut(%s,' ',NULL);\n",fw);
+        else {
+            if(nf==0) fprintf(out,"    __b_cut(%s,'%c',NULL);\n",fw,delim);
+            else for(int i=0;i<nf;i++){ char *w=emit_word(out,files[i]); fprintf(out,"    __b_cut(%s,'%c',%s);\n",fw,delim,w); free(w); }
+        }
         free(fw);
         return;
     }
@@ -3318,8 +3607,7 @@ void emit_node(FILE *out, Node *n){
 
     case NODE_FOR:{
         if(n->for_c_style){
-            /* for ((init; cond; update)) */
-            add_var(n->for_var,V_INT);
+            /* for ((init; cond; update)) — translate_arith handles V_STR vars */
             fprintf(out,"    for(%s; %s; %s){\n",
                     n->for_init?n->for_init:"",
                     n->for_cond?n->for_cond:"",
@@ -4071,12 +4359,47 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 }
                 /* split on ; */
                 char *p1=strstr(buf,";");
-                if(p1){ *p1=0; nd->for_init=xstrdup(buf);
+                char init_str[512]="", cond_str[512]="", upd_str[512]="";
+                if(p1){
+                    int ilen=(int)(p1-buf);
+                    if(ilen>=(int)sizeof(init_str)) ilen=(int)sizeof(init_str)-1;
+                    memcpy(init_str,buf,ilen); init_str[ilen]=0;
                     char *p2=strstr(p1+1,";");
-                    if(p2){ *p2=0; nd->for_cond=xstrdup(p1+1); nd->for_update=xstrdup(p2+1); }
-                    else { nd->for_cond=xstrdup(p1+1); }
+                    if(p2){
+                        int clen=(int)(p2-p1-1);
+                        if(clen>=(int)sizeof(cond_str)) clen=(int)sizeof(cond_str)-1;
+                        memcpy(cond_str,p1+1,clen); cond_str[clen]=0;
+                        strncpy(upd_str,p2+1,sizeof(upd_str)-1); upd_str[sizeof(upd_str)-1]=0;
+                    } else {
+                        strncpy(cond_str,p1+1,sizeof(cond_str)-1); cond_str[sizeof(cond_str)-1]=0;
+                    }
+                } else {
+                    strncpy(init_str,buf,sizeof(init_str)-1); init_str[sizeof(init_str)-1]=0;
                 }
-                nd->for_var=xstrdup("__i"); add_var("__i",V_INT);
+                /* Extract variable name from init (e.g., "i=0" → "i") */
+                {
+                    const char *ip=init_str;
+                    while(*ip==' '||*ip=='\t') ip++;
+                    if(isalpha((unsigned char)*ip)||*ip=='_'){
+                        char vn[128]; int vi=0;
+                        while(isalnum((unsigned char)*ip)||*ip=='_'){
+                            if(vi<(int)sizeof(vn)-1) vn[vi++]=*ip;
+                            ip++;
+                        }
+                        vn[vi]=0;
+                        nd->for_var=xstrdup(vn);
+                        /* Don't force V_INT — the variable might be used as
+                         * a string elsewhere. translate_arith handles both. */
+                        if(!is_known_var(vn)) add_var(vn,V_INT);
+                    } else {
+                        nd->for_var=xstrdup("__i");
+                        add_var("__i",V_INT);
+                    }
+                }
+                /* Translate init/cond/update from shell arithmetic to C */
+                nd->for_init=translate_arith(init_str);
+                nd->for_cond=translate_arith(cond_str);
+                nd->for_update=translate_arith(upd_str);
                 Node **_pi=parse_insert;
                 parser_append(nd);
                 BlkFrame fr={BLK_FOR,nd,&nd->body,_pi};
@@ -4177,8 +4500,18 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         if(!strcmp(kw,"continue")){parser_append(new_node(NODE_CONTINUE,lineno));return;}
         if(!strcmp(kw,"return")){
             Node *nd=new_node(NODE_RETURN,lineno);
-            if(ntoks>1) nd->exit_str=xstrdup(toks[1]);
-            else nd->exit_code=-1;
+            if(ntoks>1){
+                /* Check if the return value is a pure integer literal */
+                const char *rv=toks[1];
+                const char *rp=rv;
+                if(*rp=='-'||*rp=='+') rp++;
+                int is_num=(*rp!='\0');
+                for(const char *q=rp;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num=0; break; } }
+                if(is_num)
+                    nd->exit_code=atoi(rv);
+                else
+                    nd->exit_str=xstrdup(rv);
+            } else nd->exit_code=-1;
             parser_append(nd);return;}
         if(!strcmp(kw,"exit")){
             Node *nd=new_node(NODE_EXIT,lineno);
@@ -4373,32 +4706,35 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             parser_append(nd); return;
         }
 
-        /* && and || at top level — left-associative chaining */
+        /* || at top level — left-associative, lower precedence than && */
         {
             int ai=find_op(toks,ntoks,"&&");
             int oi=find_op(toks,ntoks,"||");
-            if(ai>=0 && (oi<0 || ai<oi)){
+            /* || has lower precedence: if || exists, split there first */
+            if(oi>=0){
+                Node *nd=new_node(NODE_OR,lineno);
+                Node **_pi=parse_insert;
+                parser_append(nd);
+                BlkFrame fr={BLK_IF_ELSE,nd,&nd->right,_pi};
+                parser_push(fr);
+                /* Left side may contain && — dispatch recursively */
+                parse_insert=&nd->left;
+                dispatch_segment(toks,oi,lineno);
+                parse_insert=&nd->right;
+                dispatch_segment(toks+oi+1,ntoks-oi-1,lineno);
+                parser_pop();
+                return;
+            }
+            if(ai>=0){
                 Node *nd=new_node(NODE_AND,lineno);
                 nd->left=make_cmd(toks,ai,lineno);
-                /* Right side may contain more && or || — dispatch recursively */
+                /* Right side may contain more && — dispatch recursively */
                 Node **_pi=parse_insert;
                 parser_append(nd);
                 BlkFrame fr={BLK_IF_THEN,nd,&nd->right,_pi};
                 parser_push(fr);
                 parse_insert=&nd->right;
                 dispatch_segment(toks+ai+1,ntoks-ai-1,lineno);
-                parser_pop();
-                return;
-            }
-            if(oi>=0){
-                Node *nd=new_node(NODE_OR,lineno);
-                nd->left=make_cmd(toks,oi,lineno);
-                Node **_pi=parse_insert;
-                parser_append(nd);
-                BlkFrame fr={BLK_IF_ELSE,nd,&nd->right,_pi};
-                parser_push(fr);
-                parse_insert=&nd->right;
-                dispatch_segment(toks+oi+1,ntoks-oi-1,lineno);
                 parser_pop();
                 return;
             }
@@ -4516,7 +4852,50 @@ Node *parse_script(FILE *f){
             lineno++;
             ll=(int)strlen(line);
         }
-        line[strcspn(line,"\r\n")]=0;
+        /* Handle multi-line quoted strings: if there are unclosed quotes,
+         * read more lines until quotes are balanced */
+        {
+            int quote_closed = 0;
+            while(!quote_closed){
+                int in_squote=0, in_dquote=0;
+                for(int i=0;line[i];i++){
+                    if(in_dquote){
+                        if(line[i]=='\\'&&line[i+1]) i++;
+                        else if(line[i]=='"') in_dquote=0;
+                    } else if(in_squote){
+                        if(line[i]=='\'') in_squote=0;
+                    } else {
+                        if(line[i]=='"') in_dquote=1;
+                        else if(line[i]=='\'') in_squote=1;
+                        /* skip comments that start outside quotes */
+                        else if(line[i]=='#') break;
+                    }
+                }
+                if(in_dquote || in_squote){
+                    /* unclosed quote — read next line */
+                    int cl=(int)strlen(line);
+                    /* strip trailing newline from current buffer before joining */
+                    if(cl>0 && (line[cl-1]=='\n'||line[cl-1]=='\r')) line[--cl]=0;
+                    if(cl < (int)sizeof(line)-2){
+                        line[cl]='\n'; line[cl+1]=0;
+                        if(!fgets(line+cl+1,(int)sizeof(line)-cl-1,f)){
+                            quote_closed=1; /* EOF — give up */
+                        } else {
+                            lineno++;
+                        }
+                    } else {
+                        quote_closed=1; /* buffer full — give up */
+                    }
+                } else {
+                    quote_closed=1;
+                }
+            }
+        }
+        /* Remove only the trailing newline (not embedded ones from multi-line quotes) */
+        {
+            int ll2=(int)strlen(line);
+            while(ll2>0 && (line[ll2-1]=='\n'||line[ll2-1]=='\r')) line[--ll2]=0;
+        }
         strip_comment(line);
         char *t=ltrim(line); rtrim(t);
         if(!*t) continue;
@@ -4528,10 +4907,17 @@ Node *parse_script(FILE *f){
             while((scan=strstr(scan,"<<"))!=NULL){
                 /* skip <<< (here-string) */
                 if(*(scan+2)=='<'){ scan+=3; continue; }
-                /* skip if inside $(...) — rough check: count parens before */
-                int paren_depth=0;
-                for(char *q=t;q<scan;q++){ if(*q=='(')paren_depth++; else if(*q==')')paren_depth--; }
-                if(paren_depth>0){ scan+=2; continue; }
+                /* skip if inside $((...)) — arithmetic shift operators */
+                {
+                    int pd=0; /* paren depth */
+                    int in_arith=0; /* inside $(( */
+                    for(char *q=t;q<scan;q++){
+                        if(q+2<t+strlen(t) && q[0]=='$' && q[1]=='(' && q[2]=='('){ in_arith++; pd+=2; q+=2; }
+                        else if(*q=='(') pd++;
+                        else if(*q==')') { if(pd>0) pd--; if(in_arith>0 && pd==0) in_arith--; }
+                    }
+                    if(in_arith>0){ scan+=2; continue; }
+                }
                 /* parse delimiter */
                 char *dp=scan+2;
                 int strip_tabs=0;
@@ -4585,8 +4971,8 @@ Node *parse_script(FILE *f){
             while(__ss<ntoks){
                 int __se=ntoks, __d=0;
                 for(int __i=__ss;__i<ntoks;__i++){
-                    if(!strcmp(toks[__i],"[")||!strcmp(toks[__i],"[[")||!strcmp(toks[__i],"(")) __d++;
-                    else if(!strcmp(toks[__i],"]")||!strcmp(toks[__i],"]]")||!strcmp(toks[__i],")")) __d--;
+                    if(!strcmp(toks[__i],"[")||!strcmp(toks[__i],"[[")||!strcmp(toks[__i],"(")||!strcmp(toks[__i],"((")) __d++;
+                    else if(!strcmp(toks[__i],"]")||!strcmp(toks[__i],"]]")||!strcmp(toks[__i],")")||!strcmp(toks[__i],"))")) __d--;
                     else if(!__d && !strcmp(toks[__i],";")){ __se=__i; break; }
                 }
                 if(__se>__ss) dispatch_segment(toks+__ss, __se-__ss, lineno);
@@ -5131,6 +5517,107 @@ const char *RT_HEADER =
 /* L11 Main                                                           */
 /* ================================================================== */
 
+/* Pre-scan: walk AST and register variables from $((var=...)) in expressions */
+static void prescan_register_vars(Node *n){
+    while(n){
+        if(n->type==NODE_CMD && n->argv){
+            for(int i=0;i<n->argc;i++){
+                const char *s=n->argv[i];
+                if(!s) continue;
+                /* scan for $(( patterns — variable assignment in arithmetic */
+                const char *p=strstr(s,"$((");
+                while(p){
+                    p+=3;
+                    /* extract variable name before = */
+                    while(*p==' '||*p=='\t') p++;
+                    if(isalpha((unsigned char)*p)||*p=='_'){
+                        char vn[128]; int vi=0;
+                        while(isalnum((unsigned char)*p)||*p=='_'){
+                            if(vi<(int)sizeof(vn)-1) vn[vi++]=*p;
+                            p++;
+                        }
+                        vn[vi]=0;
+                        while(*p==' '||*p=='\t') p++;
+                        if(*p=='='&&*(p+1)!='='){
+                            add_var(vn,V_INT);
+                        }
+                    }
+                    p=strstr(p,"$((");
+                }
+                /* scan for ${var:=...} patterns — default assignment */
+                p=strstr(s,"${");
+                while(p){
+                    p+=2;
+                    char vn[128]; int vi=0;
+                    while(*p && *p!='}' && *p!=':' && *p!='#' && *p!='/' && *p!='%' && *p!='^' && *p!='[' && vi<(int)sizeof(vn)-1) vn[vi++]=*p++;
+                    vn[vi]=0;
+                    if(*p==':' && *(p+1)=='='){
+                        if(!isdigit((unsigned char)vn[0]) && !is_known_var(vn))
+                            add_var(vn,V_STR);
+                    }
+                    /* skip to } */
+                    while(*p && *p!='}') p++;
+                    if(*p=='}') p++;
+                    p=strstr(p,"${");
+                }
+            }
+        }
+        /* Also scan conditions and expressions */
+        if(n->cond) {
+            const char *p=strstr(n->cond,"$((");
+            while(p){
+                p+=3;
+                while(*p==' '||*p=='\t') p++;
+                if(isalpha((unsigned char)*p)||*p=='_'){
+                    char vn[128]; int vi=0;
+                    while(isalnum((unsigned char)*p)||*p=='_'){
+                        if(vi<(int)sizeof(vn)-1) vn[vi++]=*p;
+                        p++;
+                    }
+                    vn[vi]=0;
+                    while(*p==' '||*p=='\t') p++;
+                    if(*p=='='&&*(p+1)!='=') add_var(vn,V_INT);
+                }
+                p=strstr(p,"$((");
+            }
+        }
+        if(n->for_init){
+            const char *p=n->for_init;
+            while(*p){
+                while(*p==' '||*p=='\t') p++;
+                if(isalpha((unsigned char)*p)||*p=='_'){
+                    char vn[128]; int vi=0;
+                    while(isalnum((unsigned char)*p)||*p=='_'){
+                        if(vi<(int)sizeof(vn)-1) vn[vi++]=*p;
+                        p++;
+                    }
+                    vn[vi]=0;
+                    while(*p==' '||*p=='\t') p++;
+                    if(*p=='='&&*(p+1)!='=') add_var(vn,V_INT);
+                }
+                while(*p && *p!=';') p++;
+                if(*p==';') p++;
+            }
+        }
+        /* recurse into children */
+        if(n->left) prescan_register_vars(n->left);
+        if(n->right) prescan_register_vars(n->right);
+        if(n->then_blk) prescan_register_vars(n->then_blk);
+        if(n->else_blk) prescan_register_vars(n->else_blk);
+        for(int i=0;i<n->elif_count;i++){
+            if(n->elif_blks[i]) prescan_register_vars(n->elif_blks[i]);
+        }
+        if(n->body) prescan_register_vars(n->body);
+        if(n->while_body) prescan_register_vars(n->while_body);
+        if(n->func_body) prescan_register_vars(n->func_body);
+        for(int i=0;i<n->case_count;i++){
+            if(n->case_bodies[i]) prescan_register_vars(n->case_bodies[i]);
+        }
+        if(n->case_default) prescan_register_vars(n->case_default);
+        n=n->next;
+    }
+}
+
 int main(int argc, char **argv){
     int do_obfuscate = 0;
     /* Check for --obfuscate flag */
@@ -5157,6 +5644,9 @@ int main(int argc, char **argv){
     if(!fin){perror(argv[1]);return 1;}
     Node *script=parse_script(fin);
     fclose(fin);
+    
+    /* Pre-scan AST to register variables from $((var=...)) in expressions */
+    prescan_register_vars(script);
 
     FILE *fout=fopen(argv[2],"w");
     if(!fout){perror(argv[2]);return 1;}
@@ -5185,7 +5675,7 @@ int main(int argc, char **argv){
 
     /* global variables */
     fprintf(fout,"/* ---- user variables ---- */\n");
-    for(int i=1;i<=9;i++) fprintf(fout,"static char __sh_arg%d[1024]=\"\";\n",i);
+    for(int i=0;i<=9;i++) fprintf(fout,"static char __sh_arg%d[1024]=\"\";\n",i);
     for(int i=0;i<var_count;i++){
         const char *cn=safe_cname(var_table[i].name);
         if(var_table[i].kind==V_INT)
@@ -5216,7 +5706,7 @@ int main(int argc, char **argv){
     fprintf(fout,"    setvbuf(stdout, NULL, _IONBF, 0);\n");
     fprintf(fout,"    setvbuf(stdin, NULL, _IONBF, 0);\n");
     fprintf(fout,"    __sh_argc = _argc - 1;\n");
-    for(int i=1;i<=9;i++)
+    for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 1023);\n",i,i,i);
     fprintf(fout,"\n");
     emit_node(fout,script);
