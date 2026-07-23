@@ -283,7 +283,16 @@ int tokenize(const char *line, char **toks, int maxtoks){
                 buf[bi++]='"'; buf[bi]=0;
                 toks[n++]=pool_dup(buf,bi); continue;
             }
-            while(*p && *p!='"'){ if(*p=='\\'&&*(p+1)) p+=2; else p++; }
+            while(*p && *p!='"'){
+                if(*p=='\\'&&*(p+1)) { p+=2; continue; }
+                /* Skip $(...) and $((...)) inside double-quoted strings */
+                if(*p=='$'&&*(p+1)=='('){
+                    p+=2; int d=1;
+                    while(*p&&d){ if(*p=='(')d++; else if(*p==')')d--; p++; }
+                    continue;
+                }
+                p++;
+            }
             if(*p=='"') p++;
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
         }
@@ -398,7 +407,7 @@ int tokenize(const char *line, char **toks, int maxtoks){
               /* $(...) command substitution kept intact */
               if(*p=='$'&&*(p+1)=='('){
                   p+=2; int d=1;
-                  while(*p&&d){ if(*p=='(')d++; else if(*p==')')d--; if(d)p++; }
+                  while(*p&&d){ if(*p=='(')d++; else if(*p==')')d--; p++; }
                   continue;
               }
               if(*p=='$'&&*(p+1)=='{'){
@@ -591,7 +600,14 @@ char *translate_brace_expansion(const char *body){
     if(*p==':' && (*(p+1)=='-'||*(p+1)=='='||*(p+1)=='+'||*(p+1)=='?')){
         char op=*(p+1);
         p+=2; char def[256]; int d=0;
-        while(*p && *p!='}') def[d++]=*p++;
+        /* Read default value, handling nested ${...} */
+        int brace_depth=0;
+        while(*p && !(*p=='}' && brace_depth==0)){
+            if(*p=='{') brace_depth++;
+            else if(*p=='}') brace_depth--;
+            if(d<255) def[d++]=*p;
+            p++;
+        }
         def[d]=0;
         char r[2048];
         const char *cn;
@@ -624,18 +640,32 @@ char *translate_brace_expansion(const char *body){
                 default:  snprintf(r,sizeof(r),"__sh_fmt(\"%%d\",%s)",cn); break;
             }
         } else {
+            /* Check if default value contains $ (needs recursive expansion) */
+            char *def_expanded = NULL;
+            if(strchr(def,'$')){
+                def_expanded = translate_expr(def);
+            }
+            char def_buf[512];
+            const char *def_val;
+            if(def_expanded){
+                def_val = def_expanded;
+            } else {
+                snprintf(def_buf,sizeof(def_buf),"\"%s\"",def);
+                def_val = def_buf;
+            }
             switch(op){
-                case '-': snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def); break;
+                case '-': snprintf(r,sizeof(r),"(%s[0]?%s:%s)",cn,cn,def_val); break;
                 case '=':
                     if(is_known_var(name))
-                        snprintf(r,sizeof(r),"(%s[0]?%s:(strncpy(%s,\"%s\",sizeof(%s)-1),%s))",cn,cn,cn,def,cn,cn);
+                        snprintf(r,sizeof(r),"(%s[0]?%s:(strncpy(%s,%s,sizeof(%s)-1),%s))",cn,cn,cn,def_val,cn,cn);
                     else
-                        snprintf(r,sizeof(r),"(%s[0]?%s:\"%s\")",cn,cn,def);
+                        snprintf(r,sizeof(r),"(%s[0]?%s:%s)",cn,cn,def_val);
                     break;
-                case '+': snprintf(r,sizeof(r),"(%s[0]?\"%s\":\"\")",cn,def); break;
-                case '?': snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%s\\n\"),exit(1),\"\"))",cn,cn,def); break;
+                case '+': snprintf(r,sizeof(r),"(%s[0]?%s:\"\")",cn,def_val); break;
+                case '?': snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\%s\\n\),exit(1),\\))",cn,cn,def); break;
                 default:  snprintf(r,sizeof(r),"%s",cn); break;
             }
+            if(def_expanded) free(def_expanded);
         }
         return xstrdup(r);
     }
@@ -1141,6 +1171,8 @@ char *translate_expr(const char *tok){
             char esc[2100]; int e=0;
             for(int i=0;cmd[i]&&e<(int)sizeof(esc)-4;i++){
                 if(cmd[i]=='"'||cmd[i]=='\\') esc[e++]='\\';
+                if(cmd[i]=='\n') { esc[e++]='\\'; esc[e++]='n'; continue; }
+                if(cmd[i]=='\t') { esc[e++]='\\'; esc[e++]='t'; continue; }
                 esc[e++]=cmd[i];
             }
             esc[e]=0;
@@ -1153,8 +1185,14 @@ char *translate_expr(const char *tok){
         if(*p=='{'){
             p++;
             char body[256]; int k=0;
-            while(*p && *p!='}') body[k++]=*p++;
-            body[k]=0; if(*p) p++;
+            /* Read body with nested brace support */
+            int brace_depth=1;
+            while(*p && brace_depth>0 && k<255){
+                if(*p=='{') brace_depth++;
+                else if(*p=='}'){ brace_depth--; if(brace_depth==0) break; }
+                body[k++]=*p++;
+            }
+            body[k]=0; if(*p=='}') p++;
             return translate_brace_expansion(body);
         }
         if(*p=='?') return xstrdup("__exit_status");
@@ -1461,8 +1499,14 @@ void expand_string(const char *s, ExpandResult *er){
         if(*p=='{'){
             p++;
             char body[256]; int k=0;
-            while(*p && *p!='}') body[k++]=*p++;
-            body[k]=0; if(*p) p++;
+            /* Read body with nested brace support */
+            int brace_depth=1;
+            while(*p && brace_depth>0 && k<255){
+                if(*p=='{') brace_depth++;
+                else if(*p=='}'){ brace_depth--; if(brace_depth==0) break; }
+                body[k++]=*p++;
+            }
+            body[k]=0; if(*p=='}') p++;
             char *e2=translate_brace_expansion(body);
             /* decide int vs str: length expressions are int, others str */
             int is_int = (body[0]=='#') || (strncmp(body,"${#",3)==0);
@@ -1583,6 +1627,24 @@ static char *quote_if_path(const char *c){
 
 char *translate_test_unary(const char *op,const char *a1){
     static char buf[1024];
+    /* For -n/-z with int variables, use numeric check instead of string */
+    if(!strcmp(op,"-n") || !strcmp(op,"-z")){
+        /* Check if operand is a simple $var or "var" that's an int */
+        const char *check = a1;
+        if(check[0]=='"') check++; /* skip quote */
+        if(check[0]=='$') check++;
+        char vname[128]; int vi=0;
+        while(*check && (isalnum((unsigned char)*check)||*check=='_') && vi<127)
+            vname[vi++]=*check++;
+        vname[vi]=0;
+        if(vi>0 && get_var_kind(vname)==V_INT){
+            /* Int variable: -n means != 0, -z means == 0 */
+            const char *cn=safe_cname(vname);
+            if(!strcmp(op,"-n")) snprintf(buf,sizeof(buf),"(%s != 0)",cn);
+            else snprintf(buf,sizeof(buf),"(%s == 0)",cn);
+            return buf;
+        }
+    }
     char *c1=translate_operand(a1);
     char *q1=quote_if_path(c1); free(c1);
     if(!strcmp(op,"-z"))      snprintf(buf,sizeof(buf),"(%s[0]=='\\0')",q1);
@@ -2280,12 +2342,25 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     if(!strcmp(cmd,"echo")){ emit_echo(out,argv,ac); return; }
     if(!strcmp(cmd,"printf")){
         if(ac>=2){
-            char *w=emit_word(out,argv[1]);
-            fprintf(out,"    { const char *__pf=%s; ",w);
-            free(w);
-            fprintf(out,"__sh_printf(__pf");
+            /* printf format string: don't escape % like echo does */
+            const char *fmt = argv[1];
+            int flen = (int)strlen(fmt);
+            int is_literal = (flen>=2 && fmt[0]=='"' && fmt[flen-1]=='"');
+            if(is_literal && !strchr(fmt,'$')){
+                /* Literal format string — use directly */
+                fprintf(out,"    __sh_printf(%s", fmt);
+            } else {
+                /* Has variables — use emit_word but fix %% back to % */
+                char *w=emit_word(out,argv[1]);
+                fprintf(out,"    { const char *__pf=%s; __sh_printf(__pf",w);
+                free(w);
+            }
             for(int i=2;i<ac;i++){ char *a=emit_word(out,argv[i]); fprintf(out,",%s",a); free(a); }
-            fprintf(out,"); }\n");
+            if(is_literal && !strchr(fmt,'$')){
+                fprintf(out,");\n");
+            } else {
+                fprintf(out,"); }\n");
+            }
         }
         return;
     }
@@ -4315,7 +4390,13 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             BlkFrame fr={BLK_IF_THEN,nd,&nd->then_blk,_pi};
             parser_push(fr); parse_insert=&nd->then_blk; return;
         }
-        if(!strcmp(kw,"then")) return;
+        if(!strcmp(kw,"then")){
+            /* If there are more tokens after 'then', dispatch them as body */
+            if(ntoks>1){
+                dispatch_segment(toks+1,ntoks-1,lineno);
+            }
+            return;
+        }
         if(!strcmp(kw,"elif")){
             if(blk_top>0){
                 BlkFrame *fr=&blk_stack[blk_top-1]; Node *pif=fr->node;
@@ -4907,56 +4988,129 @@ Node *parse_script(FILE *f){
             while((scan=strstr(scan,"<<"))!=NULL){
                 /* skip <<< (here-string) */
                 if(*(scan+2)=='<'){ scan+=3; continue; }
-                /* skip if inside $((...)) — arithmetic shift operators */
+                /* skip if inside $(...) or $((...)) — command/arithmetic substitution */
                 {
                     int pd=0; /* paren depth */
-                    int in_arith=0; /* inside $(( */
+                    int in_subst=0; /* inside $( or $(( */
                     for(char *q=t;q<scan;q++){
-                        if(q+2<t+strlen(t) && q[0]=='$' && q[1]=='(' && q[2]=='('){ in_arith++; pd+=2; q+=2; }
+                        if(q[0]=='$' && q[1]=='('){
+                            in_subst++; pd++;
+                            if(q[2]=='('){ pd++; q+=2; }
+                            else { q+=1; }
+                        }
                         else if(*q=='(') pd++;
-                        else if(*q==')') { if(pd>0) pd--; if(in_arith>0 && pd==0) in_arith--; }
+                        else if(*q==')') { if(pd>0) pd--; if(in_subst>0 && pd==0) in_subst--; }
                     }
-                    if(in_arith>0){ scan+=2; continue; }
+                    if(in_subst>0){
+                        /* Check if inside $((...)) (arithmetic) vs $(...) (cmd subst) */
+                        int is_arith=0;
+                        {
+                            int pd3=0; int in_a3=0;
+                            for(char *q=t;q<scan;q++){
+                                if(q[0]=='$'&&q[1]=='('&&q[2]=='('){
+                                    in_a3++; pd3+=2; q+=2;
+                                } else if(q[0]=='$'&&q[1]=='('){
+                                    pd3++; q+=1;
+                                } else if(*q=='(') pd3++;
+                                else if(*q==')'){ if(pd3>0)pd3--; if(in_a3>0&&pd3==0) in_a3--; }
+                            }
+                            if(in_a3>0) is_arith=1;
+                        }
+                        if(is_arith){
+                            /* << is bitwise shift inside $((...)) — skip */
+                            scan+=2;
+                            continue;
+                        }
+                        /* else: << is heredoc inside $(...) — append body to line */
+                        {
+                            char *dp2=scan+2;
+                            int strip_tabs2=0;
+                            if(*dp2=='-'){ strip_tabs2=1; dp2++; }
+                            while(*dp2==' '||*dp2=='\t') dp2++;
+                            char delim2[128]; int di2=0;
+                            int quoted2=0;
+                            if(*dp2=='"'||*dp2=='\''){
+                                char qc=*dp2; dp2++; quoted2=1;
+                                while(*dp2 && *dp2!=qc && di2<127) delim2[di2++]=*dp2++;
+                                if(*dp2==qc) dp2++;
+                            } else {
+                                while(*dp2 && *dp2!=' ' && *dp2!='\t' && *dp2!=';' && *dp2!='&' && *dp2!='|' && di2<127) delim2[di2++]=*dp2++;
+                            }
+                            delim2[di2]=0;
+                            if(di2>0){
+                                /* Read heredoc body and append to current line */
+                                char hdline2[2048];
+                                int cur_len = strlen(t);
+                                while(fgets(hdline2,sizeof(hdline2),f)){
+                                    lineno++;
+                                    hdline2[strcspn(hdline2,"\r\n")]=0;
+                                    if(strcmp(hdline2,delim2)==0) break;
+                                    if(cur_len < (int)sizeof(line)-2){
+                                        t[cur_len++]='\n';
+                                        int hl=strlen(hdline2);
+                                        if(cur_len+hl < (int)sizeof(line)-1){
+                                            memcpy(t+cur_len,hdline2,hl);
+                                            cur_len+=hl;
+                                            t[cur_len]=0;
+                                        }
+                                    }
+                                }
+                                /* Also append closing delimiter */
+                                if(cur_len < (int)sizeof(line)-2){
+                                    t[cur_len++]='\n';
+                                    int dl=strlen(delim2);
+                                    if(cur_len+dl < (int)sizeof(line)-1){
+                                        memcpy(t+cur_len,delim2,dl);
+                                        cur_len+=dl;
+                                        t[cur_len]=0;
+                                    }
+                                }
+                            }
+                            scan+=2;
+                            continue;
+                        }
+                    }
+                    /* Normal heredoc processing (not inside $(...)) */
+                    {
+                        char *dp=scan+2;
+                        int strip_tabs=0;
+                        if(*dp=='-'){ strip_tabs=1; dp++; }
+                        while(*dp==' '||*dp=='\t') dp++;
+                        char delim[128]; int di=0;
+                        int quoted=0;
+                        if(*dp=='"'||*dp=='\''){
+                            char qc=*dp; dp++; quoted=1;
+                            while(*dp && *dp!=qc && di<127) delim[di++]=*dp++;
+                            if(*dp==qc) dp++;
+                        } else {
+                            while(*dp && *dp!=' ' && *dp!='\t' && *dp!=';' && *dp!='&' && *dp!='|' && di<127) delim[di++]=*dp++;
+                        }
+                        delim[di]=0;
+                        if(di>0){
+                            char hdtext[16384]=""; char hdline[2048];
+                            while(fgets(hdline,sizeof(hdline),f)){
+                                lineno++;
+                                hdline[strcspn(hdline,"\r\n")]=0;
+                                char *trimmed = strip_tabs ? hdline : hdline;
+                                if(strip_tabs){
+                                    char *h=hdline;
+                                    while(*h=='\t') h++;
+                                    trimmed=h;
+                                } else trimmed=hdline;
+                                if(strcmp(trimmed,delim)==0) break;
+                                strncat(hdtext,hdline,sizeof(hdtext)-strlen(hdtext)-2);
+                                strcat(hdtext,"\n");
+                            }
+                            heredoc_store(hdtext, !quoted);
+                            memmove(scan+2,dp,strlen(dp)+1);
+                            scan+=2;
+                        } else {
+                            scan+=2;
+                        }
+                        continue;
+                    }
                 }
-                /* parse delimiter */
-                char *dp=scan+2;
-                int strip_tabs=0;
-                if(*dp=='-'){ strip_tabs=1; dp++; }
-                while(*dp==' '||*dp=='\t') dp++;
-                char delim[128]; int di=0;
-                int quoted=0;
-                if(*dp=='"'||*dp=='\''){
-                    char qc=*dp; dp++; quoted=1;
-                    while(*dp && *dp!=qc && di<(int)sizeof(delim)-1) delim[di++]=*dp++;
-                    if(*dp==qc) dp++;
-                } else {
-                    while(*dp && *dp!=' ' && *dp!='\t' && *dp!=';' && *dp!='&' && *dp!='|' && di<(int)sizeof(delim)-1) delim[di++]=*dp++;
-                }
-                delim[di]=0;
-                if(di==0){ scan+=2; continue; }
-                /* read heredoc body */
-                char hdtext[16384]=""; char hdline[2048];
-                while(fgets(hdline,sizeof(hdline),f)){
-                    lineno++;
-                    hdline[strcspn(hdline,"\r\n")]=0;
-                    char *trimmed = strip_tabs ? ltrim(hdline) : hdline;
-                    /* for strip_tabs, only strip leading tabs, not spaces */
-                    if(strip_tabs){
-                        char *h=hdline;
-                        while(*h=='\t') h++;
-                        trimmed=h;
-                    } else trimmed=hdline;
-                    if(strcmp(trimmed,delim)==0) break;
-                    strncat(hdtext,hdline,sizeof(hdtext)-strlen(hdtext)-2);
-                    strcat(hdtext,"\n");
-                }
-                /* store in table (expand=1 for unquoted, 0 for quoted) */
-                heredoc_store(hdtext, !quoted);
-                /* replace <<DELIM with << in the line so tokenizer sees << */
-                /* shift the rest of the line left */
-                char *rest=dp;
-                /* move rest of line over the delimiter */
-                memmove(scan+2,rest,strlen(rest)+1);
+                /* Old heredoc code removed — replaced by new code above */
                 scan+=2;
             }
         }
@@ -5137,7 +5291,24 @@ const char *RT_HEADER =
 "  while(*s){ if(*s=='\\\\' && *(s+1)){ s++; switch(*s){ case 'n':putchar('\\n');break; case 't':putchar('\\t');break; case 'r':putchar('\\r');break; case '\\\\':putchar('\\\\');break; case '0':putchar('\\0');break; default:putchar(*s);break; } s++; } else putchar(*s++); }\n"
 "}\n"
 "static void __sh_printf(const char *fmt,...){\n"
-"  va_list ap; va_start(ap,fmt); vprintf(fmt,ap); va_end(ap); fflush(stdout);\n"
+"  /* Shell-style printf: all args are strings, %d/%i convert via atoi */\n"
+"  va_list ap; va_start(ap,fmt);\n"
+"  const char *p=fmt;\n"
+"  while(*p){\n"
+"    if(*p=='%' && *(p+1)){\n"
+"      p++;\n"
+"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); printf(\"%d\",s?atoi(s):0); }\n"
+"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); fputs(s?s:\"(null)\",stdout); }\n"
+"      else if(*p=='c'){ const char *s=va_arg(ap,const char*); putchar(s?s[0]:' '); }\n"
+"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); printf(\"%x\",s?atoi(s):0); }\n"
+"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); printf(\"%X\",s?atoi(s):0); }\n"
+"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); printf(\"%o\",s?atoi(s):0); }\n"
+"      else if(*p=='%'){ putchar('%'); }\n"
+"      else { putchar('%'); putchar(*p); }\n"
+"    } else { putchar(*p); }\n"
+"    p++;\n"
+"  }\n"
+"  va_end(ap); fflush(stdout);\n"
 "}\n"
 "/* Elegant output helpers — reduce repetitive fputs+putchar patterns */\n"
 "static void __sh_puts(const char *s){ fputs(s,stdout); putchar('\\n'); }\n"

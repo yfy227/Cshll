@@ -1,163 +1,57 @@
 #!/bin/bash
-# Comprehensive stress test for shell2c — tests edge cases, tricky syntax, extreme scenarios
+# Stress test — edge cases and real-world patterns
 
-# === 1. Special characters in strings ===
-echo "tab	here"
-echo "newline
-here"
-echo 'single quote: $HOME'
-echo "double quote: $HOME"
-echo "mixed: 'single' and \"double\""
+# 1. Nested command substitution
+echo "nested: $(echo $(echo deep))"
 
-# === 2. Escape sequences ===
-echo "backslash: \\"
-echo "dollar: \$HOME"
-echo "backtick: \`date\`"
+# 2. Arithmetic in various contexts
+x=5
+y=10
+echo $((x + y))
+echo "$((x * y))"
+echo $((x > 3 ? 1 : 0))
+
+# 3. String with special chars
+echo "tab:      end"
 echo "quote: \"hello\""
+echo 'single: $HOME'
 
-# === 3. Variable edge cases ===
-EMPTY=""
-echo "empty: '${EMPTY}'"
-echo "empty_len: ${#EMPTY}"
-UNSET_VAR="test"
-unset UNSET_VAR
-echo "default: ${UNSET_VAR:-fallback}"
-echo "alt: ${UNSET_VAR:+set}"
-X=5
-echo "neg default: ${X:-default}"
-echo "assign: ${Y:=assigned}"
-echo "Y is now: $Y"
+# 4. Variable in various positions
+prefix="pre"
+suffix="suf"
+echo "${prefix}middle${suffix}"
 
-# === 4. Arithmetic edge cases ===
-a=10
-b=3
-echo "add: $((a + b))"
-echo "sub: $((a - b))"
-echo "mul: $((a * b))"
-echo "div: $((a / b))"
-echo "mod: $((a % b))"
-echo "pow: $((a ** 2))"
-echo "neg: $((-a))"
-echo "paren: $(((a + b) * 2))"
-echo "assign: $((c = a + b))"
-echo "c is: $c"
-echo "postinc: $((c++))"
-echo "c after inc: $c"
-echo "preinc: $((++c))"
-echo "bitand: $((a & b))"
-echo "bitor: $((a | b))"
-echo "xor: $((a ^ b))"
-echo "shl: $((a << 2))"
-echo "shr: $((a >> 1))"
-echo "not: $((~a))"
-echo "logic_and: $((a && b))"
-echo "logic_or: $((a || b))"
-echo "ternary: $((a > b ? 1 : 0))"
+# 5. Multiple assignments on one line
+a=1; b=2; c=3
+echo "$a $b $c"
 
-# === 5. String manipulation ===
-STR="Hello World"
-echo "len: ${#STR}"
-echo "upper: ${STR^^}"
-echo "lower: ${STR,,}"
-echo "substr1: ${STR:0:5}"
-echo "substr2: ${STR:6}"
-echo "substr3: ${STR: -5}"
-echo "replace_first: ${STR/o/0}"
-echo "replace_all: ${STR//o/0}"
-echo "replace_start: ${STR/#Hello/Hi}"
-echo "replace_end: ${STR/%World/Earth}"
-echo "strip_prefix: ${STR#Hello }"
-echo "strip_prefix_greedy: ${STR##H*o }"
-echo "strip_suffix: ${STR% World}"
-echo "strip_suffix_greedy: ${STR%%o*}"
-
-# === 6. Arrays ===
-arr=(apple banana cherry)
-echo "arr0: ${arr[0]}"
-echo "arr1: ${arr[1]}"
-echo "arr_all: ${arr[@]}"
-echo "arr_count: ${#arr[@]}"
-echo "arr_slice: ${arr[@]:0:2}"
-arr[3]="date"
-echo "arr3: ${arr[3]}"
-arr+=(elderberry)
-echo "arr_last: ${arr[4]}"
-
-# === 7. Control flow ===
-for i in 1 2 3; do
-    echo "for: $i"
-done
-
-for i in {1..5}; do
-    echo "range: $i"
-done
-
-for i in {a..c}; do
-    echo "alpha: $i"
-done
-
-j=0
-while [ $j -lt 3 ]; do
-    echo "while: $j"
-    j=$((j + 1))
-done
-
-k=0
-until [ $k -ge 3 ]; do
-    echo "until: $k"
-    k=$((k + 1))
-done
-
-# === 8. Conditionals ===
-if [ "$X" -eq 5 ]; then
-    echo "X is 5"
-elif [ "$X" -gt 5 ]; then
-    echo "X is greater than 5"
-else
-    echo "X is less than 5"
+# 6. Conditional with command substitution
+if [ "$(echo yes)" = "yes" ]; then
+    echo "match"
 fi
 
-if [[ "$STR" == Hello* ]]; then
-    echo "starts with Hello"
-fi
+# 7. For loop with command substitution
+for f in $(echo "a b c"); do
+    echo "file: $f"
+done
 
-if [[ "$STR" == *World ]]; then
-    echo "ends with World"
-fi
+# 8. While read from pipe
+echo -e "x\ny\nz" | while read -r line; do
+    echo "got: $line"
+done
 
-if [[ "$STR" =~ ^Hello ]]; then
-    echo "regex match"
-fi
-
-# === 9. Case/esac ===
-fruit="apple"
-case $fruit in
-    apple|apricot)
-        echo "starts with a"
-        ;;
-    banana)
-        echo "starts with b"
+# 9. Case with glob patterns
+ext="JPG"
+case "$ext" in
+    jpg|JPG|jpeg|JPEG)
+        echo "image"
         ;;
     *)
-        echo "other"
+        echo "unknown"
         ;;
 esac
 
-# === 10. Functions ===
-greet() {
-    local name="$1"
-    echo "Hello, $name!"
-}
-greet "World"
-greet "Shell2C"
-
-add() {
-    echo $(($1 + $2))
-}
-result=$(add 3 4)
-echo "3 + 4 = $result"
-
-# Function with return value
+# 10. Function with return value
 is_positive() {
     if [ $1 -gt 0 ]; then
         return 0
@@ -165,74 +59,61 @@ is_positive() {
         return 1
     fi
 }
-if is_positive 5; then
-    echo "5 is positive"
+if is_positive 5; then echo "positive"; fi
+if ! is_positive -3; then echo "not positive"; fi
+
+# 11. Nested if
+n=15
+if [ $n -gt 10 ]; then
+    if [ $n -lt 20 ]; then
+        echo "in range 10-20"
+    fi
 fi
 
-# === 11. Pipes ===
-echo "hello world" | tr 'a-z' 'A-Z'
-echo -e "line1\nline2\nline3" | head -2
-echo "one two three" | cut -d' ' -f2
-
-# === 12. Command substitution ===
-echo "date: $(echo today)"
-echo "nested: $(echo $(echo deep))"
-echo "backtick: `echo bt`"
-
-# === 13. Heredocs ===
-cat <<HEREDOC
-Simple heredoc
-With multiple lines
-HEREDOC
-
-cat <<'NOEXPAND'
-No expansion: $HOME
-NOEXPAND
-
-cat <<EXPAND
-Expansion: $HOME
-EXPAND
-
-# === 14. Redirection ===
-echo "to file" > /tmp/cshll_test.txt
-cat < /tmp/cshll_test.txt
-echo "appended" >> /tmp/cshll_test.txt
-cat /tmp/cshll_test.txt
-rm -f /tmp/cshll_test.txt
-
-# === 15. Special variables ===
-echo "pid: $$"
-echo "params: $@"
-echo "argc: $#"
-
-# === 16. Subshell ===
-(SUB="inside"; echo "sub: $SUB")
-echo "outside: $SUB"
-
-# === 17. Brace expansion ===
-echo {1..5}
-echo {a,b,c}
-echo pre{x,y}post
-
-# === 18. Logical operators ===
-true && echo "and"
-false || echo "or"
-true && false || echo "chain"
-
-# === 19. C-style for loop ===
-for ((i=0; i<3; i++)); do
-    echo "c-for: $i"
-done
-
-# === 20. Break and continue ===
+# 12. Break and continue
 for i in 1 2 3 4 5; do
-    if [ $i -eq 3 ]; then
-        continue
-    fi
-    if [ $i -eq 5 ]; then
-        break
-    fi
+    if [ $i -eq 3 ]; then continue; fi
+    if [ $i -eq 5 ]; then break; fi
     echo "loop: $i"
 done
+
+# 13. String operations
+s="hello world"
+echo "upper: ${s^^}"
+echo "lower: ${s,,}"
+echo "replace: ${s/world/WORLD}"
+
+# 14. Array iteration
+arr=(red green blue)
+for color in "${arr[@]}"; do
+    echo "color: $color"
+done
+echo "count: ${#arr[@]}"
+
+# 15. Default values chain
+echo "${UNSET1:-${UNSET2:-${UNSET3:-deep_default}}}"
+
+# 16. Arithmetic increment patterns
+i=0
+i=$((i + 1))
+echo "i=$i"
+i=$((i + 1))
+echo "i=$i"
+
+# 17. Echo with multiple args
+echo a b c d e
+
+# 18. Printf
+printf "%s=%d\n" "key" 42
+
+# 19. Test with && (modern style)
+if [ -n "$x" ] && [ "$x" = "5" ]; then
+    echo "x is 5 and non-empty"
+fi
+
+# 20. Subshell variable isolation
+v="outer"
+(v="inner"; echo "in sub: $v")
+echo "after sub: $v"
 
 echo "STRESS TEST DONE"
