@@ -8,3 +8,6 @@ tests/twopipe
 *.o
 *.out
 __pycache__/
+tests/test_newfeat
+tests/test_realworld
+tests/test_stress

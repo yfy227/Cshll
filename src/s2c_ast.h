@@ -30,7 +30,46 @@ typedef struct Redir {
     struct Redir *next;
 } Redir;
 
-/* Node struct defined in shell2c.c as NodeExt */
+/* Full Node struct definition — shared between shell2c.c and VM compiler */
+struct NodeExt;
+typedef struct NodeExt {
+    NodeType type;
+    int lineno;
+    struct NodeExt *next;
+    /* assign */
+    char *lhs, *rhs;
+    /* cmd / background / subshell / group */
+    char **argv; int argc;
+    Redir *redirs;
+    /* if */
+    char *cond;
+    struct NodeExt *then_blk, *else_blk;
+    struct NodeExt *elif_conds[16]; struct NodeExt *elif_blks[16]; int elif_count;
+    /* for */
+    char *for_var; char **for_list; int for_len; struct NodeExt *body;
+    int for_c_style;
+    char *for_init, *for_cond, *for_update;
+    /* while */
+    char *while_cond; int while_negate; struct NodeExt *while_body;
+    /* func */
+    char *fname; struct NodeExt *func_body;
+    /* exit/return */
+    int exit_code; char *exit_str;
+    /* pipe / and / or */
+    struct NodeExt *left, *right;
+    /* heredoc */
+    char *heredoc_text;
+    /* case */
+    char *case_var;
+    char *case_pats[64]; struct NodeExt *case_bodies[64]; int case_count;
+    struct NodeExt *case_default;
+    /* trap */
+    char *trap_action; int trap_sig;
+    /* set */
+    char *set_opts;
+} NodeExt;
+
+#define Node NodeExt
 
 /* new_redir defined in shell2c.c */
 /* new_node defined in shell2c.c */

@@ -27,6 +27,890 @@
 #include "src/s2c_parse.h"
 #include "src/s2c_obfuscate.h"
 #include "src/s2c_mangle.h"
+#include "src/s2c_vm_isa.h"
+#include "src/s2c_vm_runtime.h"
+
+/* ================================================================== */
+/* VM bytecode compiler — AST → VM bytecode                            */
+/* ================================================================== */
+
+/* Forward declare Node — now fully defined in s2c_ast.h */
+/* Node = NodeExt, defined via #define in s2c_ast.h */
+
+/* VM buffer and const pool types (defined in s2c_vm_bridge.c) */
+typedef struct { uint8_t *data; int len; int cap; } VmBuf;
+typedef struct { char **strs; int count; int cap; } VmConstPool;
+
+/* Functions provided by s2c_vm_bridge.c */
+extern void vm_buf_init(VmBuf *b);
+extern void vm_buf_free(VmBuf *b);
+extern void vm_buf_emit(VmBuf *b, uint8_t byte);
+extern void vm_buf_emit_u16(VmBuf *b, uint8_t op, uint16_t val);
+extern void vm_buf_emit_i32(VmBuf *b, uint8_t op, int32_t val);
+extern int  vm_buf_emit_jump(VmBuf *b, uint8_t op);
+extern void vm_buf_patch(VmBuf *b, int patch_loc, uint16_t target);
+extern int  vm_buf_pc(VmBuf *b);
+extern void vm_cp_init(VmConstPool *cp);
+extern void vm_cp_free(VmConstPool *cp);
+extern int  vm_cp_intern(VmConstPool *cp, const char *s);
+extern void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
+                            const VmFuncEntry *funcs, int nfuncs, int obfuscate);
+extern void emit_vm_runtime(FILE *out);
+
+/* VM compiler state */
+typedef struct {
+    VmBuf *bc;
+    VmConstPool *cp;
+    int loop_stack[64];     /* loop start PCs for break/continue */
+    int break_patches[64];  /* patch locations for break jumps */
+    int loop_depth;
+} VmCompilerState;
+
+/* Forward declarations */
+static void vmc_compile_node(VmCompilerState *vs, Node *n);
+static void vmc_compile_block(VmCompilerState *vs, Node *n);
+static void vmc_push_int(VmCompilerState *vs, int32_t val);
+static int vm_find_func(const char *name);
+static char *vm_func_names[256];
+static Node *vm_func_bodies[256];
+static int vm_func_count = 0;
+
+/* Emit a string constant and push it */
+static void vmc_push_str(VmCompilerState *vs, const char *s){
+    int idx = vm_cp_intern(vs->cp, s);
+    /* NOP padding for anti-analysis — insert random NOPs every ~8 instructions */
+    if((vs->bc->len & 7) == 0){
+        vm_buf_emit(vs->bc, OP_NOP);
+    }
+    vm_buf_emit_u16(vs->bc, OP_PUSH_STR, idx);
+}
+
+/* Compile a word with variable expansion ($var, ${var}) to bytecode.
+ * Scans the string, pushing literal segments and variable values,
+ * then concatenates with STRCAT. Final result is a single VM_STR on stack. */
+static void vmc_compile_word(VmCompilerState *vs, const char *word){
+    /* Strip surrounding quotes if present */
+    const char *p = word;
+    char quote = 0;
+    if((p[0] == '"' || p[0] == '\'') && strlen(p) >= 2){
+        quote = p[0];
+        p++; /* skip opening quote */
+    }
+
+    /* If single-quoted, push literally (no expansion) */
+    if(quote == '\''){
+        /* Find closing quote, push content */
+        char buf[2048]; int bi = 0;
+        while(p[0] && p[0] != '\'' && bi < (int)sizeof(buf) - 1)
+            buf[bi++] = *p++;
+        buf[bi] = 0;
+        vmc_push_str(vs, buf);
+        return;
+    }
+
+    /* Double-quoted or unquoted: scan for $var expansions */
+    char lit[2048]; int li = 0;
+    int has_var = 0;
+
+    /* First pass: check if there's any $ */
+    for(const char *c = p; *c; c++){
+        if(*c == '$') has_var = 1;
+    }
+
+    if(!has_var){
+        /* No variables — push literal (strip closing quote if any) */
+        char buf[2048]; int bi = 0;
+        while(p[0] && p[0] != quote && bi < (int)sizeof(buf) - 1)
+            buf[bi++] = *p++;
+        buf[bi] = 0;
+        vmc_push_str(vs, buf);
+        return;
+    }
+
+    /* Has variables — compile as concatenation of segments */
+    int segment_count = 0;
+    li = 0;
+
+    while(*p){
+        if(*p == '$' && p[1]){
+            /* Flush literal segment first */
+            if(li > 0){
+                lit[li] = 0;
+                vmc_push_str(vs, lit);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+                li = 0;
+            }
+
+            p++; /* skip $ */
+
+            /* ${var} form */
+            if(*p == '{'){
+                p++;
+                char vn[128]; int vi = 0;
+                while(*p && *p != '}' && vi < (int)sizeof(vn) - 1)
+                    vn[vi++] = *p++;
+                vn[vi] = 0;
+                if(*p == '}') p++;
+                vmc_push_str(vs, vn);
+                vm_buf_emit(vs->bc, OP_GETENV);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $((expr)) — arithmetic: compile to VM arithmetic bytecode */
+            else if(*p == '(' && *(p+1) == '('){
+                p += 2;
+                /* Extract the expression text */
+                char expr[512]; int ei = 0;
+                int d = 2;
+                while(*p && d > 0 && ei < (int)sizeof(expr) - 1){
+                    if(*p == '(') d++;
+                    else if(*p == ')') { d--; if(d == 0) { p++; break; } }
+                    if(d > 0) expr[ei++] = *p;
+                    p++;
+                }
+                if(*p == ')') p++;
+                expr[ei] = 0;
+
+                /* Simple arithmetic compiler: tokenize and emit
+                 * Supports: var, int, +, -, *, /, %, (, ) */
+                const char *ep = expr;
+                int first_operand = 1;
+                char pending_op = 0;
+
+                while(*ep){
+                    /* Skip whitespace */
+                    while(*ep == ' ' || *ep == '\t') ep++;
+                    if(!*ep) break;
+
+                    /* Number */
+                    if(isdigit((unsigned char)*ep)){
+                        int val = 0;
+                        while(isdigit((unsigned char)*ep)){
+                            val = val * 10 + (*ep - '0');
+                            ep++;
+                        }
+                        vmc_push_int(vs, val);
+                        if(!first_operand && pending_op){
+                            switch(pending_op){
+                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
+                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
+                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
+                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
+                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
+                            }
+                            pending_op = 0;
+                        }
+                        first_operand = 0;
+                    }
+                    /* Variable: $var or bare var name */
+                    else if(*ep == '$'){
+                        ep++;
+                        char vn[128]; int vi = 0;
+                        if(*ep == '{'){
+                            ep++;
+                            while(*ep && *ep != '}' && vi < (int)sizeof(vn)-1) vn[vi++] = *ep++;
+                            if(*ep == '}') ep++;
+                        } else {
+                            while(*ep && (isalnum((unsigned char)*ep) || *ep == '_') && vi < (int)sizeof(vn)-1)
+                                vn[vi++] = *ep++;
+                        }
+                        vn[vi] = 0;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vm_buf_emit(vs->bc, OP_TO_INT);
+                        if(!first_operand && pending_op){
+                            switch(pending_op){
+                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
+                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
+                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
+                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
+                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
+                            }
+                            pending_op = 0;
+                        }
+                        first_operand = 0;
+                    }
+                    /* Bare variable name (no $ prefix) */
+                    else if(isalpha((unsigned char)*ep) || *ep == '_'){
+                        char vn[128]; int vi = 0;
+                        while(*ep && (isalnum((unsigned char)*ep) || *ep == '_') && vi < (int)sizeof(vn)-1)
+                            vn[vi++] = *ep++;
+                        vn[vi] = 0;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vm_buf_emit(vs->bc, OP_TO_INT);
+                        if(!first_operand && pending_op){
+                            switch(pending_op){
+                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
+                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
+                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
+                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
+                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
+                            }
+                            pending_op = 0;
+                        }
+                        first_operand = 0;
+                    }
+                    /* Operator */
+                    else if(*ep == '+' || *ep == '-' || *ep == '*' || *ep == '/' || *ep == '%'){
+                        pending_op = *ep;
+                        ep++;
+                    }
+                    /* Skip parens for now */
+                    else if(*ep == '(' || *ep == ')'){
+                        ep++;
+                    }
+                    else {
+                        ep++; /* skip unknown chars */
+                    }
+                }
+
+                /* Convert result to string */
+                vm_buf_emit(vs->bc, OP_TO_STR);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $(cmd) — command substitution */
+            else if(*p == '('){
+                p++;
+                char cmd[1024]; int ci = 0;
+                int d = 1;
+                while(*p && d > 0 && ci < (int)sizeof(cmd) - 1){
+                    if(*p == '(') d++;
+                    else if(*p == ')') d--;
+                    if(d > 0) cmd[ci++] = *p;
+                    p++;
+                }
+                if(*p == ')') p++;
+                cmd[ci] = 0;
+                vmc_push_str(vs, cmd);
+                vm_buf_emit(vs->bc, OP_EXEC_CMD);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $var — simple variable */
+            else if(isalpha((unsigned char)*p) || *p == '_'){
+                char vn[128]; int vi = 0;
+                while(*p && (isalnum((unsigned char)*p) || *p == '_') && vi < (int)sizeof(vn) - 1)
+                    vn[vi++] = *p++;
+                vn[vi] = 0;
+                vmc_push_str(vs, vn);
+                vm_buf_emit(vs->bc, OP_GETENV);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $1, $2, etc. — positional params */
+            else if(isdigit((unsigned char)*p)){
+                char vn[8]; vn[0] = *p++; vn[1] = 0;
+                vmc_push_str(vs, vn);
+                vm_buf_emit(vs->bc, OP_GETENV);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* Lone $ — literal */
+            else {
+                lit[li++] = '$';
+            }
+        }
+        else if(*p == '\\' && p[1]){
+            /* Escape sequence in double-quoted string */
+            if(quote == '"'){
+                char next = p[1];
+                if(next == '"' || next == '\\' || next == '$' || next == '`'){
+                    lit[li++] = next;
+                    p += 2;
+                } else {
+                    lit[li++] = *p++;
+                }
+            } else {
+                lit[li++] = *p++;
+            }
+        }
+        else if(quote && *p == quote){
+            /* End of quoted string */
+            break;
+        }
+        else {
+            lit[li++] = *p++;
+        }
+    }
+
+    /* Flush final literal segment */
+    if(li > 0){
+        lit[li] = 0;
+        vmc_push_str(vs, lit);
+        if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+        segment_count++;
+    }
+
+    /* If no segments at all, push empty string */
+    if(segment_count == 0){
+        vmc_push_str(vs, "");
+    }
+}
+
+/* Emit an integer constant */
+static void vmc_push_int(VmCompilerState *vs, int32_t val){
+    vm_buf_emit_i32(vs->bc, OP_PUSH_INT, val);
+}
+
+/* Compile a command (NODE_CMD) */
+static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
+    if(!n->argv || n->argc == 0) return;
+    const char *cmd = n->argv[0];
+
+    /* Check if this is a user-defined function call */
+    int fi = vm_find_func(cmd);
+    if(fi >= 0 && vm_func_bodies[fi]){
+        /* Compile function body inline */
+        vmc_compile_block(vs, vm_func_bodies[fi]);
+        return;
+    }
+
+    /* echo / printf: push args with variable expansion, print */
+    if(strcmp(cmd, "echo") == 0){
+        int has_newline = 1;
+        int start = 1;
+        /* Check for -n flag (no newline) */
+        if(n->argc > 1 && strcmp(n->argv[1], "-n") == 0){
+            has_newline = 0;
+            start = 2;
+        }
+        for(int i = start; i < n->argc; i++){
+            vmc_compile_word(vs, n->argv[i]);
+            vm_buf_emit(vs->bc, OP_PRINT);
+            if(i < n->argc - 1){
+                vmc_push_str(vs, " ");
+                vm_buf_emit(vs->bc, OP_PRINT);
+            }
+        }
+        if(has_newline){
+            vmc_push_str(vs, "\n");
+            vm_buf_emit(vs->bc, OP_PRINT);
+        }
+        return;
+    }
+
+    /* exit: push code, EXIT */
+    if(strcmp(cmd, "exit") == 0){
+        if(n->argc > 1){
+            /* Try to parse as integer */
+            int code = atoi(n->argv[1]);
+            vmc_push_int(vs, code);
+        } else {
+            vmc_push_int(vs, 0);
+        }
+        vm_buf_emit(vs->bc, OP_EXIT);
+        return;
+    }
+
+    /* export/setenv: SETENV */
+    if(strcmp(cmd, "export") == 0 && n->argc > 1){
+        /* export VAR=value */
+        char *eq = strchr(n->argv[1], '=');
+        if(eq){
+            *eq = 0;
+            vmc_push_str(vs, n->argv[1]); /* name */
+            vmc_push_str(vs, eq + 1);      /* value */
+            vm_buf_emit(vs->bc, OP_SETENV);
+            *eq = '=';
+            return;
+        }
+        /* export VAR — just mark as exported, skip for VM */
+        return;
+    }
+
+    /* unset: SETENV with empty value */
+    if(strcmp(cmd, "unset") == 0 && n->argc > 1){
+        vmc_push_str(vs, n->argv[1]);
+        vmc_push_str(vs, "");
+        vm_buf_emit(vs->bc, OP_SETENV);
+        return;
+    }
+
+    /* pwd: execute via system, output goes directly to stdout */
+    if(strcmp(cmd, "pwd") == 0){
+        vmc_push_str(vs, "pwd");
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
+        return;
+    }
+
+    /* For all other commands: EXEC_CMD with full command string.
+     * system() output goes directly to stdout. Pop the exit code. */
+    {
+        char cmdstr[4096]; int ci = 0;
+        for(int i = 0; i < n->argc && ci < (int)sizeof(cmdstr) - 1; i++){
+            if(i > 0) cmdstr[ci++] = ' ';
+            int al = (int)strlen(n->argv[i]);
+            if(ci + al < (int)sizeof(cmdstr) - 1){
+                memcpy(cmdstr + ci, n->argv[i], al);
+                ci += al;
+            }
+        }
+        cmdstr[ci] = 0;
+        vmc_push_str(vs, cmdstr);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
+    }
+}
+
+/* Compile an assignment (NODE_ASSIGN) */
+static void vmc_compile_assign(VmCompilerState *vs, Node *n){
+    if(!n->lhs) return;
+
+    /* Array assignment: arr=(a b c) */
+    if(n->rhs && n->rhs[0] == '('){
+        /* For now, store as env var with space-separated values */
+        char val[2048]; int vi = 0;
+        const char *p = n->rhs + 1;
+        while(*p && *p != ')' && vi < (int)sizeof(val) - 1){
+            if(*p == '"'){ p++; while(*p && *p != '"' && vi < (int)sizeof(val)-1) val[vi++]=*p++; if(*p=='"')p++; }
+            else if(*p == '\''){ p++; while(*p && *p != '\'' && vi < (int)sizeof(val)-1) val[vi++]=*p++; if(*p=='\'')p++; }
+            else if(*p == ' ' || *p == '\t') { p++; if(vi>0 && vi<(int)sizeof(val)-1 && val[vi-1]!=' ') val[vi++]=' '; }
+            else val[vi++] = *p++;
+        }
+        val[vi] = 0;
+        vmc_push_str(vs, n->lhs);
+        vmc_push_str(vs, val);
+        vm_buf_emit(vs->bc, OP_SETENV);
+        return;
+    }
+
+    /* String assignment */
+    if(n->rhs){
+        /* Push variable name and value (with expansion) */
+        vmc_push_str(vs, n->lhs);
+        vmc_compile_word(vs, n->rhs);
+        vm_buf_emit(vs->bc, OP_SETENV);
+    }
+}
+
+/* Compile if/elif/else (NODE_IF) */
+static void vmc_compile_if(VmCompilerState *vs, Node *n){
+    /* Evaluate condition — for now, use a simplified approach:
+     * push a 1 (true) or 0 (false) based on a command execution result */
+    if(n->cond){
+        /* Execute condition as a command, result is on stack */
+        vmc_push_str(vs, n->cond);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        /* Convert to int (0 = false, non-zero = true) */
+        vm_buf_emit(vs->bc, OP_TO_INT);
+    } else {
+        vmc_push_int(vs, 1); /* default true */
+    }
+
+    /* In shell, exit code 0 = true. In VM, 0 = false.
+     * So we use JNZ to jump to else when the condition is false (non-zero). */
+    int jz_to_else = vm_buf_emit_jump(vs->bc, OP_JNZ);
+
+    /* Then block */
+    if(n->then_blk) vmc_compile_block(vs, n->then_blk);
+
+    /* JMP to end */
+    int jmp_to_end = vm_buf_emit_jump(vs->bc, OP_JMP);
+
+    /* Patch JZ to here (else/elif blocks) */
+    vm_buf_patch(vs->bc, jz_to_else, vm_buf_pc(vs->bc));
+
+    /* Elif blocks */
+    for(int i = 0; i < n->elif_count; i++){
+        if(n->elif_conds[i] && n->elif_conds[i]->cond){
+            vmc_push_str(vs, n->elif_conds[i]->cond);
+            vm_buf_emit(vs->bc, OP_EXEC_CMD);
+            vm_buf_emit(vs->bc, OP_TO_INT);
+        } else {
+            vmc_push_int(vs, 1);
+        }
+        int jz_skip = vm_buf_emit_jump(vs->bc, OP_JNZ);
+        if(n->elif_blks[i]) vmc_compile_block(vs, n->elif_blks[i]);
+        int jmp_end2 = vm_buf_emit_jump(vs->bc, OP_JMP);
+        vm_buf_patch(vs->bc, jz_skip, vm_buf_pc(vs->bc));
+        /* Use jmp_end2 later... but for simplicity, patch at end */
+        /* Actually, all elif jmps should go to the same end. We need to
+         * track all these and patch them all. For now, patch each to
+         * the current position, which means they'll fall through. */
+        vm_buf_patch(vs->bc, jmp_end2, vm_buf_pc(vs->bc));
+    }
+
+    /* Else block */
+    if(n->else_blk) vmc_compile_block(vs, n->else_blk);
+
+    /* Patch all JMP to end */
+    vm_buf_patch(vs->bc, jmp_to_end, vm_buf_pc(vs->bc));
+}
+
+/* Compile while loop (NODE_WHILE) */
+static void vmc_compile_while(VmCompilerState *vs, Node *n){
+    int loop_start = vm_buf_pc(vs->bc);
+
+    /* Push loop start for break/continue */
+    vs->loop_stack[vs->loop_depth] = loop_start;
+    int break_patch = -1;
+
+    /* Evaluate condition */
+    if(n->while_cond){
+        vmc_push_str(vs, n->while_cond);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_TO_INT);
+    } else {
+        vmc_push_int(vs, 1);
+    }
+
+    /* JZ to end (shell: 0=true, so JNZ = jump if false) */
+    int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
+
+    /* Body */
+    vs->loop_depth++;
+    if(n->while_body) vmc_compile_block(vs, n->while_body);
+    vs->loop_depth--;
+
+    /* JMP back to loop start (continue) */
+    vm_buf_emit_u16(vs->bc, OP_JMP, loop_start);
+
+    /* Patch JZ to here (break target) */
+    vm_buf_patch(vs->bc, jz_end, vm_buf_pc(vs->bc));
+    break_patch = jz_end;
+
+    /* Handle break: if there are pending break patches, they'd go here.
+     * For simplicity, break is not fully implemented yet. */
+    (void)break_patch;
+}
+
+/* Compile for loop (NODE_FOR) */
+static void vmc_compile_for(VmCompilerState *vs, Node *n){
+    /* For array-style for: for var in item1 item2 ... */
+    if(n->for_list && n->for_len > 0){
+        /* Store items as separate env vars with indexed names */
+        for(int i = 0; i < n->for_len; i++){
+            char name[256];
+            snprintf(name, sizeof(name), "%s", n->for_var);
+            vmc_push_str(vs, name);
+            vmc_push_str(vs, n->for_list[i]);
+            vm_buf_emit(vs->bc, OP_SETENV);
+        }
+
+        int loop_start = vm_buf_pc(vs->bc);
+        vs->loop_stack[vs->loop_depth] = loop_start;
+
+        /* Push index counter */
+        vmc_push_int(vs, 0);
+        (void)vm_buf_pc(vs->bc); /* counter tracking placeholder */
+
+        /* Check if counter < for_len */
+        /* For simplicity, emit each item's body directly (unroll) */
+        /* Actually, unrolling is simpler for now */
+        for(int i = 0; i < n->for_len; i++){
+            /* Set loop variable to current item */
+            vmc_push_str(vs, n->for_var);
+            vmc_push_str(vs, n->for_list[i]);
+            vm_buf_emit(vs->bc, OP_SETENV);
+
+            /* Compile body */
+            vs->loop_depth++;
+            if(n->body) vmc_compile_block(vs, n->body);
+            vs->loop_depth--;
+        }
+        /* Remove the counter (not used in unrolled version) */
+        vm_buf_emit(vs->bc, OP_POP);
+    }
+}
+
+/* Function table for VM compilation (collected via pre-scan) */
+/* vm_func_names, vm_func_bodies, vm_func_count declared at top of file */
+
+static void vm_prescan_funcs(Node *n){
+    while(n){
+        if(n->type == NODE_FUNC && n->fname){
+            if(vm_func_count < 256){
+                vm_func_names[vm_func_count] = n->fname;
+                vm_func_bodies[vm_func_count] = n->func_body;
+                vm_func_count++;
+            }
+        }
+        if(n->then_blk) vm_prescan_funcs(n->then_blk);
+        if(n->else_blk) vm_prescan_funcs(n->else_blk);
+        if(n->body) vm_prescan_funcs(n->body);
+        if(n->while_body) vm_prescan_funcs(n->while_body);
+        if(n->func_body) vm_prescan_funcs(n->func_body);
+        for(int i = 0; i < n->elif_count; i++){
+            if(n->elif_blks[i]) vm_prescan_funcs(n->elif_blks[i]);
+        }
+        for(int i = 0; i < n->case_count; i++){
+            if(n->case_bodies[i]) vm_prescan_funcs(n->case_bodies[i]);
+        }
+        if(n->case_default) vm_prescan_funcs(n->case_default);
+        if(n->left) vm_prescan_funcs(n->left);
+        if(n->right) vm_prescan_funcs(n->right);
+        n = n->next;
+    }
+}
+
+static int vm_find_func(const char *name){
+    for(int i = 0; i < vm_func_count; i++){
+        if(strcmp(vm_func_names[i], name) == 0) return i;
+    }
+    return -1;
+}
+
+/* Compile function definition (NODE_FUNC) */
+static void vmc_compile_func(VmCompilerState *vs, Node *n){
+    /* Function body is compiled inline when called, not at definition.
+     * Just register the name (done in pre-scan). */
+    (void)vs; (void)n;
+}
+
+/* Compile a case statement (NODE_CASE) */
+static void vmc_compile_case(VmCompilerState *vs, Node *n){
+    /* Evaluate the case variable and push its value */
+    if(n->case_var){
+        vmc_compile_word(vs, n->case_var);
+    } else {
+        vmc_push_str(vs, "");
+    }
+
+    /* For each pattern, we need to:
+     * 1. DUP the value on stack
+     * 2. Push the pattern
+     * 3. STRCMP → push 0 if match (shell semantics)
+     * 4. JZ (zero=true → match) → execute body
+     * 5. If no match, continue to next pattern
+     */
+    int jmp_to_ends[64];
+    int n_ends = 0;
+
+    for(int i = 0; i < n->case_count; i++){
+        /* Duplicate the case value for this pattern test */
+        vm_buf_emit(vs->bc, OP_DUP);
+
+        /* Push pattern (strip quotes if present) */
+        const char *pat = n->case_pats[i];
+        vmc_compile_word(vs, pat);
+
+        /* String compare: 0 = match (true in shell) */
+        vm_buf_emit(vs->bc, OP_STRCMP);
+        /* 0 = match, so JZ (zero = match = true) */
+        int jz_match = vm_buf_emit_jump(vs->bc, OP_JZ);
+
+        /* No match: pop the duplicate, continue to next pattern */
+        vm_buf_emit(vs->bc, OP_POP);
+
+        /* Match: jump to body */
+        vm_buf_patch(vs->bc, jz_match, vm_buf_pc(vs->bc));
+
+        /* Pop the original value (we consumed the DUP) */
+        vm_buf_emit(vs->bc, OP_POP);
+
+        /* Compile the body */
+        if(n->case_bodies[i]) vmc_compile_block(vs, n->case_bodies[i]);
+
+        /* Jump to end of case */
+        jmp_to_ends[n_ends++] = vm_buf_emit_jump(vs->bc, OP_JMP);
+    }
+
+    /* Default case */
+    if(n->case_default){
+        /* Pop the case value */
+        vm_buf_emit(vs->bc, OP_POP);
+        if(n->case_default) vmc_compile_block(vs, n->case_default);
+    } else {
+        /* Pop the case value */
+        vm_buf_emit(vs->bc, OP_POP);
+    }
+
+    /* Patch all JMP to end */
+    int end_pc = vm_buf_pc(vs->bc);
+    for(int i = 0; i < n_ends; i++){
+        vm_buf_patch(vs->bc, jmp_to_ends[i], end_pc);
+    }
+}
+
+/* Compile a pipe (NODE_PIPE) */
+static void vmc_compile_pipe(VmCompilerState *vs, Node *n){
+    /* For pipe, we need to execute left | right.
+     * For now, execute both as commands with EXEC_PIPE. */
+    if(n->left){
+        if(n->left->type == NODE_CMD && n->left->argv && n->left->argc > 0){
+            /* Build command string */
+            char cmdstr[2048]; int ci = 0;
+            for(int i = 0; i < n->left->argc && ci < (int)sizeof(cmdstr)-1; i++){
+                if(i > 0) cmdstr[ci++] = ' ';
+                int al = strlen(n->left->argv[i]);
+                if(ci + al < (int)sizeof(cmdstr) - 1){ memcpy(cmdstr+ci, n->left->argv[i], al); ci += al; }
+            }
+            cmdstr[ci] = 0;
+            vmc_push_str(vs, cmdstr);
+        }
+    }
+    if(n->right){
+        if(n->right->type == NODE_CMD && n->right->argv && n->right->argc > 0){
+            char cmdstr[2048]; int ci = 0;
+            for(int i = 0; i < n->right->argc && ci < (int)sizeof(cmdstr)-1; i++){
+                if(i > 0) cmdstr[ci++] = ' ';
+                int al = strlen(n->right->argv[i]);
+                if(ci + al < (int)sizeof(cmdstr) - 1){ memcpy(cmdstr+ci, n->right->argv[i], al); ci += al; }
+            }
+            cmdstr[ci] = 0;
+            vmc_push_str(vs, cmdstr);
+        }
+    }
+    vm_buf_emit(vs->bc, OP_EXEC_PIPE);
+    vm_buf_emit(vs->bc, OP_PRINT);
+}
+
+/* Compile a single AST node */
+static void vmc_compile_node(VmCompilerState *vs, Node *n){
+    if(!n) return;
+
+    switch(n->type){
+        case NODE_CMD:
+            vmc_compile_cmd(vs, n);
+            break;
+        case NODE_ASSIGN:
+            vmc_compile_assign(vs, n);
+            break;
+        case NODE_IF:
+            vmc_compile_if(vs, n);
+            break;
+        case NODE_WHILE:
+            vmc_compile_while(vs, n);
+            break;
+        case NODE_FOR:
+            vmc_compile_for(vs, n);
+            break;
+        case NODE_FUNC:
+            vmc_compile_func(vs, n);
+            break;
+        case NODE_PIPE:
+            vmc_compile_pipe(vs, n);
+            break;
+        case NODE_CASE:
+            vmc_compile_case(vs, n);
+            break;
+        case NODE_EXIT:
+            if(n->exit_str){
+                vmc_push_int(vs, atoi(n->exit_str));
+            } else {
+                vmc_push_int(vs, n->exit_code);
+            }
+            vm_buf_emit(vs->bc, OP_EXIT);
+            break;
+        case NODE_RETURN:
+            if(n->exit_str){
+                vmc_push_int(vs, atoi(n->exit_str));
+            } else {
+                vmc_push_int(vs, n->exit_code);
+            }
+            vm_buf_emit(vs->bc, OP_RET);
+            break;
+        case NODE_BREAK:
+            /* JMP to loop break target */
+            if(vs->loop_depth > 0){
+                vm_buf_emit_u16(vs->bc, OP_JMP, 0); /* placeholder */
+                /* TODO: patch to loop break */
+            }
+            break;
+        case NODE_CONTINUE:
+            /* JMP to loop start */
+            if(vs->loop_depth > 0){
+                vm_buf_emit_u16(vs->bc, OP_JMP, vs->loop_stack[vs->loop_depth - 1]);
+            }
+            break;
+        case NODE_AND:
+            /* Short-circuit AND */
+            if(n->left) vmc_compile_node(vs, n->left);
+            /* JZ to skip right */
+            int jz_and = vm_buf_emit_jump(vs->bc, OP_JZ);
+            vm_buf_emit(vs->bc, OP_POP);
+            if(n->right) vmc_compile_node(vs, n->right);
+            vm_buf_patch(vs->bc, jz_and, vm_buf_pc(vs->bc));
+            break;
+        case NODE_OR:
+            /* Short-circuit OR */
+            if(n->left) vmc_compile_node(vs, n->left);
+            int jnz_or = vm_buf_emit_jump(vs->bc, OP_JNZ);
+            vm_buf_emit(vs->bc, OP_POP);
+            if(n->right) vmc_compile_node(vs, n->right);
+            vm_buf_patch(vs->bc, jnz_or, vm_buf_pc(vs->bc));
+            break;
+        case NODE_SUBSHELL:
+        case NODE_GROUP:
+            /* Just compile the inner block */
+            if(n->left) vmc_compile_block(vs, n->left);
+            break;
+        case NODE_LOCAL:
+        case NODE_EXPORT:
+            /* Treat as assignment */
+            if(n->argv){
+                for(int i = 0; i < n->argc; i++){
+                    char *eq = strchr(n->argv[i], '=');
+                    if(eq){
+                        *eq = 0;
+                        vmc_push_str(vs, n->argv[i]);
+                        vmc_push_str(vs, eq + 1);
+                        vm_buf_emit(vs->bc, OP_SETENV);
+                        *eq = '=';
+                    }
+                }
+            }
+            break;
+        case NODE_UNSET:
+            if(n->argv && n->argc > 0){
+                for(int i = 0; i < n->argc; i++){
+                    vmc_push_str(vs, n->argv[i]);
+                    vmc_push_str(vs, "");
+                    vm_buf_emit(vs->bc, OP_SETENV);
+                }
+            }
+            break;
+        default:
+            /* Other node types: skip for now */
+            break;
+    }
+}
+
+/* Compile a block (linked list of nodes) */
+static void vmc_compile_block(VmCompilerState *vs, Node *n){
+    while(n){
+        vmc_compile_node(vs, n);
+        n = n->next;
+    }
+}
+
+/* Main entry: compile script AST to VM bytecode and emit output */
+void vmc_compile_and_emit(FILE *out, Node *script, int obfuscate){
+    VmBuf bc;
+    VmConstPool cp;
+    VmCompilerState vs;
+
+    vm_buf_init(&bc);
+    vm_cp_init(&cp);
+    vs.bc = &bc;
+    vs.cp = &cp;
+    vs.loop_depth = 0;
+
+    /* Pre-scan AST for function definitions */
+    vm_func_count = 0;
+    vm_prescan_funcs(script);
+
+    /* Emit VM runtime */
+    emit_vm_runtime(out);
+
+    /* Compile AST */
+    vmc_compile_block(&vs, script);
+
+    /* Emit HALT */
+    vm_buf_emit(&bc, OP_HALT);
+
+    /* Emit output (const pool + bytecode + main) */
+    vmc_emit_output(out, &bc, &cp, NULL, 0, obfuscate);
+
+    /* Cleanup */
+    vm_buf_free(&bc);
+    vm_cp_free(&cp);
+}
+
 
 /* ================================================================== */
 /* L0  Utility — definitions now in s2c_common.h                       */
@@ -58,33 +942,63 @@ static const char *C_KEYWORDS_EXT[] = {
     NULL
 };
 
-/* Override safe_cname to use extended keyword list */
-static char _cname_buf[256];
+/* Override safe_cname to use extended keyword list.
+ * Uses a rotating pool of buffers so multiple calls in one expression
+ * (e.g. fprintf(out, "%s...%s", safe_cname(a), safe_cname(b)))
+ * don't clobber each other. */
+#define CNAME_POOL_SIZE 8
+static char _cname_pool[CNAME_POOL_SIZE][256];
+static int  _cname_idx = 0;
+
+/* Escape a string for use inside a C double-quoted string literal.
+ * Returns a newly allocated string. Handles: \ " and control chars.
+ * Does NOT add surrounding quotes. */
+static char *c_escape_literal(const char *s){
+    if(!s) return xstrdup("");
+    size_t len = strlen(s);
+    char *r = malloc(len * 4 + 1);
+    int j = 0;
+    for(int i = 0; s[i]; i++){
+        switch(s[i]){
+            case '\\': r[j++]='\\'; r[j++]='\\'; break;
+            case '"':  r[j++]='\\'; r[j++]='"';  break;
+            case '\n': r[j++]='\\'; r[j++]='n';  break;
+            case '\t': r[j++]='\\'; r[j++]='t';  break;
+            case '\r': r[j++]='\\'; r[j++]='r';  break;
+            default:   r[j++]=s[i]; break;
+        }
+    }
+    r[j] = 0;
+    return r;
+}
+
 const char *safe_cname(const char *name){
-    if(!name||!*name) return "__sh_empty";
+    char *buf = _cname_pool[_cname_idx];
+    _cname_idx = (_cname_idx + 1) % CNAME_POOL_SIZE;
+    if(!name||!*name){ snprintf(buf,256,"__sh_empty"); return buf; }
     for(int i=0;C_KEYWORDS_EXT[i];i++){
         if(strcmp(name,C_KEYWORDS_EXT[i])==0){
-            snprintf(_cname_buf,sizeof(_cname_buf),"_sh_%s",name);
-            return _cname_buf;
+            snprintf(buf,256,"_sh_%s",name);
+            return buf;
         }
     }
     if(!isalpha((unsigned char)name[0]) && name[0]!='_'){
-        snprintf(_cname_buf,sizeof(_cname_buf),"_sh_%s",name);
-        return _cname_buf;
+        snprintf(buf,256,"_sh_%s",name);
+        return buf;
     }
     int dirty=0;
     for(const char *p=name;*p;p++){
         if(!isalnum((unsigned char)*p) && *p!='_'){ dirty=1; break; }
     }
     if(dirty){
-        char tmp[256]; int j=0;
-        for(const char *p=name;*p && j<(int)sizeof(tmp)-1;p++){
-            tmp[j++] = (isalnum((unsigned char)*p)||*p=='_') ? *p : '_';
+        int j=0;
+        for(const char *p=name;*p && j<255;p++){
+            buf[j++] = (isalnum((unsigned char)*p)||*p=='_') ? *p : '_';
         }
-        tmp[j]=0;
-        snprintf(_cname_buf,sizeof(_cname_buf),"%s",tmp);
-        return _cname_buf;
+        buf[j]=0;
+        return buf;
     }
+    /* name is clean — can return directly without copying */
     return name;
 }
 
@@ -165,48 +1079,7 @@ const char *heredoc_consume(int *expand){
 /* L3  AST — types in s2c_ast.h, constructors here                     */
 /* ================================================================== */
 
-/* NodeType, Redir, Node are declared in s2c_ast.h.
- * The local Node struct has extra fields (set_opts) not in the header,
- * so we use a local extension. */
-typedef struct NodeExt {
-    NodeType type;
-    int lineno;
-    struct NodeExt *next;
-    /* assign */
-    char *lhs, *rhs;
-    /* cmd / background / subshell / group */
-    char **argv; int argc;
-    Redir *redirs;
-    /* if */
-    char *cond;
-    struct NodeExt *then_blk, *else_blk;
-    struct NodeExt *elif_conds[16]; struct NodeExt *elif_blks[16]; int elif_count;
-    /* for */
-    char *for_var; char **for_list; int for_len; struct NodeExt *body;
-    int for_c_style;
-    char *for_init, *for_cond, *for_update;
-    /* while */
-    char *while_cond; int while_negate; struct NodeExt *while_body;
-    /* func */
-    char *fname; struct NodeExt *func_body;
-    /* exit/return */
-    int exit_code; char *exit_str;
-    /* pipe / and / or */
-    struct NodeExt *left, *right;
-    /* heredoc */
-    char *heredoc_text;
-    /* case */
-    char *case_var;
-    char *case_pats[64]; struct NodeExt *case_bodies[64]; int case_count;
-    struct NodeExt *case_default;
-    /* trap */
-    char *trap_action; int trap_sig;
-    /* set */
-    char *set_opts;
-} NodeExt;
-
-/* Use NodeExt as Node throughout this file */
-#define Node NodeExt
+/* NodeExt is now defined in s2c_ast.h */
 
 Node *new_node(NodeType t, int ln){
     Node *n=calloc(1,sizeof(Node));
@@ -296,12 +1169,8 @@ int tokenize(const char *line, char **toks, int maxtoks){
             if(*p=='"') p++;
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
         }
-        if(*p=='\''){
-            const char *s=p; p++;
-            while(*p && *p!='\'') p++;
-            if(*p=='\'') p++;
-            toks[n++]=pool_dup(s,(int)(p-s)); continue;
-        }
+        /* Note: standalone single-quoted strings are handled by the bare word
+         * handler below, which also handles mixed quoting like 'It'\''s' */
         /* backtick command substitution — convert to $(...) form */
         if(*p=='`'){
             p++;
@@ -359,11 +1228,29 @@ int tokenize(const char *line, char **toks, int maxtoks){
         if(*p=='>'&&*(p+1)=='&'){ toks[n++]=(char*)">&"; p+=2; continue; }
         if(*p=='<'){             toks[n++]=(char*)"<";  p++;  continue; }
         if(*p=='>'){             toks[n++]=(char*)">";  p++;  continue; }
-        /* bare word */
+        /* bare word — consumes adjacent quoted segments too (e.g. 'It'\''s' = one token) */
         { const char *s=p;
-          while(*p&&*p!=' '&&*p!='\t'&&*p!='"'&&*p!='\''){
+          while(*p&&*p!=' '&&*p!='\t'){
               if(*p=='\\'&&*(p+1)){ p+=2; continue; }  /* escape next char */
               if(*p=='#'&&p>s) break;
+              if(*p=='\''){
+                  /* consume single-quoted segment as part of this word */
+                  p++;
+                  while(*p && *p!='\'') p++;
+                  if(*p=='\'') p++;
+                  continue;
+              }
+              if(*p=='"'){
+                  /* consume double-quoted segment as part of this word */
+                  p++;
+                  while(*p && *p!='"'){
+                      if(*p=='\\'&&*(p+1)){ p+=2; continue; }
+                      if(*p=='$'&&*(p+1)=='('){ p+=2; int d=1; while(*p&&d){ if(*p=='(')d++; else if(*p==')')d--; p++; } continue; }
+                      p++;
+                  }
+                  if(*p=='"') p++;
+                  continue;
+              }
               /* check for array index pattern: name[key]= or name[key] */
               if(*p=='[' && p>s && (isalnum((unsigned char)*(p-1))||*(p-1)=='_')){
                   /* look for matching ] */
@@ -662,7 +1549,19 @@ char *translate_brace_expansion(const char *body){
                         snprintf(r,sizeof(r),"(%s[0]?%s:%s)",cn,cn,def_val);
                     break;
                 case '+': snprintf(r,sizeof(r),"(%s[0]?%s:\"\")",cn,def_val); break;
-                case '?': snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\%s\\n\),exit(1),\\))",cn,cn,def); break;
+                case '?': {
+                    /* Escape def for C string literal */
+                    char esc_def[512]; int ei=0;
+                    for(const char *dp=def;*dp&&ei<(int)sizeof(esc_def)-4;dp++){
+                        if(*dp=='"'){ esc_def[ei++]='\\'; esc_def[ei++]='"'; }
+                        else if(*dp=='\\'){ esc_def[ei++]='\\'; esc_def[ei++]='\\'; }
+                        else if(*dp=='\n'){ esc_def[ei++]='\\'; esc_def[ei++]='n'; }
+                        else esc_def[ei++]=*dp;
+                    }
+                    esc_def[ei]=0;
+                    snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%s\\n\"),exit(1),\"\"))",cn,cn,esc_def);
+                    break;
+                }
                 default:  snprintf(r,sizeof(r),"%s",cn); break;
             }
             if(def_expanded) free(def_expanded);
@@ -2107,39 +3006,77 @@ char *emit_word(FILE *out, const char *word){
         char *r=malloc(32); snprintf(r,32,"__ps_%d",id);
         return r;
     }
-    char inner[4096];
-    /* Single-quoted strings are literal — no variable expansion */
-    if(word[0]=='\'' && strlen(word)>=2){
-        strncpy(inner,word+1,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
-        int l=(int)strlen(inner);
-        if(l>0 && inner[l-1]=='\'') inner[--l]=0;
-        char *r=malloc(strlen(inner)+3);
-        sprintf(r,"\"%s\"",inner);
-        return r;
-    }
-    if((word[0]=='"')&&strlen(word)>=2){
-        strncpy(inner,word+1,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
-        int l=(int)strlen(inner);
-        if(l>0&&inner[l-1]=='"') inner[--l]=0;
-    } else {
-        strncpy(inner,word,sizeof(inner)-1); inner[sizeof(inner)-1]=0;
-    }
-    if(!strchr(inner,'$')&&!strchr(inner,'\\')){
-        /* Escape embedded newlines/tabs for C string literal */
-        char esc[8192]; int ei=0;
-        for(int i=0;inner[i]&&ei<(int)sizeof(esc)-4;i++){
-            if(inner[i]=='\n'){ esc[ei++]='\\'; esc[ei++]='n'; }
-            else if(inner[i]=='\t'){ esc[ei++]='\\'; esc[ei++]='t'; }
-            else if(inner[i]=='\r'){ esc[ei++]='\\'; esc[ei++]='r'; }
-            else if(inner[i]=='"'){ esc[ei++]='\\'; esc[ei++]='"'; }
-            else esc[ei++]=inner[i];
+
+    /* Unescape the word: handle mixed quoting (e.g. 'It'\''s' = It's).
+     * Walk through the token, handling each segment:
+     * - '...' → literal (no expansion)
+     * - "..." → with variable expansion and escape processing
+     * - \X → literal X (outside quotes)
+     * - bare chars → literal (or variable expansion if $) */
+    char unescaped[4096]; int ui = 0;
+    int has_dollar = 0;  /* flag: does the unescaped result contain $ for expansion? */
+    const char *p = word;
+
+    while(*p && ui < (int)sizeof(unescaped)-1){
+        if(*p == '\''){
+            /* single-quoted segment: literal, no expansion */
+            p++;
+            while(*p && *p != '\'' && ui < (int)sizeof(unescaped)-1){
+                unescaped[ui++] = *p++;
+            }
+            if(*p == '\'') p++;
+        } else if(*p == '"'){
+            /* double-quoted segment: variable expansion applies, backslash before $ ` " \ newline */
+            p++;
+            while(*p && *p != '"' && ui < (int)sizeof(unescaped)-1){
+                if(*p == '\\' && *(p+1)){
+                    char next = *(p+1);
+                    if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n'){
+                        unescaped[ui++] = next;
+                        p += 2;
+                    } else {
+                        unescaped[ui++] = *p++;
+                    }
+                } else if(*p == '$'){
+                    has_dollar = 1;
+                    unescaped[ui++] = *p++;
+                } else {
+                    unescaped[ui++] = *p++;
+                }
+            }
+            if(*p == '"') p++;
+        } else if(*p == '\\' && *(p+1)){
+            /* escaped character outside quotes → literal */
+            unescaped[ui++] = *(p+1);
+            p += 2;
+        } else if(*p == '$'){
+            has_dollar = 1;
+            unescaped[ui++] = *p++;
+        } else {
+            unescaped[ui++] = *p++;
         }
-        esc[ei]=0;
-        char *r=malloc(strlen(esc)+3);
-        sprintf(r,"\"%s\"",esc);
+    }
+    unescaped[ui] = 0;
+
+    /* Now emit the unescaped string */
+    if(!has_dollar && !strchr(unescaped,'\\')){
+        /* Pure literal — escape for C string and return */
+        char *esc = c_escape_literal(unescaped);
+        char *r = malloc(strlen(esc) + 3);
+        sprintf(r, "\"%s\"", esc);
+        free(esc);
         return r;
     }
-    ExpandResult er; expand_string(word,&er);
+    if(!has_dollar){
+        /* Has backslashes but no $ — still a literal, just escape for C */
+        char *esc = c_escape_literal(unescaped);
+        char *r = malloc(strlen(esc) + 3);
+        sprintf(r, "\"%s\"", esc);
+        free(esc);
+        return r;
+    }
+    /* Has $ — use expand_string for variable expansion */
+    ExpandResult er; expand_string(unescaped,&er);
     int id=tmp_id++;
     /* Escape newlines/tabs in fmt for C string literal */
     fprintf(out,"    char __tw_%d[1024]; snprintf(__tw_%d, sizeof(__tw_%d), \"",id,id,id);
@@ -3377,11 +4314,19 @@ void emit_node(FILE *out, Node *n){
                 while(*p==' '||*p=='\t') p++;
                 if(*p==')') break;
                 char elem[256]; int ei=0;
-                if(*p=='"'){ p++; while(*p&&*p!='"'&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; if(*p=='"')p++; }
+                if(*p=='"'){ p++; while(*p&&*p!='"'&&ei<(int)sizeof(elem)-1){
+                    if(*p=='\\' && *(p+1)){
+                        char next=*(p+1);
+                        if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n') p++; /* skip backslash */
+                    }
+                    elem[ei++]=*p++;
+                } if(*p=='"')p++; }
                 else if(*p=='\''){ p++; while(*p&&*p!='\''&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; if(*p=='\'')p++; }
                 else { while(*p&&*p!=' '&&*p!='\t'&&*p!=')'&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; }
                 elem[ei]=0;
-                fprintf(out,"    __arr_%s[__al++]=\"%s\";\n",safe_cname(n->lhs),elem);
+                { char *esc=c_escape_literal(elem);
+                fprintf(out,"    __arr_%s[__al++]=\"%s\";\n",safe_cname(n->lhs),esc);
+                free(esc); }
             }
             fprintf(out,"    __arr_%s[__al]=NULL; }\n",safe_cname(n->lhs));
             break;
@@ -3401,7 +4346,9 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,",sizeof(%s)-strlen(%s)-1);\n",cn,cn);
                 expand_free(&er);
             } else {
-                fprintf(out,"    strncat(%s,\"%s\",sizeof(%s)-strlen(%s)-1);\n",cn,n->rhs,cn,cn);
+                char *esc=c_escape_literal(n->rhs);
+                fprintf(out,"    strncat(%s,\"%s\",sizeof(%s)-strlen(%s)-1);\n",cn,esc,cn,cn);
+                free(esc);
             }
             break;
         }
@@ -3414,9 +4361,21 @@ void emit_node(FILE *out, Node *n){
                 while(*p==' '||*p=='\t') p++;
                 if(*p==')') break;
                 char *q=items[ni]; int k=0;
+                int saw_quotes=0; /* track quoted elements (including empty "") */
                 while(*p && *p!=' ' && *p!='\t' && *p!=')'){
-                    if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1))p++; q[k++]=*p++; } if(*p)p++; }
-                    else if(*p=='\''){ p++; while(*p&&*p!='\'') q[k++]=*p++; if(*p)p++; }
+                    if(*p=='"'){ p++; saw_quotes=1; while(*p&&*p!='"'){
+                        /* In bash double quotes, \ is only special before $ ` " \ and newline.
+                         * Before other chars, \ is literal. */
+                        if(*p=='\\' && *(p+1)){
+                            char next=*(p+1);
+                            if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n'){
+                                p++; /* skip backslash, keep next char */
+                            }
+                            /* else: keep backslash literally */
+                        }
+                        q[k++]=*p++;
+                    } if(*p)p++; }
+                    else if(*p=='\''){ p++; saw_quotes=1; while(*p&&*p!='\'') q[k++]=*p++; if(*p)p++; }
                     else if(*p=='$' && (*(p+1)=='{' || *(p+1)=='(')){
                         /* ${...} or $(...) — read as single unit */
                         char open=*(p+1); char close=(open=='{')?'}':')';
@@ -3431,7 +4390,9 @@ void emit_node(FILE *out, Node *n){
                     }
                     else q[k++]=*p++;
                 }
-                q[k]=0; if(k>0){ ni++; }
+                q[k]=0;
+                /* Always add element if it was quoted (even if empty) or non-empty */
+                if(k>0 || saw_quotes){ ni++; }
             }
             fprintf(out,"    /* array %s */\n",safe_cname(n->lhs));
             fprintf(out,"    {\n");
@@ -3461,7 +4422,9 @@ void emit_node(FILE *out, Node *n){
                     expand_free(&er);
                     fprintf(out,"    __arr_%s[__an%d++]=strdup(__tw_%d);\n",safe_cname(n->lhs),n->lineno,id);
                 } else {
-                    fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,items[i]);
+                    char *esc = c_escape_literal(items[i]);
+                    fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,esc);
+                    free(esc);
                 }
             }
             fprintf(out,"    __arr_%s[__an%d]=NULL;\n",safe_cname(n->lhs),n->lineno);
@@ -3507,14 +4470,26 @@ void emit_node(FILE *out, Node *n){
                 const char *val=rhs;
                 char tmp[2048];
                 if((val[0]=='"'||val[0]=='\'')&&strlen(val)>=2){
-                    strncpy(tmp,val+1,sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
-                    int l=(int)strlen(tmp);
-                    if(l>0&&(tmp[l-1]=='"'||tmp[l-1]=='\'')) tmp[--l]=0;
+                    char q=val[0];
+                    const char *vp=val+1;
+                    int ti=0;
+                    while(*vp && *vp!=q && ti<(int)sizeof(tmp)-1){
+                        if(q=='"' && *vp=='\\' && *(vp+1)){
+                            char next=*(vp+1);
+                            if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n') vp++;
+                        }
+                        tmp[ti++]=*vp++;
+                    }
+                    tmp[ti]=0;
+                    char *esc=c_escape_literal(tmp);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
-                            safe_cname(n->lhs),tmp,safe_cname(n->lhs));
+                            safe_cname(n->lhs),esc,safe_cname(n->lhs));
+                    free(esc);
                 } else {
+                    char *esc=c_escape_literal(val);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
-                            safe_cname(n->lhs),val,safe_cname(n->lhs));
+                            safe_cname(n->lhs),esc,safe_cname(n->lhs));
+                    free(esc);
                 }
             }
         }
@@ -3543,11 +4518,19 @@ void emit_node(FILE *out, Node *n){
                         while(*p==' '||*p=='\t') p++;
                         if(*p==')') break;
                         char elem[256]; int ei=0;
-                        if(*p=='"'){ p++; while(*p&&*p!='"'&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; if(*p=='"')p++; }
+                        if(*p=='"'){ p++; while(*p&&*p!='"'&&ei<(int)sizeof(elem)-1){
+                            if(*p=='\\' && *(p+1)){
+                                char next=*(p+1);
+                                if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n') p++;
+                            }
+                            elem[ei++]=*p++;
+                        } if(*p=='"')p++; }
                         else if(*p=='\''){ p++; while(*p&&*p!='\''&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; if(*p=='\'')p++; }
                         else { while(*p&&*p!=' '&&*p!='\t'&&*p!=')'&&ei<(int)sizeof(elem)-1) elem[ei++]=*p++; }
                         elem[ei]=0;
-                        fprintf(out,"    __arr_%s[%d]=\"%s\";\n",cn,idx,elem);
+                        { char *esc=c_escape_literal(elem);
+                        fprintf(out,"    __arr_%s[%d]=\"%s\";\n",cn,idx,esc);
+                        free(esc); }
                         idx++;
                     }
                 } else {
@@ -3558,7 +4541,13 @@ void emit_node(FILE *out, Node *n){
                         /* strip quotes */
                         char inner[1024]; int il=0;
                         const char *vp=val+1;
-                        while(*vp && *vp!=val[0] && il<(int)sizeof(inner)-1) inner[il++]=*vp++;
+                        while(*vp && *vp!=val[0] && il<(int)sizeof(inner)-1){
+                            if(val[0]=='"' && *vp=='\\' && *(vp+1)){
+                                char next=*(vp+1);
+                                if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n') vp++;
+                            }
+                            inner[il++]=*vp++;
+                        }
                         inner[il]=0;
                         if(strchr(inner,'$')){
                             /* expand variables */
@@ -3568,7 +4557,9 @@ void emit_node(FILE *out, Node *n){
                             fprintf(out,");\n");
                             expand_free(&er);
                         } else {
-                            fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,inner,cn);
+                            char *esc=c_escape_literal(inner);
+                            fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,esc,cn);
+                            free(esc);
                         }
                     } else if(strchr(val,'$')){
                         ExpandResult er; expand_string(val,&er);
@@ -3577,7 +4568,9 @@ void emit_node(FILE *out, Node *n){
                         fprintf(out,");\n");
                         expand_free(&er);
                     } else {
-                        fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,val,cn);
+                        char *esc=c_escape_literal(val);
+                        fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",cn,esc,cn);
+                        free(esc);
                     }
                 }
                 *eq='=';
@@ -4455,7 +5448,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                         strncpy(cond_str,p1+1,sizeof(cond_str)-1); cond_str[sizeof(cond_str)-1]=0;
                     }
                 } else {
-                    strncpy(init_str,buf,sizeof(init_str)-1); init_str[sizeof(init_str)-1]=0;
+                    snprintf(init_str,sizeof(init_str),"%s",buf);
                 }
                 /* Extract variable name from init (e.g., "i=0" → "i") */
                 {
@@ -4946,7 +5939,9 @@ Node *parse_script(FILE *f){
                     } else if(in_squote){
                         if(line[i]=='\'') in_squote=0;
                     } else {
-                        if(line[i]=='"') in_dquote=1;
+                        /* Handle escaped characters outside quotes */
+                        if(line[i]=='\\' && line[i+1]) { i++; }
+                        else if(line[i]=='"') in_dquote=1;
                         else if(line[i]=='\'') in_squote=1;
                         /* skip comments that start outside quotes */
                         else if(line[i]=='#') break;
@@ -5037,6 +6032,9 @@ Node *parse_script(FILE *f){
                                 while(*dp2 && *dp2!=' ' && *dp2!='\t' && *dp2!=';' && *dp2!='&' && *dp2!='|' && di2<127) delim2[di2++]=*dp2++;
                             }
                             delim2[di2]=0;
+                            (void)quoted2; /* quoted delimiter disables expansion in bash;
+                                            * here the body is passed to runtime sh -c,
+                                            * so expansion is handled by the shell. */
                             if(di2>0){
                                 /* Read heredoc body and append to current line */
                                 char hdline2[2048];
@@ -5044,6 +6042,12 @@ Node *parse_script(FILE *f){
                                 while(fgets(hdline2,sizeof(hdline2),f)){
                                     lineno++;
                                     hdline2[strcspn(hdline2,"\r\n")]=0;
+                                    /* strip leading tabs if <<- was used */
+                                    if(strip_tabs2){
+                                        char *h=hdline2;
+                                        while(*h=='\t') h++;
+                                        memmove(hdline2,h,strlen(h)+1);
+                                    }
                                     if(strcmp(hdline2,delim2)==0) break;
                                     if(cur_len < (int)sizeof(line)-2){
                                         t[cur_len++]='\n';
@@ -5158,29 +6162,55 @@ const char *RT_HEADER =
 "static int __sh_set_e=0;\n"
 "static int __sh_set_u=0;\n"
 "static int __sh_set_x=0;\n"
-"static char __sh_indirect_buf[1024];\n"
-"static char __sh_substr_buf[4096];\n"
-"static char __sh_strip_buf[4096];\n"
-"static char __sh_replace_buf[4096];\n"
-"static char __sh_upper_buf[4096];\n"
-"static char __sh_lower_buf[4096];\n"
-"static char __sh_cmd_out_buf[65536];\n"
+"\n"
+"/* ---- rotating buffer pools (safe for nested calls) ---- */\n"
+"/* 4-slot pools: calling a function 4+ times in one expression still\n"
+" * overwrites, but that's rare. 4 is the sweet spot for memory vs safety. */\n"
+"static char __sh_indirect_p0[1024], __sh_indirect_p1[1024], __sh_indirect_p2[1024], __sh_indirect_p3[1024];\n"
+"static int  __sh_indirect_i = 0;\n"
+"static char __sh_substr_p0[4096], __sh_substr_p1[4096], __sh_substr_p2[4096], __sh_substr_p3[4096];\n"
+"static int  __sh_substr_i = 0;\n"
+"static char __sh_strip_p0[4096], __sh_strip_p1[4096], __sh_strip_p2[4096], __sh_strip_p3[4096];\n"
+"static int  __sh_strip_i = 0;\n"
+"static char __sh_replace_p0[4096], __sh_replace_p1[4096], __sh_replace_p2[4096], __sh_replace_p3[4096];\n"
+"static int  __sh_replace_i = 0;\n"
+"static char __sh_upper_p0[4096], __sh_upper_p1[4096], __sh_upper_p2[4096], __sh_upper_p3[4096];\n"
+"static int  __sh_upper_i = 0;\n"
+"static char __sh_lower_p0[4096], __sh_lower_p1[4096], __sh_lower_p2[4096], __sh_lower_p3[4096];\n"
+"static int  __sh_lower_i = 0;\n"
+"static char __sh_cmd_out_p0[65536], __sh_cmd_out_p1[65536], __sh_cmd_out_p2[65536], __sh_cmd_out_p3[65536];\n"
+"static int  __sh_cmd_out_i = 0;\n"
+"static char __sh_fmt_p0[8192], __sh_fmt_p1[8192], __sh_fmt_p2[8192], __sh_fmt_p3[8192];\n"
+"static int  __sh_fmt_i = 0;\n"
+"static char __sh_fn_out_p0[65536], __sh_fn_out_p1[65536], __sh_fn_out_p2[65536], __sh_fn_out_p3[65536];\n"
+"static int  __sh_fn_out_i = 0;\n"
+"static char __sh_arr_p0[8192], __sh_arr_p1[8192], __sh_arr_p2[8192], __sh_arr_p3[8192];\n"
+"static int  __sh_arr_i = 0;\n"
+"static char __sh_ps_p0[64], __sh_ps_p1[64], __sh_ps_p2[64], __sh_ps_p3[64];\n"
+"static int  __sh_ps_i = 0;\n"
+"\n"
+"/* Helper: get next pool slot for a given base name */\n"
+"static char *__sh_pool_next(char *p0, char *p1, char *p2, char *p3, int *idx){\n"
+"  char *r = ( (*idx == 0) ? p0 : (*idx == 1) ? p1 : (*idx == 2) ? p2 : p3 );\n"
+"  *idx = (*idx + 1) & 3;\n"
+"  return r;\n"
+"}\n"
 "\n"
 "/* ---- string helpers ---- */\n"
 "static const char *__sh_indirect(const char *name){\n"
+"  char *buf = __sh_pool_next(__sh_indirect_p0,__sh_indirect_p1,__sh_indirect_p2,__sh_indirect_p3,&__sh_indirect_i);\n"
 "  char vn[256]; snprintf(vn,sizeof(vn),\"%s\",name);\n"
-"  /* look up env */\n"
-"  const char *v=getenv(vn); if(v) return v;\n"
-"  return \"\";\n"
+"  const char *v=getenv(vn); if(v) { snprintf(buf,1024,\"%s\",v); return buf; }\n"
+"  buf[0]=0; return buf;\n"
 "}\n"
 "static const char *__sh_getenv(const char *name){\n"
 "  const char *v=getenv(name); return v?v:\"\";\n"
 "}\n"
-"static char __sh_arr_buf[8192];\n"
 "static const char *__sh_arr_join(const char **arr){\n"
-"  __sh_arr_buf[0]=0;\n"
-"  for(int i=0;arr[i];i++){ if(i>0) strncat(__sh_arr_buf,\" \",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); strncat(__sh_arr_buf,arr[i]?arr[i]:\"\",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); }\n"
-"  return __sh_arr_buf;\n"
+"  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);\n"
+"  buf[0]=0;\n"
+"  for(int i=0;arr[i];i++){ if(i>0) strncat(buf,\" \",8192-strlen(buf)-1); strncat(buf,arr[i]?arr[i]:\"\",8192-strlen(buf)-1); }\n"
+"  return buf;\n"
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
 "  int n=0; while(arr[n]) n++; return n;\n"
@@ -5190,42 +6220,49 @@ const char *RT_HEADER =
 "  long r=1; while(exp-->0) r*=base; return r;\n"
 "}\n"
 "static const char *__sh_arr_slice(const char **arr,int off,int len){\n"
+"  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);\n"
 "  int n=0; while(arr[n]) n++;\n"
-"  if(off<0) off+=n; if(off<0) off=0; if(off>n) off=n;\n"
+"  if(off<0) off+=n;\n"
+"  if(off<0) off=0;\n"
+"  if(off>n) off=n;\n"
 "  int end=(len<0)?n:off+len; if(end>n) end=n;\n"
-"  __sh_arr_buf[0]=0;\n"
-"  for(int i=off;i<end;i++){ if(i>off) strncat(__sh_arr_buf,\" \",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); strncat(__sh_arr_buf,arr[i]?arr[i]:\"\",sizeof(__sh_arr_buf)-strlen(__sh_arr_buf)-1); }\n"
-"  return __sh_arr_buf;\n"
+"  buf[0]=0;\n"
+"  for(int i=off;i<end;i++){ if(i>off) strncat(buf,\" \",8192-strlen(buf)-1); strncat(buf,arr[i]?arr[i]:\"\",8192-strlen(buf)-1); }\n"
+"  return buf;\n"
 "}\n"
 "static const char *__sh_substr(const char *s,int off,int len){\n"
+"  char *buf = __sh_pool_next(__sh_substr_p0,__sh_substr_p1,__sh_substr_p2,__sh_substr_p3,&__sh_substr_i);\n"
 "  int n=(int)strlen(s);\n"
-"  if(off<0) off+=n; if(off<0) off=0; if(off>n) off=n;\n"
+"  if(off<0) off+=n;\n"
+"  if(off<0) off=0;\n"
+"  if(off>n) off=n;\n"
 "  int end = (len<0)? n : off+len; if(end>n) end=n;\n"
-"  int l=end-off; if(l<0) l=0; if(l>=(int)sizeof(__sh_substr_buf)) l=(int)sizeof(__sh_substr_buf)-1;\n"
-"  memcpy(__sh_substr_buf,s+off,l); __sh_substr_buf[l]=0;\n"
-"  return __sh_substr_buf;\n"
+"  int l=end-off; if(l<0) l=0; if(l>=4096) l=4095;\n"
+"  memcpy(buf,s+off,l); buf[l]=0;\n"
+"  return buf;\n"
 "}\n"
 "static const char *__sh_strip_prefix(const char *s,const char *pat,int greedy){\n"
-"  /* simple glob via fnmatch on prefixes */\n"
+"  char *buf = __sh_pool_next(__sh_strip_p0,__sh_strip_p1,__sh_strip_p2,__sh_strip_p3,&__sh_strip_i);\n"
 "  int best=0; int n=(int)strlen(s);\n"
 "  if(greedy){ for(int i=n;i>=1;i--){ char tmp[1024]; int l=i; if(l>=(int)sizeof(tmp)) continue; memcpy(tmp,s,l); tmp[l]=0; if(fnmatch(pat,tmp,0)==0){ best=i; break; } } }\n"
 "  else { for(int i=1;i<=n;i++){ char tmp[1024]; int l=i; if(l>=(int)sizeof(tmp)) continue; memcpy(tmp,s,l); tmp[l]=0; if(fnmatch(pat,tmp,0)==0){ best=i; break; } } }\n"
-"  strncpy(__sh_strip_buf,s+best,sizeof(__sh_strip_buf)-1); __sh_strip_buf[sizeof(__sh_strip_buf)-1]=0;\n"
-"  return __sh_strip_buf;\n"
+"  snprintf(buf,4096,\"%s\",s+best);\n"
+"  return buf;\n"
 "}\n"
 "static const char *__sh_strip_suffix(const char *s,const char *pat,int greedy){\n"
+"  char *buf = __sh_pool_next(__sh_strip_p0,__sh_strip_p1,__sh_strip_p2,__sh_strip_p3,&__sh_strip_i);\n"
 "  int n=(int)strlen(s); int best=n;\n"
-"  /* %pat: shortest suffix (largest i); %%pat: longest suffix (smallest i) */\n"
 "  if(!greedy){ for(int i=n;i>=1;i--){ if(fnmatch(pat,s+i,0)==0){ best=i; break; } } }\n"
 "  else { for(int i=1;i<=n;i++){ if(fnmatch(pat,s+i,0)==0){ best=i; break; } } }\n"
-"  int l=best; if(l<0) l=0; if(l>=(int)sizeof(__sh_strip_buf)) l=(int)sizeof(__sh_strip_buf)-1;\n"
-"  memcpy(__sh_strip_buf,s,l); __sh_strip_buf[l]=0;\n"
-"  return __sh_strip_buf;\n"
+"  int l=best; if(l<0) l=0; if(l>=4096) l=4095;\n"
+"  memcpy(buf,s,l); buf[l]=0;\n"
+"  return buf;\n"
 "}\n"
 "static const char *__sh_replace(const char *s,const char *old,const char *newp,int global,int anchor_start,int anchor_end){\n"
-"  char *out=__sh_replace_buf; int oi=0; int sl=(int)strlen(s); int ol=(int)strlen(old); int nl=(int)strlen(newp);\n"
+"  char *out = __sh_pool_next(__sh_replace_p0,__sh_replace_p1,__sh_replace_p2,__sh_replace_p3,&__sh_replace_i);\n"
+"  int oi=0; int sl=(int)strlen(s); int ol=(int)strlen(old); int nl=(int)strlen(newp);\n"
 "  int i=0; int done=0;\n"
-"  while(i<sl && oi<(int)sizeof(__sh_replace_buf)-nl-2){\n"
+"  while(i<sl && oi<4096-nl-2){\n"
 "    if(!done && (anchor_start?i==0:1) && strncmp(s+i,old,ol)==0){\n"
 "      memcpy(out+oi,newp,nl); oi+=nl; i+=ol; if(!global){ done=1; }\n"
 "      if(anchor_start) anchor_start=0;\n"
@@ -5235,28 +6272,31 @@ const char *RT_HEADER =
 "  return out;\n"
 "}\n"
 "static const char *__sh_upper(const char *s){\n"
-"  int i; for(i=0;s[i]&&i<(int)sizeof(__sh_upper_buf)-1;i++) __sh_upper_buf[i]=toupper((unsigned char)s[i]); __sh_upper_buf[i]=0; return __sh_upper_buf;\n"
+"  char *buf = __sh_pool_next(__sh_upper_p0,__sh_upper_p1,__sh_upper_p2,__sh_upper_p3,&__sh_upper_i);\n"
+"  int i; for(i=0;s[i]&&i<4095;i++) buf[i]=toupper((unsigned char)s[i]); buf[i]=0; return buf;\n"
 "}\n"
 "static const char *__sh_lower(const char *s){\n"
-"  int i; for(i=0;s[i]&&i<(int)sizeof(__sh_lower_buf)-1;i++) __sh_lower_buf[i]=tolower((unsigned char)s[i]); __sh_lower_buf[i]=0; return __sh_lower_buf;\n"
+"  char *buf = __sh_pool_next(__sh_lower_p0,__sh_lower_p1,__sh_lower_p2,__sh_lower_p3,&__sh_lower_i);\n"
+"  int i; for(i=0;s[i]&&i<4095;i++) buf[i]=tolower((unsigned char)s[i]); buf[i]=0; return buf;\n"
 "}\n"
 "static const char *__sh_cmd_output(const char *cmd){\n"
-"  FILE *p=popen(cmd,\"r\"); if(!p){ return \"\"; }\n"
-"  size_t n=fread(__sh_cmd_out_buf,1,sizeof(__sh_cmd_out_buf)-1,p); pclose(p);\n"
-"  if(n>0 && __sh_cmd_out_buf[n-1]=='\\n') n--;\n"
-"  __sh_cmd_out_buf[n]=0;\n"
-"  return __sh_cmd_out_buf;\n"
+"  char *buf = __sh_pool_next(__sh_cmd_out_p0,__sh_cmd_out_p1,__sh_cmd_out_p2,__sh_cmd_out_p3,&__sh_cmd_out_i);\n"
+"  FILE *p=popen(cmd,\"r\"); if(!p){ buf[0]=0; return buf; }\n"
+"  size_t n=fread(buf,1,65535,p); pclose(p);\n"
+"  if(n>0 && buf[n-1]=='\\n') n--;\n"
+"  buf[n]=0;\n"
+"  return buf;\n"
 "}\n"
 "static void __sh_usleep(unsigned us){ usleep(us); }\n"
-"static char __sh_fmt_buf[8192];\n"
 "static const char *__sh_fmt(const char *fmt, ...){\n"
+"  char *buf = __sh_pool_next(__sh_fmt_p0,__sh_fmt_p1,__sh_fmt_p2,__sh_fmt_p3,&__sh_fmt_i);\n"
 "  va_list ap; va_start(ap, fmt);\n"
-"  vsnprintf(__sh_fmt_buf, sizeof(__sh_fmt_buf), fmt, ap);\n"
-"  va_end(ap); return __sh_fmt_buf;\n"
+"  vsnprintf(buf, 8192, fmt, ap);\n"
+"  va_end(ap); return buf;\n"
 "}\n"
-"static char __sh_fn_out_buf[65536];\n"
 "static const char *__sh_capture_fn(void (*fn)(int,char**), int argc, char **argv){\n"
-"  int pfd[2]; if(pipe(pfd)<0){ return \"\"; }\n"
+"  char *buf = __sh_pool_next(__sh_fn_out_p0,__sh_fn_out_p1,__sh_fn_out_p2,__sh_fn_out_p3,&__sh_fn_out_i);\n"
+"  int pfd[2]; if(pipe(pfd)<0){ buf[0]=0; return buf; }\n"
 "  pid_t pid=fork();\n"
 "  if(pid==0){\n"
 "    close(pfd[0]); dup2(pfd[1],1); close(pfd[1]);\n"
@@ -5265,27 +6305,29 @@ const char *RT_HEADER =
 "    fflush(stdout); _exit(0);\n"
 "  }\n"
 "  close(pfd[1]);\n"
-"  size_t n=fread(__sh_fn_out_buf,1,sizeof(__sh_fn_out_buf)-1,fdopen(pfd[0],\"r\"));\n"
+"  FILE *fp=fdopen(pfd[0],\"r\"); if(!fp){ close(pfd[0]); waitpid(pid,NULL,0); buf[0]=0; return buf; }\n"
+"  size_t n=fread(buf,1,65535,fp);\n"
+"  fclose(fp); /* also closes underlying pfd[0] */\n"
 "  waitpid(pid,NULL,0);\n"
-"  if(n>0 && __sh_fn_out_buf[n-1]=='\\n') n--;\n"
-"  __sh_fn_out_buf[n]=0;\n"
-"  return __sh_fn_out_buf;\n"
+"  if(n>0 && buf[n-1]=='\\n') n--;\n"
+"  buf[n]=0;\n"
+"  return buf;\n"
 "}\n"
 "/* Process substitution: <(cmd) or >(cmd).\n"
 " * Returns a /dev/fd/N path string. For <(cmd), cmd's stdout is connected\n"
 " * to the read end. For >(cmd), cmd's stdin is connected to the write end. */\n"
-"static char __sh_ps_buf[64];\n"
 "static const char *__sh_proc_subst(const char *cmd, char dir){\n"
-"  int pfd[2]; if(pipe(pfd)<0) return \"/dev/null\";\n"
+"  char *buf = __sh_pool_next(__sh_ps_p0,__sh_ps_p1,__sh_ps_p2,__sh_ps_p3,&__sh_ps_i);\n"
+"  int pfd[2]; if(pipe(pfd)<0){ snprintf(buf,64,\"/dev/null\"); return buf; }\n"
 "  pid_t pid=fork();\n"
 "  if(pid==0){\n"
 "    if(dir=='<'){ close(pfd[0]); dup2(pfd[1],1); close(pfd[1]); }\n"
 "    else { close(pfd[1]); dup2(pfd[0],0); close(pfd[0]); }\n"
 "    execl(\"/bin/sh\",\"sh\",\"-c\",cmd,(char*)NULL); _exit(127);\n"
 "  }\n"
-"  if(dir=='<'){ close(pfd[1]); snprintf(__sh_ps_buf,sizeof(__sh_ps_buf),\"/dev/fd/%d\",pfd[0]); }\n"
-"  else { close(pfd[0]); snprintf(__sh_ps_buf,sizeof(__sh_ps_buf),\"/dev/fd/%d\",pfd[1]); }\n"
-"  return __sh_ps_buf;\n"
+"  if(dir=='<'){ close(pfd[1]); snprintf(buf,64,\"/dev/fd/%d\",pfd[0]); }\n"
+"  else { close(pfd[0]); snprintf(buf,64,\"/dev/fd/%d\",pfd[1]); }\n"
+"  return buf;\n"
 "}\n"
 "static void __sh_echo_escape(const char *s){\n"
 "  while(*s){ if(*s=='\\\\' && *(s+1)){ s++; switch(*s){ case 'n':putchar('\\n');break; case 't':putchar('\\t');break; case 'r':putchar('\\r');break; case '\\\\':putchar('\\\\');break; case '0':putchar('\\0');break; default:putchar(*s);break; } s++; } else putchar(*s++); }\n"
@@ -5344,7 +6386,7 @@ const char *RT_HEADER =
 "  const char *path; int first=1;\n"
 "  while((path=va_arg(ap,const char*))!=NULL){\n"
 "    DIR *dp=opendir(path[0]?path:\".\"); if(!dp){perror(path);continue;}\n"
-"    if(!first) printf(\"\\n\"); first=0;\n"
+"    if(!first) printf(\"\\n\");\n    first=0;\n"
 "    struct dirent *e; struct stat st; char full[4096];\n"
 "    while((e=readdir(dp))){ if(!show_all&&e->d_name[0]=='.') continue;\n"
 "      if(long_fmt){ snprintf(full,sizeof(full),\"%s/%s\",path,e->d_name); if(stat(full,&st)==0){ printf(\"%c %8ld %s\\n\",S_ISDIR(st.st_mode)?'d':'-',(long)st.st_size,e->d_name); } else printf(\"? %8s %s\\n\",\"?\",e->d_name); }\n"
@@ -5408,15 +6450,18 @@ const char *RT_HEADER =
 "  FILE *f=path?fopen(path,\"r\"):stdin; if(!f){perror(\"grep\");regfree(&r);return;}\n"
 "  char ln[8192]; int n=1;\n"
 "  while(fgets(ln,sizeof(ln),f)){ int m=regexec(&r,ln,0,NULL,0)==0; if(m!=invert){ if(line_no) printf(\"%d:\",n); fputs(ln,stdout); } n++; }\n"
-"  if(path)fclose(f); regfree(&r);\n"
+"  if(path)fclose(f);\n"
+"  regfree(&r);\n"
 "}\n"
 "static void __attribute__((unused)) __b_sed(const char *script,const char *path){\n"
 "  /* support s/old/new/[g] and s|old|new|[g] */\n"
 "  if(script[0]!='s'){ if(path){ char cmd[8192]; snprintf(cmd,sizeof(cmd),\"sed '%s' \\\"%s\\\"\",script,path); system(cmd); } else { char cmd[8192]; snprintf(cmd,sizeof(cmd),\"sed '%s'\",script); system(cmd); } return; }\n"
 "  char delim=script[1]; const char *p=script+2; char old[1024]; int oi=0;\n"
-"  while(*p && *p!=delim && oi<(int)sizeof(old)-1) old[oi++]=*p++; old[oi]=0; if(*p) p++;\n"
+"  while(*p && *p!=delim && oi<(int)sizeof(old)-1) old[oi++]=*p++;\n"
+"  old[oi]=0; if(*p) p++;\n"
 "  char newp[1024]; int ni=0;\n"
-"  while(*p && *p!=delim && ni<(int)sizeof(newp)-1) newp[ni++]=*p++; newp[ni]=0; if(*p) p++;\n"
+"  while(*p && *p!=delim && ni<(int)sizeof(newp)-1) newp[ni++]=*p++;\n"
+"  newp[ni]=0; if(*p) p++;\n"
 "  int global=0; while(*p){ if(*p=='g') global=1; p++; }\n"
 "  FILE *f=path?fopen(path,\"r\"):stdin; if(!f){perror(\"sed\");return;}\n"
 "  char ln[8192];\n"
@@ -5471,7 +6516,8 @@ const char *RT_HEADER =
 "  else qsort(lines,n,sizeof(char*),rev?__sort_cmp_rev:__sort_cmp);\n"
 "  const char *prev=NULL;\n"
 "  for(int i=0;i<n;i++){ if(uniq&&prev&&strcmp(prev,lines[i])==0){ free(lines[i]); continue; } fputs(lines[i],stdout); prev=lines[i]; }\n"
-"  for(int i=0;i<n;i++) free(lines[i]); free(lines);\n"
+"  for(int i=0;i<n;i++) free(lines[i]);\n"
+"  free(lines);\n"
 "}\n"
 "static void __attribute__((unused)) __b_uniq(const char *path,int count){\n"
 "  FILE *f=path?fopen(path,\"r\"):stdin; if(!f){perror(\"uniq\");return;}\n"
@@ -5489,8 +6535,11 @@ const char *RT_HEADER =
 "  while((c=fgetc(f))!=EOF){ci++;if(c=='\\n')li++;if(isspace(c))iw=0;else if(!iw){iw=1;wi++;}}\n"
 "  if(path)fclose(f);\n"
 "  {int __w1=1;\n"
-"  if(dl)printf(\"%s%ld\",__w1?\"\":\" \",li),__w1=0;if(dw)printf(\"%s%ld\",__w1?\"\":\" \",wi),__w1=0;if(dc)printf(\"%s%ld\",__w1?\"\":\" \",ci),__w1=0;\n"
-"  if(path)printf(\"%s%s\",__w1?\"\":\" \",path);putchar('\\n');\n"
+"  if(dl)printf(\"%s%ld\",__w1?\"\":\" \",li),__w1=0;\n"
+"  if(dw)printf(\"%s%ld\",__w1?\"\":\" \",wi),__w1=0;\n"
+"  if(dc)printf(\"%s%ld\",__w1?\"\":\" \",ci),__w1=0;\n"
+"  if(path)printf(\"%s%s\",__w1?\"\":\" \",path);\n"
+"  putchar('\\n');\n"
 "  }\n"
 "}\n"
 "static void __attribute__((unused)) __b_head(const char *path,int n){\n"
@@ -5506,7 +6555,8 @@ const char *RT_HEADER =
 "  if(path)fclose(f);\n"
 "  int st=(tot>n)?idx%n:0,cnt=(tot>n)?n:tot;\n"
 "  for(i=0;i<cnt;i++){int j=(st+i)%n;if(buf[j])fputs(buf[j],stdout);}\n"
-"  for(i=0;i<n;i++)free(buf[i]);free(buf);\n"
+"  for(i=0;i<n;i++)free(buf[i]);\n"
+"  free(buf);\n"
 "}\n"
 "static void __attribute__((unused)) __b_tee(int append,...){\n"
 "  va_list ap; va_start(ap,append);\n"
@@ -5515,7 +6565,8 @@ const char *RT_HEADER =
 "  while((p=va_arg(ap,const char*))!=NULL){ fps=realloc(fps,(nf+1)*sizeof(FILE*)); fps[nf]=fopen(p,append?\"a\":\"w\"); nf++; }\n"
 "  va_end(ap);\n"
 "  int c; while((c=fgetc(stdin))!=EOF){ putchar(c); for(int i=0;i<nf;i++) if(fps[i]) fputc(c,fps[i]); }\n"
-"  for(int i=0;i<nf;i++) if(fps[i]) fclose(fps[i]); free(fps);\n"
+"  for(int i=0;i<nf;i++) if(fps[i]) fclose(fps[i]);\n"
+"  free(fps);\n"
 "}\n"
 "static void __attribute__((unused)) __b_xargs(const char *cmd,...){\n"
 "  va_list ap; va_start(ap,cmd);\n"
@@ -5609,7 +6660,8 @@ const char *RT_HEADER =
 "    ca=fgetc(fa); cb=fgetc(fb);\n"
 "    if(ca==EOF&&cb==EOF) break;\n"
 "    if(ca!=cb){ diff=1; break; }\n"
-"    if(ca=='\\n') la++; if(cb=='\\n') lb++;\n"
+"    if(ca=='\\n') la++;\n"
+"    if(cb=='\\n') lb++;\n"
 "  }\n"
 "  fclose(fa); fclose(fb);\n"
 "  __exit_status=diff?1:0;\n"
@@ -5791,9 +6843,11 @@ static void prescan_register_vars(Node *n){
 
 int main(int argc, char **argv){
     int do_obfuscate = 0;
-    /* Check for --obfuscate flag */
+    int do_vm = 0;
+    /* Check for flags */
     for(int i=3;i<argc;i++){
         if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
+        if(!strcmp(argv[i],"--vm")) do_vm=1;
     }
 
     /* Initialize name mangler */
@@ -5801,13 +6855,16 @@ int main(int argc, char **argv){
 
     if(argc<3){
         fprintf(stderr,
-            "shell2c — Shell-to-C Transpiler (modular + obfuscation)\n\n"
+            "shell2c — Shell-to-C Transpiler (modular + obfuscation + VM)\n\n"
             "Author: 爱摸鱼的狐狸 🦊\n\n"
-            "Usage: %s input.sh output.c [--makefile] [--run] [--obfuscate]\n\n"
+            "Usage: %s input.sh output.c [options]\n\n"
             "Options:\n"
             "  --makefile   Also emit a Makefile for the output\n"
             "  --run        Compile and run the output immediately\n"
-            "  --obfuscate  Generate obfuscated C code (anti-analysis)\n",
+            "  --obfuscate  Generate obfuscated C code (anti-analysis)\n"
+            "  --vm         Generate VM-protected output (bytecode + hybrid JIT)\n"
+            "               Custom stack-based ISA with hot-path native JIT.\n"
+            "               Implies --obfuscate for bytecode encoding.\n",
             argv[0]);
         return 1;
     }
@@ -5822,6 +6879,52 @@ int main(int argc, char **argv){
     FILE *fout=fopen(argv[2],"w");
     if(!fout){perror(argv[2]);return 1;}
 
+    /* ---- VM mode: compile to bytecode, emit VM runtime ---- */
+    if(do_vm){
+        fprintf(fout,"/* ============================================================\n");
+        fprintf(fout," * Generated by shell2c — VM-Protected Mode\n");
+        fprintf(fout," * Custom stack-based ISA with hot-path JIT\n");
+        fprintf(fout," * Author: 爱摸鱼的狐狸 🦊\n");
+        fprintf(fout," * Source: %s\n",argv[1]);
+        fprintf(fout," * ============================================================ */\n\n");
+
+        /* Emit VM runtime + compile AST to bytecode */
+        extern void vmc_compile_and_emit(FILE *out, Node *script_ast, int obfuscate);
+        vmc_compile_and_emit(fout, script, do_obfuscate);
+
+        fclose(fout);
+        printf("[OK] %s -> %s (VM mode)\n",argv[1],argv[2]);
+
+        /* Handle --makefile and --run */
+        for(int i=3;i<argc;i++){
+            if(!strcmp(argv[i],"--makefile")){
+                char exe[256]; strncpy(exe,argv[2],255); exe[255]=0;
+                char *dot=strrchr(exe,'.'); if(dot)*dot=0;
+                FILE *mk=fopen("Makefile","w");
+                if(mk){
+                    fprintf(mk,"CC=gcc\nCFLAGS=-O2 -Wall\nall: %s\n%s: %s\n\t$(CC) $(CFLAGS) -o $@ $<\nclean:\n\trm -f %s\n",
+                            exe,exe,argv[2],exe);
+                    fclose(mk);
+                    printf("[OK] Makefile written\n");
+                }
+            }
+            if(!strcmp(argv[i],"--run")){
+                char exe[256]; strncpy(exe,argv[2],255); exe[255]=0;
+                char *dot=strrchr(exe,'.'); if(dot)*dot=0;
+                char cmd[1024];
+                snprintf(cmd,sizeof(cmd),"gcc -O2 -Wall -o %s %s 2>&1",exe,argv[2]);
+                printf("[RUN] %s\n",cmd);
+                int rc=system(cmd);
+                if(rc==0){
+                    snprintf(cmd,sizeof(cmd),"./%s",exe);
+                    printf("[RUN] %s\n",cmd);
+                    system(cmd);
+                }
+            }
+        }
+        return 0;
+    }
+
     fprintf(fout,"/* ============================================================\n");
     fprintf(fout," * Generated by shell2c — Shell-to-C Transpiler\n");
     fprintf(fout," * Author: 爱摸鱼的狐狸\n");
@@ -5830,14 +6933,8 @@ int main(int argc, char **argv){
         fprintf(fout," * Mode: obfuscated (anti-analysis enabled)\n");
     fprintf(fout," * This file is auto-generated. Do not edit manually.\n");
     fprintf(fout," * ============================================================ */\n\n");
-    /* Emit runtime header — mangle names if obfuscation is on */
-    if(do_obfuscate){
-        /* Mangle the entire RT_HEADER string */
-        const char *mangled_header = mangle_string(RT_HEADER);
-        fprintf(fout, "%s", mangled_header);
-    } else {
-        fprintf(fout, "%s", RT_HEADER);
-    }
+    /* Emit runtime header — names will be mangled in post-processing pass */
+    fprintf(fout, "%s", RT_HEADER);
 
     /* Emit obfuscation runtime if requested */
     if(do_obfuscate){
@@ -5899,17 +6996,25 @@ int main(int argc, char **argv){
             long fsize = ftell(fin2);
             fseek(fin2, 0, SEEK_SET);
             char *content = malloc(fsize + 1);
-            fread(content, 1, fsize, fin2);
-            content[fsize] = 0;
-            fclose(fin2);
+            if(content){
+                size_t rd = fread(content, 1, fsize, fin2);
+                content[rd] = 0;
+                fclose(fin2);
 
-            const char *mangled = mangle_string(content);
-            fout = fopen(argv[2], "w");
-            if(fout){
-                fprintf(fout, "%s", mangled);
-                fclose(fout);
+                const char *mangled = mangle_string(content);
+                fout = fopen(argv[2], "w");
+                if(fout){
+                    fprintf(fout, "%s", mangled);
+                    fclose(fout);
+                }
+                /* mangle_string returns malloc'd buffer if it modified anything,
+                 * or the original pointer if unchanged. Safe to free either way
+                 * since 'content' is freed next. */
+                if(mangled != content) free((void*)mangled);
+                free(content);
+            } else {
+                fclose(fin2);
             }
-            free(content);
         }
     } else {
         fclose(fout);

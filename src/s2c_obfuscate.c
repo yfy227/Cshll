@@ -9,10 +9,13 @@
 /* XOR-based string decoder — emitted into generated C */
 static const char *OBfuscation_runtime =
 "/* ---- anti-analysis runtime ---- */\n"
-"static char _xd[4096];\n"
+"static char _xd0[4096], _xd1[4096], _xd2[4096], _xd3[4096];\n"
+"static int  _xd_i = 0;\n"
 "static const char *_xs(const char *e, int n){\n"
-"  for(int i=0;i<n;i++) _xd[i]=e[i]^0x5A;\n"
-"  _xd[n]=0; return _xd;\n"
+"  char *b = ( (_xd_i==0) ? _xd0 : (_xd_i==1) ? _xd1 : (_xd_i==2) ? _xd2 : _xd3 );\n"
+"  _xd_i = (_xd_i + 1) & 3;\n"
+"  for(int i=0;i<n;i++) b[i]=e[i]^0x5A;\n"
+"  b[n]=0; return b;\n"
 "}\n"
 "/* indirect dispatch table */\n"
 "typedef void (*_dfn)(void);\n"
@@ -42,19 +45,24 @@ void emit_obfuscated_string(FILE *out, const char *str, const char *var_name){
 
 /* Simple name mangler: produce non-obvious names from seeds */
 static const char *MANGLE_CHARS = "QqWwEeRrTtYyUuIiOoPpAaSsDdFfGgHhJjKkLlZzXxCcVvBbNnMm0123456789";
-static char mangle_buf[32];
+#define MANGLE_NCHARS 62
+#define MANGLE_POOL 4
+static char mangle_buf[MANGLE_POOL][32];
+static int  mangle_idx = 0;
 
 const char *mangle_name(int seed){
     /* Generate a deterministic but non-obvious name */
+    char *buf = mangle_buf[mangle_idx];
+    mangle_idx = (mangle_idx + 1) % MANGLE_POOL;
     int idx = 0;
-    mangle_buf[idx++] = '_';
-    mangle_buf[idx++] = 'Z';
+    buf[idx++] = '_';
+    buf[idx++] = 'Z';
     for(int i=0; i<6 && seed>0; i++){
-        mangle_buf[idx++] = MANGLE_CHARS[seed % 52];
-        seed /= 52;
+        buf[idx++] = MANGLE_CHARS[seed % MANGLE_NCHARS];
+        seed /= MANGLE_NCHARS;
     }
-    mangle_buf[idx] = 0;
-    return mangle_buf;
+    buf[idx] = 0;
+    return buf;
 }
 
 void emit_decoy_block(FILE *out, int seed){

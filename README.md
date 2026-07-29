@@ -14,9 +14,9 @@
 
 ## 快速开始
 
-
+```bash
 # 构建转译器
-gcc -O2 -Wall -o shell2c shell2c.c
+make
 
 # 转译脚本
 ./shell2c myscript.sh myscript.c
@@ -208,7 +208,7 @@ cmd <<'EOF'                  # heredoc（字面量，不展开）
 $var stays literal
 EOF
 cmd <<-EOF                   # heredoc（去除前导 tab）
-	indented
+        indented
 EOF
 diff <(cmd1) <(cmd2)         # 进程替换
 ```
@@ -379,7 +379,11 @@ done
 ## 构建从源码
 
 ```bash
-gcc -O2 -Wall -o shell2c shell2c.c
+# 使用 Makefile（推荐）
+make
+
+# 或手动编译（需要所有模块）
+gcc -O2 -Wall -o shell2c shell2c.c src/s2c_obfuscate.c src/s2c_mangle.c
 ```
 
 无外部依赖——仅标准 C 库和 POSIX 头文件。
@@ -390,7 +394,17 @@ gcc -O2 -Wall -o shell2c shell2c.c
 
 ```
 Cshll/
-├── shell2c.c          # 转译器（单文件，~5200 行）
+├── shell2c.c          # 转译器（单文件，~6000 行）
+├── src/               # 模块化源码
+│   ├── s2c_common.h   # 共享类型与工具
+│   ├── s2c_symtab.h   # 符号表与函数注册
+│   ├── s2c_ast.h      # AST 节点类型
+│   ├── s2c_emit.h     # 代码发射器接口
+│   ├── s2c_parse.h    # 解析器接口
+│   ├── s2c_obfuscate.c # 代码混淆运行时
+│   ├── s2c_obfuscate.h
+│   ├── s2c_mangle.c   # 名称混淆
+│   └── s2c_mangle.h
 ├── README.md          # 本文件
 ├── Makefile           # 构建和测试
 ├── .gitignore
@@ -419,6 +433,65 @@ Cshll/
 - **正则表达式**：`[[ =~ ]]` 翻译为 `regcomp`/`regexec`，复杂正则可能不完美。
 - **动态 eval**：`eval` 和 `source` 回退到运行时 shell 调用。
 - **信号处理**：`trap` 支持基础级别。
+- **VM 模式**：当前 `--vm` 输出 bootstrap 字节码，完整 AST→字节码编译器开发中。
+
+---
+
+## VM 虚拟机保护模式（`--vm`）
+
+Cshll 内置自定义栈式虚拟机，可将脚本编译为字节码嵌入 C 二进制中运行。
+
+### 架构
+
+- **ISA 类型**：混合栈机 + 寄存器扩展（主操作走栈，r0-r7 辅助热路径）
+- **字节码编码**：XOR 0x5A 加密，运行时解码
+- **指令集**：40+ 单字节操作码（0x00-0xFF），含栈操作、算术、比较、字符串、控制流、Shell 互操作
+- **热路径检测**：基本块计数器，超阈值（100次）触发 JIT
+- **混合执行**：热路径 → native JIT（dlopen），冷路径 → VM 解释器
+
+### 使用
+
+```bash
+./shell2c script.sh script.c --vm
+gcc -O2 -Wall -o script script.c -ldl
+```
+
+### VM 文件结构
+
+| 文件 | 说明 |
+|------|------|
+| `src/s2c_vm_isa.h` | ISA 定义（操作码、值类型、函数表） |
+| `src/s2c_vm_runtime.h` | 运行时接口声明 |
+| `src/s2c_vm_runtime.c` | VM 解释器（嵌入生成 C 的字符串） |
+| `src/s2c_vm_compiler.h` | 字节码编译器接口 |
+| `src/s2c_vm_compiler.c` | AST → 字节码编译器 |
+| `src/s2c_vm_bridge.c` | shell2c 集成桥接层 |
+
+### 路线图
+
+| 阶段 | 状态 | 说明 |
+|------|------|------|
+| ISA 设计 | 完成 | 40+ 操作码，栈+寄存器混合 |
+| VM 解释器 | 完成 | switch-dispatch，4096 栈深 |
+| 旋转密钥 XOR 编码 | 完成 | 位置相关密钥，非固定 0x5A |
+| 常量池 XOR 编码 | 完成 | 每字符串独立旋转密钥 |
+| 热路径 profiling | 完成 | 基本块计数器 |
+| JIT 框架 | 完成 | dlopen + 模板编译 |
+| `--vm` 集成 | 完成 | CLI 选项 + 生成路径 |
+| 变量展开 | 完成 | `$var`, `${var}`, `$1` 等参数展开 |
+| 算术表达式 | 完成 | `$((x + y))` 编译为 ADD/SUB/MUL/DIV/MOD |
+| 条件判断 | 完成 | `[ -gt ]`, `[ = ]` 等 test 条件 |
+| for/while 循环 | 完成 | 展开 + 循环字节码 |
+| if/elif/else | 完成 | JNZ 条件跳转，shell exit code 语义 |
+| case 语句 | 完成 | 模式匹配 + STRCMP + JZ |
+| 函数调用 | 完成 | 预扫描 + 内联编译 |
+| echo + 赋值 | 完成 | 变量展开 + SETENV |
+| ptrace 反调试 | 完成 | PTRACE_TRACEME 检测 |
+| 不透明谓词 | 完成 | dispatch loop 中 __vm_opq() 恒真检查 |
+| 运行时完整性检查 | 完成 | 0x1337 XOR 篡改检测 |
+| 反调试时间陷阱 | 完成 | clock() 周期性检查 |
+| 完整 JIT 触发 | 待做 | 热路径自动 native 编译 |
+| 字节码控制流平坦化 | 待做 | switch-dispatch 展平 |
 
 
 ## 许可证

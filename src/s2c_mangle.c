@@ -93,7 +93,8 @@ const char *mangle_tmp(const char *name){
 }
 
 /* Mangle references inside string literals.
- * This handles cases where __sh_* names appear inside RT_HEADER strings. */
+ * This handles cases where __sh_* names appear inside RT_HEADER strings.
+ * Uses a dynamically allocated buffer to handle large files safely. */
 const char *mangle_string(const char *s){
     if(!g_obfuscate) return s;
     if(!s || !*s) return s;
@@ -106,14 +107,18 @@ const char *mangle_string(const char *s){
        !strstr(s, "__sh_arg"))
         return s;
 
-    /* For RT_HEADER strings, we need to do string replacement.
-     * This is complex, so we return a modified copy. */
-    static char result[65536];
+    /* Allocate result buffer: 2x input size (mangled names may be longer) */
+    size_t in_len = strlen(s);
+    size_t buf_size = in_len * 2 + 4096;
+    char *result = (char *)malloc(buf_size);
+    if(!result) return s; /* OOM — return original unchanged */
+
     char *dst = result;
     const char *src = s;
     int modified = 0;
+    const char *dst_end = result + buf_size - 32;
 
-    while(*src && (dst - result) < (int)sizeof(result) - 32){
+    while(*src && dst < dst_end){
         if(strncmp(src, "__sh_", 5)==0 || strncmp(src, "__b_", 4)==0){
             /* Find end of identifier */
             int prefix_len = (src[2]=='s') ? 5 : 4;
@@ -128,7 +133,7 @@ const char *mangle_string(const char *s){
                 namebuf[len] = 0;
                 const char *mangled = mangle(namebuf);
                 int mlen = strlen(mangled);
-                if(dst + mlen < result + sizeof(result) - 1){
+                if(dst + mlen < dst_end){
                     memcpy(dst, mangled, mlen);
                     dst += mlen;
                     modified = 1;
@@ -141,7 +146,7 @@ const char *mangle_string(const char *s){
         if(strncmp(src, "__exit_status", 13)==0){
             const char *mangled = mangle("__exit_status");
             int mlen = strlen(mangled);
-            if(dst + mlen < result + sizeof(result) - 1){
+            if(dst + mlen < dst_end){
                 memcpy(dst, mangled, mlen);
                 dst += mlen;
                 src += 13;
@@ -161,7 +166,7 @@ const char *mangle_string(const char *s){
                 namebuf[len] = 0;
                 const char *mangled = mangle(namebuf);
                 int mlen = strlen(mangled);
-                if(dst + mlen < result + sizeof(result) - 1){
+                if(dst + mlen < dst_end){
                     memcpy(dst, mangled, mlen);
                     dst += mlen;
                     modified = 1;
@@ -180,12 +185,10 @@ const char *mangle_string(const char *s){
            strncmp(src, "__psi", 5)==0 || strncmp(src, "__pso", 5)==0 ||
            strncmp(src, "__ppid", 6)==0 || strncmp(src, "__pfd", 4)==0 ||
            strncmp(src, "__sfd_", 5)==0 || strncmp(src, "__bg", 4)==0 ||
-           strncmp(src, "__tw_", 5)==0 || strncmp(src, "__w1", 4)==0 ||
-           strncmp(src, "__w2", 4)==0 || strncmp(src, "__vi", 4)==0 ||
-           strncmp(src, "__tok", 5)==0 || strncmp(src, "__rl", 3)==0 ||
-           strncmp(src, "__pf", 3)==0 || strncmp(src, "__al", 3)==0 ||
-           strncmp(src, "__ai", 3)==0 || strncmp(src, "__hdb", 4)==0 ||
-           strncmp(src, "__tw_", 5)==0){
+           strncmp(src, "__w1", 4)==0 || strncmp(src, "__w2", 4)==0 ||
+           strncmp(src, "__vi", 4)==0 || strncmp(src, "__tok", 5)==0 ||
+           strncmp(src, "__rl", 3)==0 || strncmp(src, "__pf", 3)==0 ||
+           strncmp(src, "__al", 3)==0 || strncmp(src, "__hdb", 4)==0){
             /* Generic __xx* identifier — mangle the whole identifier */
             const char *start = src;
             src++; /* skip first _ */
@@ -197,7 +200,7 @@ const char *mangle_string(const char *s){
                 namebuf[len] = 0;
                 const char *mangled = mangle(namebuf);
                 int mlen = strlen(mangled);
-                if(dst + mlen < result + sizeof(result) - 1){
+                if(dst + mlen < dst_end){
                     memcpy(dst, mangled, mlen);
                     dst += mlen;
                     modified = 1;
@@ -211,5 +214,6 @@ const char *mangle_string(const char *s){
     *dst = 0;
 
     if(modified) return result;
+    free(result);
     return s;
 }
