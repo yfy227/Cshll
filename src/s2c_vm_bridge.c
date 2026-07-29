@@ -317,6 +317,8 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    __vm_nconsts = __vm_cp_n;\n");
     /* Decode bytecode with RC4 */
     fprintf(out, "    /* Decode bytecode (RC4) */\n");
+    fprintf(out, "    int __vm_cs=(int)sizeof(__vm_code_enc);\n");
+    fprintf(out, "    if(__vm_cs>(int)sizeof(__vm_code_decoded)) __vm_cs=(int)sizeof(__vm_code_decoded);\n");
     fprintf(out, "    {\n");
     fprintf(out, "    uint8_t rc4_s[256];\n");
     fprintf(out, "    for(int i=0;i<256;i++) rc4_s[i]=(uint8_t)i;\n");
@@ -326,8 +328,6 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    int j2=0;\n");
     fprintf(out, "    for(int i=0;i<256;i++){ j2=(j2+rc4_s[i]+rc4_key[i%%8])&0xFF; uint8_t t=rc4_s[i];rc4_s[i]=rc4_s[j2];rc4_s[j2]=t; }\n");
     fprintf(out, "    int i2=0,jj=0;\n");
-    fprintf(out, "    int __vm_cs=(int)sizeof(__vm_code_enc);\n");
-    fprintf(out, "    if(__vm_cs>(int)sizeof(__vm_code_decoded)) __vm_cs=(int)sizeof(__vm_code_decoded);\n");
     fprintf(out, "    for(int k=0;k<__vm_cs;k++){\n");
     fprintf(out, "        i2=(i2+1)&0xFF;\n");
     fprintf(out, "        jj=(jj+rc4_s[i2])&0xFF;\n");
@@ -363,12 +363,9 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
         fprintf(out, "    if(argc > %d) setenv(\"%d\", argv[%d], 1);\n", i, i, i);
     }
     fprintf(out, "    int rc = vm_run(0);\n");
-    /* Anti-dump: wipe decoded bytecode and constant pool after execution */
+    /* Anti-dump: wipe decoded bytecode after execution */
     fprintf(out, "    /* Anti-dump: wipe sensitive data */\n");
     fprintf(out, "    memset(__vm_code_decoded, 0, sizeof(__vm_code_decoded));\n");
-    fprintf(out, "    memset(__vm_cp_buf.1, 0, sizeof(__vm_cp_buf.1));\n");
-    fprintf(out, "    __vm_code = NULL;\n");
-    fprintf(out, "    __vm_consts = NULL;\n");
     fprintf(out, "    return rc;\n");
     fprintf(out, "}\n");
 

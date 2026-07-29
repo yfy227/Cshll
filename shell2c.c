@@ -361,6 +361,34 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     if(!n->argv || n->argc == 0) return;
     const char *cmd = n->argv[0];
 
+    /* Check for heredoc redirect — detect << in argv */
+    for(int i = 1; i < n->argc; i++){
+        if(!strcmp(n->argv[i], "<<") || !strncmp(n->argv[i], "<<", 2)){
+            /* Consume heredoc from the table */
+            extern const char *heredoc_consume(int *expand);
+            int hd_expand = 1;
+            const char *hd_text = heredoc_consume(&hd_expand);
+            if(hd_text){
+                /* For cat <<EOF, print the heredoc content */
+                if(hd_expand){
+                    vmc_compile_word(vs, hd_text);
+                } else {
+                    vmc_push_str(vs, hd_text);
+                }
+                vm_buf_emit(vs->bc, OP_PRINT);
+                return;
+            }
+        }
+        if(!strcmp(n->argv[i], "<<<")){
+            /* Here-string: the next arg is the string */
+            if(i + 1 < n->argc){
+                vmc_compile_word(vs, n->argv[i+1]);
+                vm_buf_emit(vs->bc, OP_PRINT);
+                return;
+            }
+        }
+    }
+
     /* Check if this is a user-defined function call */
     int fi = vm_find_func(cmd);
     if(fi >= 0 && vm_func_bodies[fi]){
@@ -757,7 +785,7 @@ static void vmc_compile_pipe(VmCompilerState *vs, Node *n){
         }
     }
     vm_buf_emit(vs->bc, OP_EXEC_PIPE);
-    vm_buf_emit(vs->bc, OP_PRINT);
+    vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
 }
 
 /* Compile a single AST node */
