@@ -78,9 +78,10 @@ static int vm_func_count = 0;
 /* Emit a string constant and push it */
 static void vmc_push_str(VmCompilerState *vs, const char *s){
     int idx = vm_cp_intern(vs->cp, s);
-    /* NOP padding for anti-analysis — insert random NOPs every ~8 instructions */
-    if((vs->bc->len & 7) == 0){
-        vm_buf_emit(vs->bc, OP_NOP);
+    /* Junk instruction: PUSH_STR "" + POP — looks meaningful but does nothing */
+    if((vs->bc->len & 15) == 0){
+        vm_buf_emit_u16(vs->bc, OP_PUSH_STR, 0); /* push empty string */
+        vm_buf_emit(vs->bc, OP_POP);             /* immediately pop it */
     }
     vm_buf_emit_u16(vs->bc, OP_PUSH_STR, idx);
 }
@@ -6893,6 +6894,36 @@ int main(int argc, char **argv){
         vmc_compile_and_emit(fout, script, do_obfuscate);
 
         fclose(fout);
+
+        /* VM mode always applies name mangling to strip symbols */
+        {
+            extern const char *mangle_string(const char *s);
+            extern int g_obfuscate;
+            g_obfuscate = 1; /* enable mangler */
+            FILE *fin2 = fopen(argv[2], "r");
+            if(fin2){
+                fseek(fin2, 0, SEEK_END);
+                long fsize = ftell(fin2);
+                fseek(fin2, 0, SEEK_SET);
+                char *content = malloc(fsize + 1);
+                if(content){
+                    size_t rd = fread(content, 1, fsize, fin2);
+                    content[rd] = 0;
+                    fclose(fin2);
+                    const char *mangled = mangle_string(content);
+                    fout = fopen(argv[2], "w");
+                    if(fout){
+                        fprintf(fout, "%s", mangled);
+                        fclose(fout);
+                    }
+                    if(mangled != content) free((void*)mangled);
+                    free(content);
+                } else {
+                    fclose(fin2);
+                }
+            }
+        }
+
         printf("[OK] %s -> %s (VM mode)\n",argv[1],argv[2]);
 
         /* Handle --makefile and --run */

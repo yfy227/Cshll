@@ -99,12 +99,17 @@ const char *mangle_string(const char *s){
     if(!g_obfuscate) return s;
     if(!s || !*s) return s;
 
-    /* Check if string contains __sh_ or __b_ references */
+    /* Check if string contains mangleable references */
     if(!strstr(s, "__sh_") && !strstr(s, "__b_") &&
        !strstr(s, "__tw_") && !strstr(s, "__fl") &&
        !strstr(s, "__fa") && !strstr(s, "__sfd_") &&
        !strstr(s, "__pfd") && !strstr(s, "__exit_status") &&
-       !strstr(s, "__sh_arg"))
+       !strstr(s, "__sh_arg") && !strstr(s, "__vm_") &&
+       !strstr(s, "vm_run") && !strstr(s, "vm_push") &&
+       !strstr(s, "vm_pop") && !strstr(s, "vm_str") &&
+       !strstr(s, "vm_int") && !strstr(s, "vm_free") &&
+       !strstr(s, "vm_to_") && !strstr(s, "VmValue") &&
+       !strstr(s, "VmType") && !strstr(s, "VmFunc"))
         return s;
 
     /* Allocate result buffer: 2x input size (mangled names may be longer) */
@@ -119,9 +124,13 @@ const char *mangle_string(const char *s){
     const char *dst_end = result + buf_size - 32;
 
     while(*src && dst < dst_end){
-        if(strncmp(src, "__sh_", 5)==0 || strncmp(src, "__b_", 4)==0){
+        if(strncmp(src, "__sh_", 5)==0 || strncmp(src, "__b_", 4)==0 ||
+           strncmp(src, "__vm_", 5)==0 || strncmp(src, "vm_", 3)==0){
             /* Find end of identifier */
-            int prefix_len = (src[2]=='s') ? 5 : 4;
+            int prefix_len;
+            if(strncmp(src, "__sh_", 5)==0 || strncmp(src, "__vm_", 5)==0) prefix_len = 5;
+            else if(strncmp(src, "__b_", 4)==0) prefix_len = 4;
+            else prefix_len = 3; /* vm_ */
             const char *start = src;
             src += prefix_len;
             while(*src && (isalnum((unsigned char)*src) || *src=='_')) src++;
