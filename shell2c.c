@@ -61,8 +61,11 @@ extern void emit_vm_runtime(FILE *out);
 typedef struct {
     VmBuf *bc;
     VmConstPool *cp;
-    int loop_stack[64];     /* loop start PCs for break/continue */
-    int break_patches[64];  /* patch locations for break jumps */
+    int loop_stack[64];       /* loop start PCs for continue */
+    int break_patches[64];    /* patch locations for break jumps */
+    int break_count;          /* number of pending break patches */
+    int cont_patches[64];    /* patch locations for continue jumps */
+    int cont_count;          /* number of pending continue patches */
     int loop_depth;
 } VmCompilerState;
 
@@ -145,18 +148,36 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
 
             p++; /* skip $ */
 
-            /* ${var} form */
+            /* ${...} form */
             if(*p == '{'){
                 p++;
-                char vn[128]; int vi = 0;
-                while(*p && *p != '}' && vi < (int)sizeof(vn) - 1)
-                    vn[vi++] = *p++;
-                vn[vi] = 0;
-                if(*p == '}') p++;
-                vmc_push_str(vs, vn);
-                vm_buf_emit(vs->bc, OP_GETENV);
-                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
-                segment_count++;
+                /* ${#var} — string length */
+                if(*p == '#'){
+                    p++;
+                    char vn[128]; int vi = 0;
+                    while(*p && *p != '}' && vi < (int)sizeof(vn) - 1)
+                        vn[vi++] = *p++;
+                    vn[vi] = 0;
+                    if(*p == '}') p++;
+                    vmc_push_str(vs, vn);
+                    vm_buf_emit(vs->bc, OP_GETENV);
+                    vm_buf_emit(vs->bc, OP_STRLEN);
+                    vm_buf_emit(vs->bc, OP_TO_STR);
+                    if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                    segment_count++;
+                }
+                /* ${var} */
+                else {
+                    char vn[128]; int vi = 0;
+                    while(*p && *p != '}' && vi < (int)sizeof(vn) - 1)
+                        vn[vi++] = *p++;
+                    vn[vi] = 0;
+                    if(*p == '}') p++;
+                    vmc_push_str(vs, vn);
+                    vm_buf_emit(vs->bc, OP_GETENV);
+                    if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                    segment_count++;
+                }
             }
             /* $((expr)) — arithmetic: compile to VM arithmetic bytecode */
             else if(*p == '(' && *(p+1) == '('){
@@ -573,12 +594,12 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
 /* Compile while loop (NODE_WHILE) */
 static void vmc_compile_while(VmCompilerState *vs, Node *n){
     int loop_start = vm_buf_pc(vs->bc);
-
-    /* Push loop start for break/continue */
     vs->loop_stack[vs->loop_depth] = loop_start;
-    int break_patch = -1;
+    int saved_break = vs->break_count;
+    int saved_cont = vs->cont_count;
+    vs->break_count = 0;
+    vs->cont_count = 0;
 
-    /* Evaluate condition */
     if(n->while_cond){
         vmc_push_str(vs, n->while_cond);
         vm_buf_emit(vs->bc, OP_EXEC_CMD);
@@ -587,62 +608,104 @@ static void vmc_compile_while(VmCompilerState *vs, Node *n){
         vmc_push_int(vs, 1);
     }
 
-    /* JZ to end (shell: 0=true, so JNZ = jump if false) */
     int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
 
-    /* Body */
     vs->loop_depth++;
     if(n->while_body) vmc_compile_block(vs, n->while_body);
     vs->loop_depth--;
 
-    /* JMP back to loop start (continue) */
+    /* Patch continue to loop start */
+    for(int j = 0; j < vs->cont_count; j++){
+        vm_buf_patch(vs->bc, vs->cont_patches[j], loop_start);
+    }
+
     vm_buf_emit_u16(vs->bc, OP_JMP, loop_start);
 
-    /* Patch JZ to here (break target) */
-    vm_buf_patch(vs->bc, jz_end, vm_buf_pc(vs->bc));
-    break_patch = jz_end;
-
-    /* Handle break: if there are pending break patches, they'd go here.
-     * For simplicity, break is not fully implemented yet. */
-    (void)break_patch;
+    int end_pc = vm_buf_pc(vs->bc);
+    vm_buf_patch(vs->bc, jz_end, end_pc);
+    for(int i = 0; i < vs->break_count; i++){
+        vm_buf_patch(vs->bc, vs->break_patches[i], end_pc);
+    }
+    vs->break_count = saved_break;
+    vs->cont_count = saved_cont;
 }
 
 /* Compile for loop (NODE_FOR) */
 static void vmc_compile_for(VmCompilerState *vs, Node *n){
     /* For array-style for: for var in item1 item2 ... */
     if(n->for_list && n->for_len > 0){
-        /* Store items as separate env vars with indexed names */
+        int saved_break = vs->break_count;
+        int saved_cont = vs->cont_count;
+        vs->break_count = 0;
+
         for(int i = 0; i < n->for_len; i++){
-            char name[256];
-            snprintf(name, sizeof(name), "%s", n->for_var);
-            vmc_push_str(vs, name);
-            vmc_push_str(vs, n->for_list[i]);
-            vm_buf_emit(vs->bc, OP_SETENV);
-        }
-
-        int loop_start = vm_buf_pc(vs->bc);
-        vs->loop_stack[vs->loop_depth] = loop_start;
-
-        /* Push index counter */
-        vmc_push_int(vs, 0);
-        (void)vm_buf_pc(vs->bc); /* counter tracking placeholder */
-
-        /* Check if counter < for_len */
-        /* For simplicity, emit each item's body directly (unroll) */
-        /* Actually, unrolling is simpler for now */
-        for(int i = 0; i < n->for_len; i++){
-            /* Set loop variable to current item */
+            /* Set loop variable */
             vmc_push_str(vs, n->for_var);
             vmc_push_str(vs, n->for_list[i]);
             vm_buf_emit(vs->bc, OP_SETENV);
+
+            /* Start of iteration — save continue count */
+            vs->cont_count = 0;
+            vs->loop_stack[vs->loop_depth] = vm_buf_pc(vs->bc);
 
             /* Compile body */
             vs->loop_depth++;
             if(n->body) vmc_compile_block(vs, n->body);
             vs->loop_depth--;
+
+            /* Patch continue jumps to end of this iteration */
+            int iter_end = vm_buf_pc(vs->bc);
+            for(int j = 0; j < vs->cont_count; j++){
+                vm_buf_patch(vs->bc, vs->cont_patches[j], iter_end);
+            }
         }
-        /* Remove the counter (not used in unrolled version) */
+
+        /* Patch break jumps to end of entire loop */
+        int end_pc = vm_buf_pc(vs->bc);
+        for(int i = 0; i < vs->break_count; i++){
+            vm_buf_patch(vs->bc, vs->break_patches[i], end_pc);
+        }
+        vs->break_count = saved_break;
+        vs->cont_count = saved_cont;
+    }
+    /* C-style for: for ((init; cond; update)); do ... done */
+    else if(n->for_c_style && n->for_init){
+        /* Execute init */
+        vmc_push_str(vs, n->for_init);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
         vm_buf_emit(vs->bc, OP_POP);
+
+        int loop_start = vm_buf_pc(vs->bc);
+        vs->loop_stack[vs->loop_depth] = loop_start;
+        int saved_break_count = vs->break_count;
+        vs->break_count = 0;
+
+        /* Evaluate condition */
+        vmc_push_str(vs, n->for_cond);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_TO_INT);
+        int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
+
+        /* Body */
+        vs->loop_depth++;
+        if(n->body) vmc_compile_block(vs, n->body);
+        vs->loop_depth--;
+
+        /* Execute update */
+        vmc_push_str(vs, n->for_update);
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_POP);
+
+        /* Jump back to condition */
+        vm_buf_emit_u16(vs->bc, OP_JMP, loop_start);
+
+        /* Patch break and condition jump */
+        int end_pc = vm_buf_pc(vs->bc);
+        vm_buf_patch(vs->bc, jz_end, end_pc);
+        for(int i = 0; i < vs->break_count; i++){
+            vm_buf_patch(vs->bc, vs->break_patches[i], end_pc);
+        }
+        vs->break_count = saved_break_count;
     }
 }
 
@@ -834,16 +897,21 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
             vm_buf_emit(vs->bc, OP_RET);
             break;
         case NODE_BREAK:
-            /* JMP to loop break target */
+            /* JMP to loop break target — record patch location */
             if(vs->loop_depth > 0){
-                vm_buf_emit_u16(vs->bc, OP_JMP, 0); /* placeholder */
-                /* TODO: patch to loop break */
+                int patch = vm_buf_emit_jump(vs->bc, OP_JMP);
+                if(vs->break_count < 64){
+                    vs->break_patches[vs->break_count++] = patch;
+                }
             }
             break;
         case NODE_CONTINUE:
-            /* JMP to loop start */
+            /* JMP to end of current iteration */
             if(vs->loop_depth > 0){
-                vm_buf_emit_u16(vs->bc, OP_JMP, vs->loop_stack[vs->loop_depth - 1]);
+                int patch = vm_buf_emit_jump(vs->bc, OP_JMP);
+                if(vs->cont_count < 64){
+                    vs->cont_patches[vs->cont_count++] = patch;
+                }
             }
             break;
         case NODE_AND:
