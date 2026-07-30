@@ -220,17 +220,15 @@ static void arith_logic(ArithCtx *a){
         arith_skip_ws(a);
         if(*a->p == '&' && a->p[1] == '&'){
             a->p += 2;
-            /* Short-circuit AND: if top is 0, skip right */
+            /* Short-circuit AND: JZ pops condition, if false skip right */
             int jz_skip = vm_buf_emit_jump(a->vs->bc, OP_JZ);
-            vm_buf_emit(a->vs->bc, OP_POP);
             arith_compare(a);
             vm_buf_patch(a->vs->bc, jz_skip, vm_buf_pc(a->vs->bc));
         }
         else if(*a->p == '|' && a->p[1] == '|'){
             a->p += 2;
-            /* Short-circuit OR: if top is non-zero, skip right */
+            /* Short-circuit OR: JNZ pops condition, if true skip right */
             int jnz_skip = vm_buf_emit_jump(a->vs->bc, OP_JNZ);
-            vm_buf_emit(a->vs->bc, OP_POP);
             arith_compare(a);
             vm_buf_patch(a->vs->bc, jnz_skip, vm_buf_pc(a->vs->bc));
         }
@@ -244,19 +242,17 @@ static void arith_ternary(ArithCtx *a){
     arith_skip_ws(a);
     if(*a->p == '?'){
         a->p++;
-        /* JZ to else (false) branch */
+        /* JZ to false branch (JZ pops the condition) */
         int jz_else = vm_buf_emit_jump(a->vs->bc, OP_JZ);
-        vm_buf_emit(a->vs->bc, OP_POP);
-        /* True branch — stops at ':' */
+        /* True branch — condition already popped by JZ */
         arith_ternary(a);
         /* JMP to end */
         int jmp_end = vm_buf_emit_jump(a->vs->bc, OP_JMP);
         /* Consume ':' */
         arith_skip_ws(a);
         if(*a->p == ':') a->p++;
-        /* False branch */
+        /* False branch — JZ already popped condition */
         vm_buf_patch(a->vs->bc, jz_else, vm_buf_pc(a->vs->bc));
-        vm_buf_emit(a->vs->bc, OP_POP);
         arith_ternary(a);
         /* End */
         vm_buf_patch(a->vs->bc, jmp_end, vm_buf_pc(a->vs->bc));
@@ -271,11 +267,6 @@ static void arith_expr(ArithCtx *a){
 /* Emit a string constant and push it */
 static void vmc_push_str(VmCompilerState *vs, const char *s){
     int idx = vm_cp_intern(vs->cp, s);
-    /* Junk instruction: PUSH_STR "" + POP — looks meaningful but does nothing */
-    if((vs->bc->len & 15) == 0){
-        vm_buf_emit_u16(vs->bc, OP_PUSH_STR, 0); /* push empty string */
-        vm_buf_emit(vs->bc, OP_POP);             /* immediately pop it */
-    }
     vm_buf_emit_u16(vs->bc, OP_PUSH_STR, idx);
 }
 
@@ -376,9 +367,9 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 char expr[512]; int ei = 0;
                 int d = 2;
                 while(*p && d > 0 && ei < (int)sizeof(expr) - 1){
-                    if(*p == '(') d++;
-                    else if(*p == ')') { d--; if(d == 0) { p++; break; } }
-                    if(d > 0) expr[ei++] = *p;
+                    if(*p == '(') { d++; expr[ei++] = *p; }
+                    else if(*p == ')') { d--; if(d == 0) { p++; break; } if(d >= 2) expr[ei++] = *p; }
+                    else expr[ei++] = *p;
                     p++;
                 }
                 if(*p == ')') p++;
@@ -1017,19 +1008,16 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
             }
             break;
         case NODE_AND:
-            /* Short-circuit AND */
+            /* Short-circuit AND — JZ pops condition */
             if(n->left) vmc_compile_node(vs, n->left);
-            /* JZ to skip right */
             int jz_and = vm_buf_emit_jump(vs->bc, OP_JZ);
-            vm_buf_emit(vs->bc, OP_POP);
             if(n->right) vmc_compile_node(vs, n->right);
             vm_buf_patch(vs->bc, jz_and, vm_buf_pc(vs->bc));
             break;
         case NODE_OR:
-            /* Short-circuit OR */
+            /* Short-circuit OR — JNZ pops condition */
             if(n->left) vmc_compile_node(vs, n->left);
             int jnz_or = vm_buf_emit_jump(vs->bc, OP_JNZ);
-            vm_buf_emit(vs->bc, OP_POP);
             if(n->right) vmc_compile_node(vs, n->right);
             vm_buf_patch(vs->bc, jnz_or, vm_buf_pc(vs->bc));
             break;

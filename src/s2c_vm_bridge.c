@@ -195,8 +195,6 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     }
 
     /* ---- Emit permutation table (encoded) ---- */
-    /* The inverse permutation table is embedded so the runtime can
-     * un-permute opcodes during decode. XOR-encoded with perm_seed. */
     fprintf(out, "\n/* ---- VM opcode permutation table (encoded) ---- */\n");
     fprintf(out, "static const unsigned char __vm_perm[] = {\n");
     fprintf(out, "    ");
@@ -244,7 +242,6 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     {
         uint8_t rc4_s[256];
         for(int i = 0; i < 256; i++) rc4_s[i] = (uint8_t)i;
-        /* KSA: key = 8 bytes of perm_seed */
         uint8_t rc4_key[8];
         for(int i = 0; i < 8; i++) rc4_key[i] = (uint8_t)(perm_seed >> (i * 4));
         int j = 0;
@@ -252,7 +249,6 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
             j = (j + rc4_s[i] + rc4_key[i % 8]) & 0xFF;
             uint8_t tmp = rc4_s[i]; rc4_s[i] = rc4_s[j]; rc4_s[j] = tmp;
         }
-        /* PRGA: generate keystream and encrypt */
         int ii = 0, jj = 0;
         for(int k = 0; k < bc->len; k++){
             ii = (ii + 1) & 0xFF;
@@ -336,14 +332,13 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "        __vm_code_decoded[k]=__vm_code_enc[k]^ks;\n");
     fprintf(out, "    }\n");
     fprintf(out, "    }\n");
-    /* Un-permute opcodes: build inverse table from encoded __vm_perm */
+    /* Un-permute opcodes */
     fprintf(out, "    /* Un-permute opcodes (per-build randomized) */\n");
     fprintf(out, "    uint8_t __vm_inv[256];\n");
     fprintf(out, "    unsigned int __vm_ps = __VM_PERM_SEED;\n");
     fprintf(out, "    for(int i = 0; i < 256; i++){\n");
     fprintf(out, "        __vm_inv[i] = __vm_perm[i] ^ (uint8_t)(__vm_ps >> (i %% 4 * 8));\n");
     fprintf(out, "    }\n");
-    /* Walk decoded bytecode and replace each opcode with un-permuted value */
     fprintf(out, "    { int i = 0;\n");
     fprintf(out, "    while(i < __vm_cs){\n");
     fprintf(out, "        uint8_t vm_op = __vm_code_decoded[i];\n");
