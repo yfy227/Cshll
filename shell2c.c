@@ -568,13 +568,33 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
             has_newline = 0;
             start = 2;
         }
+        int printed = 0;
         for(int i = start; i < n->argc; i++){
-            vmc_compile_word(vs, n->argv[i]);
-            vm_buf_emit(vs->bc, OP_PRINT);
-            if(i < n->argc - 1){
+            const char *arg = n->argv[i];
+            /* Skip redirect operators */
+            if(strchr(arg, '>') || strchr(arg, '<') ||
+               !strncmp(arg, ">&", 2) || !strncmp(arg, ">>", 2))
+                continue;
+            /* Skip redirect targets (arg after redirect operator) */
+            if(i > start){
+                const char *prev = n->argv[i-1];
+                if(strchr(prev, '>') || strchr(prev, '<') ||
+                   !strncmp(prev, ">&", 2) || !strncmp(prev, ">>", 2))
+                    continue;
+            }
+            /* Skip fd numbers (e.g. "2" in "2>/dev/null") */
+            if(i + 1 < n->argc && strlen(arg) == 1 && isdigit((unsigned char)arg[0])){
+                const char *next = n->argv[i+1];
+                if(strchr(next, '>') || strchr(next, '<'))
+                    continue;
+            }
+            if(printed){
                 vmc_push_str(vs, " ");
                 vm_buf_emit(vs->bc, OP_PRINT);
             }
+            vmc_compile_word(vs, arg);
+            vm_buf_emit(vs->bc, OP_PRINT);
+            printed = 1;
         }
         if(has_newline){
             vmc_push_str(vs, "\n");
