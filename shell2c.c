@@ -73,10 +73,200 @@ typedef struct {
 static void vmc_compile_node(VmCompilerState *vs, Node *n);
 static void vmc_compile_block(VmCompilerState *vs, Node *n);
 static void vmc_push_int(VmCompilerState *vs, int32_t val);
+static void vmc_push_str(VmCompilerState *vs, const char *s);
 static int vm_find_func(const char *name);
 static char *vm_func_names[256];
 static Node *vm_func_bodies[256];
 static int vm_func_count = 0;
+
+/* ---- Recursive-descent arithmetic compiler ----
+ * Grammar:
+ *   expr    → ternary
+ *   ternary → logic ('?' ternary ':' ternary)?
+ *   logic   → compare (('&&' | '||') compare)*
+ *   compare → add (('<'|'>'|'<='|'>='|'=='|'!=') add)*
+ *   add     → mul (('+'|'-') mul)*
+ *   mul     → unary (('*'|'/'|'%') unary)*
+ *   unary   → '-' unary | primary
+ *   primary → NUMBER | VAR | '(' expr ')'
+ */
+typedef struct {
+    const char *p;      /* current position in expression */
+    VmCompilerState *vs;
+} ArithCtx;
+
+static void arith_skip_ws(ArithCtx *a){
+    while(*a->p == ' ' || *a->p == '\t') a->p++;
+}
+
+/* Forward declarations for recursive descent */
+static void arith_expr(ArithCtx *a);
+static void arith_primary(ArithCtx *a);
+
+/* Parse a number */
+static void arith_number(ArithCtx *a){
+    int val = 0;
+    while(isdigit((unsigned char)*a->p)){
+        val = val * 10 + (*a->p - '0');
+        a->p++;
+    }
+    vmc_push_int(a->vs, val);
+}
+
+/* Parse a variable reference */
+static void arith_variable(ArithCtx *a){
+    char vn[128]; int vi = 0;
+    if(*a->p == '$') a->p++; /* skip $ */
+    if(*a->p == '{'){
+        a->p++;
+        while(*a->p && *a->p != '}' && vi < (int)sizeof(vn)-1) vn[vi++] = *a->p++;
+        if(*a->p == '}') a->p++;
+    } else {
+        while(*a->p && (isalnum((unsigned char)*a->p) || *a->p == '_') && vi < (int)sizeof(vn)-1)
+            vn[vi++] = *a->p++;
+    }
+    vn[vi] = 0;
+    vmc_push_str(a->vs, vn);
+    vm_buf_emit(a->vs->bc, OP_GETENV);
+    vm_buf_emit(a->vs->bc, OP_TO_INT);
+}
+
+/* primary: NUMBER | VAR | '(' expr ')' */
+static void arith_primary(ArithCtx *a){
+    arith_skip_ws(a);
+    if(*a->p == '('){
+        a->p++; /* skip ( */
+        arith_expr(a);
+        arith_skip_ws(a);
+        if(*a->p == ')') a->p++; /* skip ) */
+    }
+    else if(*a->p == '-'){
+        /* Unary minus: push 0, swap, sub → 0 - operand = -operand */
+        a->p++;
+        arith_skip_ws(a);
+        arith_primary(a);
+        vmc_push_int(a->vs, 0);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vm_buf_emit(a->vs->bc, OP_SUB);
+    }
+    else if(isdigit((unsigned char)*a->p)){
+        arith_number(a);
+    }
+    else if(*a->p == '$' || isalpha((unsigned char)*a->p) || *a->p == '_'){
+        arith_variable(a);
+    }
+    else {
+        /* Unknown token — push 0 */
+        vmc_push_int(a->vs, 0);
+        if(*a->p) a->p++; /* skip */
+    }
+}
+
+/* mul: unary (('*'|'/'|'%') unary)* */
+static void arith_mul(ArithCtx *a){
+    arith_primary(a);
+    for(;;){
+        arith_skip_ws(a);
+        char op = *a->p;
+        if(op != '*' && op != '/' && op != '%') break;
+        a->p++;
+        arith_primary(a);
+        switch(op){
+            case '*': vm_buf_emit(a->vs->bc, OP_MUL); break;
+            case '/': vm_buf_emit(a->vs->bc, OP_DIV); break;
+            case '%': vm_buf_emit(a->vs->bc, OP_MOD); break;
+        }
+    }
+}
+
+/* add: mul (('+'|'-') mul)* */
+static void arith_add(ArithCtx *a){
+    arith_mul(a);
+    for(;;){
+        arith_skip_ws(a);
+        char op = *a->p;
+        if(op != '+' && op != '-') break;
+        /* Check it's not part of <= >= == != */
+        if((op == '-' || op == '+') &&
+           (a->p[1] == '=' || a->p[1] == op)) break;
+        a->p++;
+        arith_mul(a);
+        switch(op){
+            case '+': vm_buf_emit(a->vs->bc, OP_ADD); break;
+            case '-': vm_buf_emit(a->vs->bc, OP_SUB); break;
+        }
+    }
+}
+
+/* compare: add (('<'|'>'|'<='|'>='|'=='|'!=') add)* */
+static void arith_compare(ArithCtx *a){
+    arith_add(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '<' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_LE); }
+        else if(*a->p == '>' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_GE); }
+        else if(*a->p == '=' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_EQ); }
+        else if(*a->p == '!' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_NE); }
+        else if(*a->p == '<'){ a->p++; arith_add(a); vm_buf_emit(a->vs->bc, OP_LT); }
+        else if(*a->p == '>'){ a->p++; arith_add(a); vm_buf_emit(a->vs->bc, OP_GT); }
+        else break;
+    }
+}
+
+/* logic: compare (('&&'|'||') compare)* */
+static void arith_logic(ArithCtx *a){
+    arith_compare(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '&' && a->p[1] == '&'){
+            a->p += 2;
+            /* Short-circuit AND: if top is 0, skip right */
+            int jz_skip = vm_buf_emit_jump(a->vs->bc, OP_JZ);
+            vm_buf_emit(a->vs->bc, OP_POP);
+            arith_compare(a);
+            vm_buf_patch(a->vs->bc, jz_skip, vm_buf_pc(a->vs->bc));
+        }
+        else if(*a->p == '|' && a->p[1] == '|'){
+            a->p += 2;
+            /* Short-circuit OR: if top is non-zero, skip right */
+            int jnz_skip = vm_buf_emit_jump(a->vs->bc, OP_JNZ);
+            vm_buf_emit(a->vs->bc, OP_POP);
+            arith_compare(a);
+            vm_buf_patch(a->vs->bc, jnz_skip, vm_buf_pc(a->vs->bc));
+        }
+        else break;
+    }
+}
+
+/* ternary: logic ('?' ternary ':' ternary)? */
+static void arith_ternary(ArithCtx *a){
+    arith_logic(a);
+    arith_skip_ws(a);
+    if(*a->p == '?'){
+        a->p++;
+        /* JZ to else (false) branch */
+        int jz_else = vm_buf_emit_jump(a->vs->bc, OP_JZ);
+        vm_buf_emit(a->vs->bc, OP_POP);
+        /* True branch — stops at ':' */
+        arith_ternary(a);
+        /* JMP to end */
+        int jmp_end = vm_buf_emit_jump(a->vs->bc, OP_JMP);
+        /* Consume ':' */
+        arith_skip_ws(a);
+        if(*a->p == ':') a->p++;
+        /* False branch */
+        vm_buf_patch(a->vs->bc, jz_else, vm_buf_pc(a->vs->bc));
+        vm_buf_emit(a->vs->bc, OP_POP);
+        arith_ternary(a);
+        /* End */
+        vm_buf_patch(a->vs->bc, jmp_end, vm_buf_pc(a->vs->bc));
+    }
+}
+
+/* expr: ternary */
+static void arith_expr(ArithCtx *a){
+    arith_ternary(a);
+}
 
 /* Emit a string constant and push it */
 static void vmc_push_str(VmCompilerState *vs, const char *s){
@@ -179,7 +369,7 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     segment_count++;
                 }
             }
-            /* $((expr)) — arithmetic: compile to VM arithmetic bytecode */
+            /* $((expr)) — arithmetic: recursive-descent compiler */
             else if(*p == '(' && *(p+1) == '('){
                 p += 2;
                 /* Extract the expression text */
@@ -194,99 +384,11 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 if(*p == ')') p++;
                 expr[ei] = 0;
 
-                /* Simple arithmetic compiler: tokenize and emit
-                 * Supports: var, int, +, -, *, /, %, (, ) */
-                const char *ep = expr;
-                int first_operand = 1;
-                char pending_op = 0;
-
-                while(*ep){
-                    /* Skip whitespace */
-                    while(*ep == ' ' || *ep == '\t') ep++;
-                    if(!*ep) break;
-
-                    /* Number */
-                    if(isdigit((unsigned char)*ep)){
-                        int val = 0;
-                        while(isdigit((unsigned char)*ep)){
-                            val = val * 10 + (*ep - '0');
-                            ep++;
-                        }
-                        vmc_push_int(vs, val);
-                        if(!first_operand && pending_op){
-                            switch(pending_op){
-                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
-                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
-                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
-                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
-                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
-                            }
-                            pending_op = 0;
-                        }
-                        first_operand = 0;
-                    }
-                    /* Variable: $var or bare var name */
-                    else if(*ep == '$'){
-                        ep++;
-                        char vn[128]; int vi = 0;
-                        if(*ep == '{'){
-                            ep++;
-                            while(*ep && *ep != '}' && vi < (int)sizeof(vn)-1) vn[vi++] = *ep++;
-                            if(*ep == '}') ep++;
-                        } else {
-                            while(*ep && (isalnum((unsigned char)*ep) || *ep == '_') && vi < (int)sizeof(vn)-1)
-                                vn[vi++] = *ep++;
-                        }
-                        vn[vi] = 0;
-                        vmc_push_str(vs, vn);
-                        vm_buf_emit(vs->bc, OP_GETENV);
-                        vm_buf_emit(vs->bc, OP_TO_INT);
-                        if(!first_operand && pending_op){
-                            switch(pending_op){
-                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
-                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
-                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
-                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
-                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
-                            }
-                            pending_op = 0;
-                        }
-                        first_operand = 0;
-                    }
-                    /* Bare variable name (no $ prefix) */
-                    else if(isalpha((unsigned char)*ep) || *ep == '_'){
-                        char vn[128]; int vi = 0;
-                        while(*ep && (isalnum((unsigned char)*ep) || *ep == '_') && vi < (int)sizeof(vn)-1)
-                            vn[vi++] = *ep++;
-                        vn[vi] = 0;
-                        vmc_push_str(vs, vn);
-                        vm_buf_emit(vs->bc, OP_GETENV);
-                        vm_buf_emit(vs->bc, OP_TO_INT);
-                        if(!first_operand && pending_op){
-                            switch(pending_op){
-                                case '+': vm_buf_emit(vs->bc, OP_ADD); break;
-                                case '-': vm_buf_emit(vs->bc, OP_SUB); break;
-                                case '*': vm_buf_emit(vs->bc, OP_MUL); break;
-                                case '/': vm_buf_emit(vs->bc, OP_DIV); break;
-                                case '%': vm_buf_emit(vs->bc, OP_MOD); break;
-                            }
-                            pending_op = 0;
-                        }
-                        first_operand = 0;
-                    }
-                    /* Operator */
-                    else if(*ep == '+' || *ep == '-' || *ep == '*' || *ep == '/' || *ep == '%'){
-                        pending_op = *ep;
-                        ep++;
-                    }
-                    /* Skip parens for now */
-                    else if(*ep == '(' || *ep == ')'){
-                        ep++;
-                    }
-                    else {
-                        ep++; /* skip unknown chars */
-                    }
-                }
+                /* Compile using recursive-descent parser */
+                ArithCtx a;
+                a.p = expr;
+                a.vs = vs;
+                arith_expr(&a);
 
                 /* Convert result to string */
                 vm_buf_emit(vs->bc, OP_TO_STR);
