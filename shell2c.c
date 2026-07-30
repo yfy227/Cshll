@@ -571,21 +571,23 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         int printed = 0;
         for(int i = start; i < n->argc; i++){
             const char *arg = n->argv[i];
-            /* Skip redirect operators */
-            if(strchr(arg, '>') || strchr(arg, '<') ||
+            /* Skip redirect operators (only at start of token, not inside expressions) */
+            if((arg[0] == '>' || arg[0] == '<') ||
+               (arg[0] == '2' && arg[1] == '>') ||
                !strncmp(arg, ">&", 2) || !strncmp(arg, ">>", 2))
                 continue;
             /* Skip redirect targets (arg after redirect operator) */
             if(i > start){
                 const char *prev = n->argv[i-1];
-                if(strchr(prev, '>') || strchr(prev, '<') ||
+                if((prev[0] == '>' || prev[0] == '<') ||
+                   (prev[0] == '2' && prev[1] == '>') ||
                    !strncmp(prev, ">&", 2) || !strncmp(prev, ">>", 2))
                     continue;
             }
             /* Skip fd numbers (e.g. "2" in "2>/dev/null") */
             if(i + 1 < n->argc && strlen(arg) == 1 && isdigit((unsigned char)arg[0])){
                 const char *next = n->argv[i+1];
-                if(strchr(next, '>') || strchr(next, '<'))
+                if(next[0] == '>' || next[0] == '<')
                     continue;
             }
             if(printed){
