@@ -399,8 +399,56 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 }
                 if(*p == ')') p++;
                 cmd[ci] = 0;
-                vmc_push_str(vs, cmd);
-                vm_buf_emit(vs->bc, OP_EXEC_CMD);
+
+                /* Check if this is a VM function call */
+                char *space = strchr(cmd, ' ');
+                char fname[256];
+                if(space){
+                    int fl = (int)(space - cmd);
+                    if(fl >= (int)sizeof(fname)) fl = (int)sizeof(fname) - 1;
+                    memcpy(fname, cmd, fl);
+                    fname[fl] = 0;
+                } else {
+                    strncpy(fname, cmd, sizeof(fname) - 1);
+                    fname[sizeof(fname)-1] = 0;
+                }
+
+                int fi = vm_find_func(fname);
+                if(fi >= 0 && vm_func_bodies[fi]){
+                    /* VM function: set $1, $2, ... from args, compile body inline */
+                    /* Parse args from the command string */
+                    char *argp = cmd;
+                    /* Skip function name */
+                    argp += strlen(fname);
+                    int argi = 1;
+                    while(*argp && argi < 16){
+                        while(*argp == ' ') argp++;
+                        if(!*argp) break;
+                        char argbuf[256]; int ai = 0;
+                        if(*argp == '"' || *argp == '\''){
+                            char q = *argp++;
+                            while(*argp && *argp != q && ai < (int)sizeof(argbuf)-1)
+                                argbuf[ai++] = *argp++;
+                            if(*argp == q) argp++;
+                        } else {
+                            while(*argp && *argp != ' ' && ai < (int)sizeof(argbuf)-1)
+                                argbuf[ai++] = *argp++;
+                        }
+                        argbuf[ai] = 0;
+                        char argname[8];
+                        snprintf(argname, sizeof(argname), "%d", argi);
+                        vmc_push_str(vs, argname);
+                        vmc_push_str(vs, argbuf);
+                        vm_buf_emit(vs->bc, OP_SETENV);
+                        argi++;
+                    }
+                    /* Compile function body inline */
+                    vmc_compile_block(vs, vm_func_bodies[fi]);
+                } else {
+                    /* External command: use system() */
+                    vmc_push_str(vs, cmd);
+                    vm_buf_emit(vs->bc, OP_EXEC_CMD);
+                }
                 if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                 segment_count++;
             }
