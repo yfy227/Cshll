@@ -284,9 +284,10 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "/* ---- VM entry point ---- */\n");
     fprintf(out, "int main(int argc, char **argv){\n");
     fprintf(out, "    setvbuf(stdout, NULL, _IONBF, 0);\n");
+    fprintf(out, "    if(!_x_sys) _x_init(); /* resolve libc via dlsym */\n");
     /* Anti-debug: check if being traced */
     fprintf(out, "    /* Anti-analysis: runtime integrity check */\n");
-    fprintf(out, "    if(getenv(\"__vm_guard\")) goto __vm_skip;\n");
+    fprintf(out, "    if(_getenv(\"__vm_guard\")) goto __vm_skip;\n");
     fprintf(out, "    { volatile int __vm_check = 0x1337;\n");
     fprintf(out, "      __vm_check ^= 0xDEAD; __vm_check ^= 0xDEAD;\n");
     fprintf(out, "      if(__vm_check != 0x1337) return 0xBAD; }\n");
@@ -355,7 +356,7 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    __vm_code_size = __VM_CODE_SIZE;\n");
     fprintf(out, "    /* Set $0-$9 from argv */\n");
     for(int i = 0; i < 10; i++){
-        fprintf(out, "    if(argc > %d) setenv(\"%d\", argv[%d], 1);\n", i, i, i);
+        fprintf(out, "    if(argc > %d) _setenv(\"%d\", argv[%d], 1);\n", i, i, i);
     }
     fprintf(out, "    int rc = vm_run(0);\n");
     /* Anti-dump: wipe decoded bytecode after execution */
