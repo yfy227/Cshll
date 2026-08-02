@@ -415,7 +415,8 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
 
                 int fi = vm_find_func(fname);
                 if(fi >= 0 && vm_func_bodies[fi]){
-                    /* VM function: set $1, $2, ... from args, compile body inline */
+                    /* VM function: capture output with CAP_START/CAP_END */
+                    vm_buf_emit(vs->bc, OP_CAP_START);
                     /* Parse args from the command string */
                     char *argp = cmd;
                     /* Skip function name */
@@ -444,10 +445,12 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     }
                     /* Compile function body inline */
                     vmc_compile_block(vs, vm_func_bodies[fi]);
+                    /* End capture, push captured output as string */
+                    vm_buf_emit(vs->bc, OP_CAP_END);
                 } else {
-                    /* External command: use system() */
+                    /* External command: use popen to capture output */
                     vmc_push_str(vs, cmd);
-                    vm_buf_emit(vs->bc, OP_EXEC_CMD);
+                    vm_buf_emit(vs->bc, OP_EXEC_CAP);
                 }
                 if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                 segment_count++;
@@ -522,6 +525,45 @@ static void vmc_push_int(VmCompilerState *vs, int32_t val){
 static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     if(!n->argv || n->argc == 0) return;
     const char *cmd = n->argv[0];
+
+    /* read with here-string: read var1 var2 ... <<< "content" */
+    if(strcmp(cmd, "read") == 0){
+        for(int i = 1; i < n->argc; i++){
+            if(!strcmp(n->argv[i], "<<<")){
+                if(i + 1 < n->argc){
+                    /* Extract here-string content (strip quotes) */
+                    const char *content = n->argv[i+1];
+                    char buf[1024]; int bi = 0;
+                    if(content[0] == '"' || content[0] == '\''){
+                        char q = content[0];
+                        content++;
+                        while(*content && *content != q && bi < (int)sizeof(buf)-1)
+                            buf[bi++] = *content++;
+                        buf[bi] = 0;
+                    } else {
+                        strncpy(buf, content, sizeof(buf)-1);
+                        buf[sizeof(buf)-1] = 0;
+                    }
+                    /* Split on whitespace and assign to variables */
+                    char *p = buf;
+                    for(int j = 1; j < i; j++){
+                        if(n->argv[j][0] == '-') continue; /* skip flags */
+                        while(*p == ' ' || *p == '\t') p++;
+                        char word[256]; int wi = 0;
+                        while(*p && *p != ' ' && *p != '\t' && wi < (int)sizeof(word)-1)
+                            word[wi++] = *p++;
+                        word[wi] = 0;
+                        vmc_push_str(vs, n->argv[j]);
+                        vmc_push_str(vs, word);
+                        vm_buf_emit(vs->bc, OP_SETENV);
+                    }
+                }
+                return;
+            }
+        }
+        /* read without here-string — skip (no stdin in VM) */
+        return;
+    }
 
     /* Check for heredoc redirect — detect << in argv */
     for(int i = 1; i < n->argc; i++){
@@ -982,36 +1024,45 @@ static void vmc_compile_case(VmCompilerState *vs, Node *n){
 }
 
 /* Compile a pipe (NODE_PIPE) */
+/* Build command string from a NODE_CMD */
+static void vmc_build_cmdstr(char *buf, int bufsize, Node *n){
+    int ci = 0;
+    for(int i = 0; i < n->argc && ci < bufsize - 1; i++){
+        if(i > 0) buf[ci++] = ' ';
+        int al = strlen(n->argv[i]);
+        if(ci + al < bufsize - 1){ memcpy(buf+ci, n->argv[i], al); ci += al; }
+    }
+    buf[ci] = 0;
+}
+
+/* Recursively build pipeline string for multi-stage pipes */
+static void vmc_build_pipestr(char *buf, int bufsize, Node *n){
+    if(!n) { buf[0] = 0; return; }
+    if(n->type == NODE_CMD){
+        vmc_build_cmdstr(buf, bufsize, n);
+        return;
+    }
+    if(n->type == NODE_PIPE){
+        char left[1024], right[1024];
+        vmc_build_pipestr(left, sizeof(left), n->left);
+        vmc_build_pipestr(right, sizeof(right), n->right);
+        snprintf(buf, bufsize, "%s | %s", left, right);
+        return;
+    }
+    buf[0] = 0;
+}
+
 static void vmc_compile_pipe(VmCompilerState *vs, Node *n){
-    /* For pipe, we need to execute left | right.
-     * For now, execute both as commands with EXEC_PIPE. */
-    if(n->left){
-        if(n->left->type == NODE_CMD && n->left->argv && n->left->argc > 0){
-            /* Build command string */
-            char cmdstr[2048]; int ci = 0;
-            for(int i = 0; i < n->left->argc && ci < (int)sizeof(cmdstr)-1; i++){
-                if(i > 0) cmdstr[ci++] = ' ';
-                int al = strlen(n->left->argv[i]);
-                if(ci + al < (int)sizeof(cmdstr) - 1){ memcpy(cmdstr+ci, n->left->argv[i], al); ci += al; }
-            }
-            cmdstr[ci] = 0;
-            vmc_push_str(vs, cmdstr);
-        }
+    /* Build full pipeline string (handles multi-stage pipes) */
+    char pipestr[4096];
+    vmc_build_pipestr(pipestr, sizeof(pipestr), n);
+    
+    if(strlen(pipestr) > 0){
+        /* Use popen to execute the full pipeline, print output to stdout */
+        vmc_push_str(vs, pipestr);
+        vm_buf_emit(vs->bc, OP_EXEC_CAP);
+        vm_buf_emit(vs->bc, OP_PRINT); /* print captured output */
     }
-    if(n->right){
-        if(n->right->type == NODE_CMD && n->right->argv && n->right->argc > 0){
-            char cmdstr[2048]; int ci = 0;
-            for(int i = 0; i < n->right->argc && ci < (int)sizeof(cmdstr)-1; i++){
-                if(i > 0) cmdstr[ci++] = ' ';
-                int al = strlen(n->right->argv[i]);
-                if(ci + al < (int)sizeof(cmdstr) - 1){ memcpy(cmdstr+ci, n->right->argv[i], al); ci += al; }
-            }
-            cmdstr[ci] = 0;
-            vmc_push_str(vs, cmdstr);
-        }
-    }
-    vm_buf_emit(vs->bc, OP_EXEC_PIPE);
-    vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
 }
 
 /* Compile a single AST node */

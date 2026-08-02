@@ -106,6 +106,9 @@ typedef enum {
     OP_PRINTLN   = 0x51,  /* print string + newline */
     OP_PRINT_INT = 0x52,  // print integer top of stack
     OP_READ      = 0x53,  // read line from stdin
+    OP_CAP_START = 0x54,  /* start capturing PRINT output to buffer */
+    OP_CAP_END   = 0x55,  /* stop capturing, push buffer as string */
+    OP_EXEC_CAP  = 0x56,  /* execute external command via popen, push captured output */
 
     /* 0x60-0x6F: Shell interop */
     OP_EXEC_CMD  = 0x60,  /* execute external command via system() */
