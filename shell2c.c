@@ -1527,6 +1527,10 @@ int tokenize(const char *line, char **toks, int maxtoks){
             toks[n++]=pool_dup(ps_buf,pi); continue;
         }
         if(*p=='>'&&*(p+1)=='>'){ toks[n++]=(char*)">>"; p+=2; continue; }
+        if(*p=='<'&&*(p+1)=='='){ toks[n++]=(char*)"<="; p+=2; continue; }
+        if(*p=='>'&&*(p+1)=='='){ toks[n++]=(char*)">="; p+=2; continue; }
+        if(*p=='='&&*(p+1)=='='){ toks[n++]=(char*)"=="; p+=2; continue; }
+        if(*p=='!'&&*(p+1)=='='){ toks[n++]=(char*)"!="; p+=2; continue; }
         if(*p=='<'&&*(p+1)=='>'){ toks[n++]=(char*)"<>"; p+=2; continue; }
         if(*p=='&'&&*(p+1)=='>'){ toks[n++]=(char*)"&>"; p+=2; continue; }
         if(*p==';'){             toks[n++]=(char*)";";  p++;  continue; }
@@ -2333,7 +2337,18 @@ char *translate_expr(const char *tok){
                     }
                     continue;
                 }
-                /* ++ -- += -= etc. pass through */
+                /* ++ -- += -= *= /= %= <<= >>= &= |= ^= etc. pass through */
+                /* Also handle two-char comparison ops: <= >= == != */
+                if((*s=='<'||*s=='>'||*s=='='||*s=='!') && *(s+1)=='='){
+                    buf[q++]=*s++; buf[q++]=*s++; continue;
+                }
+                if((*s=='<'||*s=='>') && (*(s+1)=='<'||*(s+1)=='>')){
+                    /* << >> bit shift */
+                    buf[q++]=*s++; buf[q++]=*s++; continue;
+                }
+                if((*s=='&'&&*(s+1)=='&')||(*s=='|'&&*(s+1)=='|')){
+                    buf[q++]=*s++; buf[q++]=*s++; continue;
+                }
                 buf[q++]=*s++;
             }
         }
@@ -2441,7 +2456,7 @@ char *translate_expr(const char *tok){
         if(*p=='#') return xstrdup("__sh_argc");
         if(*p=='$') return xstrdup("(int)getpid()");
         if(*p=='!') return xstrdup("__sh_last_bg_pid");
-        if(*p=='@'||*p=='*') return xstrdup("\"\"");
+        if(*p=='@'||*p=='*') return xstrdup("__sh_join_args(__sh_argc,__sh_args)");
         if(*p=='_') return xstrdup("__sh_last_arg");
         if(isdigit((unsigned char)*p)){
             char r[32]; snprintf(r,sizeof(r),"__sh_arg%c",*p);
@@ -2794,7 +2809,7 @@ void expand_string(const char *s, ExpandResult *er){
             if(er->nargs<EXPAND_MAX_ARGS){ er->args[er->nargs]=xstrdup("__sh_last_bg_pid"); er->arg_is_int[er->nargs++]=1; }
             p++; continue; }
         if(*p=='@'||*p=='*'){ fmt[fi++]='%'; fmt[fi++]='s';
-            if(er->nargs<EXPAND_MAX_ARGS){ er->args[er->nargs]=xstrdup("\"\""); er->arg_is_int[er->nargs++]=0; }
+            if(er->nargs<EXPAND_MAX_ARGS){ er->args[er->nargs]=xstrdup("__sh_join_args(__sh_argc,__sh_args)"); er->arg_is_int[er->nargs++]=0; }
             p++; continue; }
         if(isdigit((unsigned char)*p)){
             char r[32]; snprintf(r,sizeof(r),"__sh_arg%c",*p); p++;
@@ -4671,11 +4686,23 @@ void emit_node(FILE *out, Node *n){
             /* if key is numeric, use as index; otherwise use assoc set */
             int is_num_key=1;
             for(const char *q=akey;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num_key=0; break; } }
+            /* BUG: if key is $var, it's a runtime-numeric index */
+            int is_var_key=(akey[0]=='$' && akey[1] && akey[1]!='{');
+            if(is_var_key) is_num_key=1; /* treat $var as numeric index */
             if(is_num_key && akey[0]){
+                if(is_var_key){
+                    /* Runtime evaluation: use atoi(var) as index */
+                    char *e=translate_expr(akey);
+                    fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
+                    fprintf(out,"    int __idx=%s; if(__idx<0)__idx=0; if(__idx>=256)__idx=255;\n",e);
+                    free(e);
+                    fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
+                }else{
                 fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
                 fprintf(out,"    int __idx=atoi(\"%s\");\n",akey);
                 fprintf(out,"    if(__idx>=256) __idx=255;\n");
                 fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
+                }
             } else {
                 /* BUG-10 fix: use __sh_assoc_set for string keys */
                 fprintf(out,"    __sh_assoc_set(__arr_%s,\"%s\",",safe_cname(n->lhs),akey);
@@ -5212,11 +5239,13 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",w);
                 free(w);
                 fprintf(out,"    char *__sv=__sbuf;\n");
+                /* Use IFS for word splitting (same as do_split_var path) */
+                fprintf(out,"    const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \\t\\n\";\n");
                 fprintf(out,"    while(*__sv){\n");
-                fprintf(out,"        while(*__sv==' '||*__sv=='\\t'||*__sv=='\\n')__sv++;\n");
+                fprintf(out,"        while(*__sv&&strchr(__ifs,*__sv))__sv++;\n");
                 fprintf(out,"        if(!*__sv)break;\n");
                 fprintf(out,"        char *__se=__sv;\n");
-                fprintf(out,"        while(*__se&&*__se!=' '&&*__se!='\\t'&&*__se!='\\n')__se++;\n");
+                fprintf(out,"        while(*__se&&!strchr(__ifs,*__se))__se++;\n");
                 fprintf(out,"        char __sc=*__se; *__se=0;\n");
                 VarKind vk=get_var_kind(n->for_var);
                 if(vk==V_INT)
@@ -6058,6 +6087,18 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         if(!strcmp(kw,"case")){
             Node *nd=new_node(NODE_CASE,lineno);
             nd->case_var=(ntoks>1)?xstrdup(translate_expr(toks[1])):xstrdup("\"\"");
+            /* BUG-34 fix: if case_var is an int variable, convert to string */
+            if(ntoks>1 && toks[1][0]=='$'){
+                const char *vname=toks[1]+1;
+                if(*vname=='{') vname++;
+                VarKind vk=get_var_kind(vname);
+                if(vk==V_INT){
+                    /* Wrap in __sh_fmt to get string representation */
+                    char tmp[300]; snprintf(tmp,sizeof(tmp),"__sh_fmt(\"%%d\",%s)",safe_cname(vname));
+                    free(nd->case_var);
+                    nd->case_var=xstrdup(tmp);
+                }
+            }
             Node **_pi=parse_insert;
             parser_append(nd);
             BlkFrame fr={BLK_CASE,nd,NULL,_pi};
@@ -6378,6 +6419,26 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             }
             if(ai>=0){
                 Node *nd=new_node(NODE_AND,lineno);
+                /* BUG-18fix: if left side is [[ ]], make it an if-condition not a cmd */
+                if(ai>=2 && !strcmp(toks[0],"[[") && !strcmp(toks[ai-1],"]]")){
+                    /* Build condition string from tokens between [[ and ]] */
+                    char cb[2048]="";
+                    for(int i=1;i<ai-1;i++){
+                        if(i>1) strcat(cb," ");
+                        strncat(cb,toks[i],sizeof(cb)-strlen(cb)-1);
+                    }
+                    char cond[2100]; snprintf(cond,sizeof(cond),"[[ %s ]]",cb);
+                    Node *ifnd=new_node(NODE_IF,lineno);
+                    ifnd->cond=xstrdup(cond);
+                    BlkFrame ifr={BLK_IF_THEN,ifnd,&ifnd->then_blk,parse_insert};
+                    parser_append(ifnd);
+                    parser_push(ifr);
+                    parse_insert=&ifnd->then_blk;
+                    /* The && right side becomes the then-body */
+                    dispatch_segment(toks+ai+1,ntoks-ai-1,lineno);
+                    parser_pop();
+                    return;
+                }
                 nd->left=make_cmd(toks,ai,lineno);
                 /* Right side may contain more && — dispatch recursively */
                 Node **_pi=parse_insert;
@@ -6838,6 +6899,13 @@ const char *RT_HEADER =
 "  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);\n"
 "  buf[0]=0;\n"
 "  for(int i=0;arr[i];i++){ if(i>0) strncat(buf,\" \",8192-strlen(buf)-1); strncat(buf,arr[i]?arr[i]:\"\",8192-strlen(buf)-1); }\n"
+"  return buf;\n"
+"}\n"
+"/* Join function args (for $@ / $*) */\n"
+"static const char *__sh_join_args(int argc, char **args){\n"
+"  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);\n"
+"  buf[0]=0;\n"
+"  for(int i=0;i<argc;i++){ if(i>0) strncat(buf,\" \",8192-strlen(buf)-1); strncat(buf,args[i]?args[i]:\"\",8192-strlen(buf)-1); }\n"
 "  return buf;\n"
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
