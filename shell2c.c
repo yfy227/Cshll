@@ -5560,6 +5560,12 @@ void emit_node(FILE *out, Node *n){
     }
 
     case NODE_WHILE:{
+        /* Handle redirects (e.g., done < file) */
+        if(n->redirs){
+            fprintf(out,"    {\n");
+            emit_redirs_save(out,n->redirs,n->lineno);
+            emit_redirs_apply(out,n->redirs,n->lineno);
+        }
         /* Check for pending pipe command (cmd | while ...) */
         if(pending_pipe_cmd){
             fprintf(out,"    { int __ppfd[2]; if(pipe(__ppfd)<0){perror(\"pipe\");exit(1);}\n");
@@ -5616,6 +5622,11 @@ void emit_node(FILE *out, Node *n){
             fprintf(out,"    fflush(stdout); dup2(__psi,0); close(__psi); clearerr(stdin); waitpid(__ppid,NULL,0);\n");
             fprintf(out,"    }\n");
             pipe_restore_needed=0;
+        }
+        /* Restore redirects */
+        if(n->redirs){
+            emit_redirs_restore(out,n->redirs,n->lineno);
+            fprintf(out,"    }\n");
         }
         break;
     }
@@ -6386,7 +6397,21 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             BlkFrame fr={BLK_SELECT,nd,&nd->body,_pi};
             parser_push(fr); parse_insert=&nd->body; return;
         }
-        if(!strcmp(kw,"done")){ parser_pop(); return; }
+        if(!strcmp(kw,"done")){
+            /* Check for redirect after done (e.g., done < file) */
+            if(ntoks>2 && blk_top && (blk_top->kind==BLK_WHILE||blk_top->kind==BLK_UNTIL)){
+                Node *wnd=blk_top->node;
+                for(int i=1;i+1<ntoks;i++){
+                    if(!strcmp(toks[i],"<")){
+                        Redir *r=new_redir(0,toks[i+1],0,-1,0,0,0);
+                        /* append to redir list */
+                        if(!wnd->redirs) wnd->redirs=r;
+                        else { Redir *p=wnd->redirs; while(p->next)p=p->next; p->next=r; }
+                    }
+                }
+            }
+            parser_pop(); return;
+        }
 
         if(!strcmp(kw,"case")){
             Node *nd=new_node(NODE_CASE,lineno);
