@@ -5201,6 +5201,9 @@ void emit_node(FILE *out, Node *n){
                     char *esc=c_escape_literal(val);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
                             safe_cname(n->lhs),esc,safe_cname(n->lhs));
+                    /* sync IFS to environment */
+                    if(!strcmp(n->lhs,"IFS"))
+                        fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
                     free(esc);
                 }
             }
