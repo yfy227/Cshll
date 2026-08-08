@@ -3065,8 +3065,85 @@ char *translate_test_binary(const char *op,const char *a1,const char *a2){
 
 char *translate_cond(const char *cond){
     static char buf[4096];
+    buf[0]=0; /* clear static buffer from previous calls */
     const char *s=cond;
     while(isspace((unsigned char)*s)) s++;
+    /* [ ... ] — single bracket test, treat same as [[ ]] */
+    if(s[0]=='[' && s[1]!='[' && (isspace((unsigned char)s[1])||s[1]==0)){
+        /* Only handle simple [ expr ] — not [ ... ] && [ ... ] */
+        /* Check if there's a matching ] at the end */
+        int has_close=0;
+        { const char *q=s+1; int dq=0;
+          while(*q){
+            if(*q=='"'&&dq==0) dq=1;
+            else if(*q=='"'&&dq==1) dq=0;
+            else if(!dq && *q==']' && (*(q+1)==0||isspace((unsigned char)*(q+1)))) { has_close=1; break; }
+            q++;
+          }
+        }
+        if(has_close){
+        s++; while(isspace((unsigned char)*s)) s++;
+        char tmp2[2048]; strncpy(tmp2,s,sizeof(tmp2)-1); tmp2[sizeof(tmp2)-1]=0;
+        int rp2=(int)strlen(tmp2);
+        while(rp2>0 && isspace((unsigned char)tmp2[rp2-1])) tmp2[--rp2]=0;
+        if(rp2>=1 && tmp2[rp2-1]==']') tmp2[--rp2]=0;
+        /* Now process tmp2 same as [[ ]] body */
+        char *words[256]; int nw=0;
+        char *save; char *cp=strdup(tmp2);
+        char *tk=strtok_r(cp," \t",&save);
+        while(tk && nw<256){ words[nw++]=tk; tk=strtok_r(NULL," \t",&save); }
+        words[nw]=NULL;
+        int wi=0; int bi=0;
+        bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
+        while(wi<nw){
+            if(!strcmp(words[wi],"&&")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"&&"); wi++; }
+            else if(!strcmp(words[wi],"||")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"||"); wi++; }
+            else if(!strcmp(words[wi],"!")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"!"); wi++; }
+            else if(!strcmp(words[wi],"(")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"("); wi++; }
+            else if(!strcmp(words[wi],")")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,")"); wi++; }
+            else if(!strcmp(words[wi],"[")||!strcmp(words[wi],"]")){ wi++; /* skip brackets */ }
+            else {
+                if(wi+2<nw && (
+                    !strcmp(words[wi+1],"=")||!strcmp(words[wi+1],"==")||
+                    !strcmp(words[wi+1],"!=")||!strcmp(words[wi+1],"<=")||
+                    !strcmp(words[wi+1],">=")||!strcmp(words[wi+1],"<")||
+                    !strcmp(words[wi+1],">")||!strcmp(words[wi+1],"=~")||
+                    !strcmp(words[wi+1],"-eq")||!strcmp(words[wi+1],"-ne")||
+                    !strcmp(words[wi+1],"-lt")||!strcmp(words[wi+1],"-le")||
+                    !strcmp(words[wi+1],"-gt")||!strcmp(words[wi+1],"-ge")||
+                    !strcmp(words[wi+1],"-ef")||!strcmp(words[wi+1],"-nt")||
+                    !strcmp(words[wi+1],"-ot"))){
+                    char *r=translate_test_binary(words[wi+1],words[wi],words[wi+2]);
+                    bi+=snprintf(buf+bi,sizeof(buf)-bi,"%s",r);
+                    wi+=3;
+                } else if(wi+1<nw && (
+                    !strcmp(words[wi],"-z")||!strcmp(words[wi],"-n")||
+                    !strcmp(words[wi],"-f")||!strcmp(words[wi],"-d")||
+                    !strcmp(words[wi],"-e")||!strcmp(words[wi],"-r")||
+                    !strcmp(words[wi],"-w")||!strcmp(words[wi],"-x")||
+                    !strcmp(words[wi],"-s")||!strcmp(words[wi],"-h")||
+                    !strcmp(words[wi],"-L")||!strcmp(words[wi],"-p")||
+                    !strcmp(words[wi],"-S")||!strcmp(words[wi],"-b")||
+                    !strcmp(words[wi],"-c")||!strcmp(words[wi],"-t")||
+                    !strcmp(words[wi],"-v")||!strcmp(words[wi],"-O")||
+                    !strcmp(words[wi],"-G")||!strcmp(words[wi],"-N"))){
+                    char *r=translate_test_unary(words[wi],words[wi+1]);
+                    bi+=snprintf(buf+bi,sizeof(buf)-bi,"%s",r);
+                    wi+=2;
+                } else {
+                    char *r=translate_operand(words[wi]);
+                    bi+=snprintf(buf+bi,sizeof(buf)-bi,"%s",r);
+                    free(r);
+                    wi++;
+                }
+            }
+        }
+        bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
+        buf[bi]=0;
+        free(cp);
+        return buf;
+        } /* end if(has_close) */
+    } /* end if([ ) */
     /* [[ ... ]] — strip the brackets if present */
     if(starts_with(s,"[[")){
         s+=2; while(isspace((unsigned char)*s)) s++;
@@ -3093,6 +3170,7 @@ char *translate_cond(const char *cond){
             else if(!strcmp(words[wi],"!")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"!"); wi++; }
             else if(!strcmp(words[wi],"(")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"("); wi++; }
             else if(!strcmp(words[wi],")")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,")"); wi++; }
+            else if(!strcmp(words[wi],"[")||!strcmp(words[wi],"]")){ wi++; /* skip brackets */ }
             else {
                 /* look ahead for binary op */
                 if(wi+2<nw && (
@@ -3189,12 +3267,12 @@ char *translate_cond(const char *cond){
             }
         }
         bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
+        buf[bi]=0; /* ensure null termination */
         free(cp);
         return buf;
     }
     /* [ ... ] */
-    if(*s=='['){
-        s++;
+    if(*s=='['){        s++;
         while(isspace((unsigned char)*s)) s++;
         char tmp[2048]; strncpy(tmp,s,sizeof(tmp)-1); tmp[sizeof(tmp)-1]=0;
         int rp=(int)strlen(tmp)-1;
