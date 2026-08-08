@@ -4998,6 +4998,15 @@ void emit_node(FILE *out, Node *n){
             fprintf(out,"    __arr_%s[__al]=NULL; }\n",safe_cname(n->lhs));
             break;
         }
+        if(n->lineno==-4){
+            /* arithmetic compound assign: x = x op rhs */
+            add_var(n->lhs,V_INT);
+            const char *cn=safe_cname(n->lhs);
+            char *e=translate_arith(n->rhs);
+            fprintf(out,"    %s=(%s);\n",cn,e);
+            free(e);
+            break;
+        }
         if(n->lineno==-2){
             /* string append: var+=value */
             /* BUG-14 fix: if var is V_INT, use arithmetic += instead */
@@ -5429,7 +5438,10 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,"    }\n");
                 fprintf(out,"    }\n");
             } else if(do_split_var){
-                const char *vname = safe_cname(n->for_list[0]+1);
+                const char *listexpr = n->for_list[0]+1;
+                /* $@ / $* → __sh_join_args(__sh_argc, __sh_args) */
+                int is_args = (listexpr[0]=='@' || listexpr[0]=='*');
+                const char *vname = is_args ? "__sh_join_args(__sh_argc,__sh_args)" : safe_cname(listexpr);
                 fprintf(out,"    {\n");
                 fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
                 fprintf(out,"    char *__sv=__sbuf;\n");
@@ -5484,7 +5496,10 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,"%s%s",(i>0?", ":""),w);
                 free(w);
             }
-            fprintf(out,", NULL};\n");
+            if(n->for_len==0)
+                fprintf(out,"NULL};\n");
+            else
+                fprintf(out,", NULL};\n");
             fprintf(out,"    for (int __fi%d = 0; __fl%d[__fi%d]; __fi%d++) {\n",
                     n->lineno,n->lineno,n->lineno,n->lineno);
             VarKind vk=get_var_kind(n->for_var);
@@ -6346,7 +6361,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
               char cand[128]; strncpy(cand,kw,127); int cl=(int)strlen(cand);
               if(cl>=2&&cand[cl-2]=='('&&cand[cl-1]==')'){
                   cand[cl-2]=0; snprintf(fname,sizeof(fname),"%s",cand); is_func=1;
-              } else if(ntoks>=3&&!strcmp(toks[1],"(")&&!strcmp(toks[2],")")){
+              } else if(ntoks>=3&&!strcmp(toks[1],"(")&&!strcmp(toks[2],")")&&!strchr(kw,'=')){
                   strncpy(fname,kw,127); is_func=1;
               }
           }
@@ -6553,13 +6568,34 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         /* assignment */
         if(is_assignment(toks[0])){
             /* detect += -= *= /= %= */
-            int is_append=0;
+            int is_append=0; int append_op=0; /* 0=+, 1=-, 2=*, 3=/, 4=% */
             char *eq=strstr(toks[0],"+=");
-            if(eq){ is_append=1; *eq=0; eq++; } /* eq now points to = */
-            else { eq=strchr(toks[0],'='); *eq=0; }
+            if(eq){ is_append=1; append_op=0; *eq=0; eq++; }
+            else { eq=strstr(toks[0],"-="); if(eq){ is_append=1; append_op=1; *eq=0; eq++; } }
+            if(!eq){ eq=strstr(toks[0],"*="); if(eq){ is_append=1; append_op=2; *eq=0; eq++; } }
+            if(!eq){ eq=strstr(toks[0],"/="); if(eq){ is_append=1; append_op=3; *eq=0; eq++; } }
+            if(!eq){ eq=strstr(toks[0],"%="); if(eq){ is_append=1; append_op=4; *eq=0; eq++; } }
+            if(!eq){ eq=strchr(toks[0],'='); if(eq){ *eq=0; } }
             Node *nd=new_node(NODE_ASSIGN,lineno);
             nd->lhs=xstrdup(toks[0]);
             if(is_append){
+                /* For -=, *=, /=, %= — always arithmetic, not string append */
+                if(append_op > 0){
+                    /* Arithmetic compound assignment: x -= 3 → x = x - 3 */
+                    char rhs[4096]=""; strncpy(rhs,eq+1,4095);
+                    for(int i=1;i<ntoks;i++){
+                        if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
+                        if(rhs[0]) strncat(rhs," ",sizeof(rhs)-strlen(rhs)-1);
+                        strncat(rhs,toks[i],sizeof(rhs)-strlen(rhs)-1);
+                    }
+                    const char *ops[]={"","+","-","*","/","%"};
+                    char arith_expr[4200];
+                    snprintf(arith_expr,sizeof(arith_expr),"%s %s %s",toks[0],ops[append_op],rhs);
+                    add_var(nd->lhs,V_INT);
+                    nd->rhs=xstrdup(arith_expr);
+                    nd->lineno = -4; /* signal arithmetic assign from expr */
+                    parser_append(nd); return;
+                }
                 /* arr+=value — append to variable */
                 char rhs[4096]=""; strncpy(rhs,eq+1,4095);
                 /* collect remaining tokens */
