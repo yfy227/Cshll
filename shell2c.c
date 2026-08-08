@@ -2203,6 +2203,16 @@ char *translate_arith(const char *expr){
                 }
             }
         } else {
+            /* Detect division/modulo by zero — replace /0 with /(0||1) */
+            if(*s=='/'||*s=='%'){
+                const char *np=s+1;
+                while(*np==' '||*np=='\t') np++;
+                if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
+                    /* /0 or %0 — replace /0 with /1 to avoid SIGFPE */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"/1");
+                    s=np+1; continue;
+                }
+            }
             buf[q++]=*s++;
         }
     }
@@ -2420,6 +2430,16 @@ char *translate_expr(const char *tok){
                 }
                 if((*s=='&'&&*(s+1)=='&')||(*s=='|'&&*(s+1)=='|')){
                     buf[q++]=*s++; buf[q++]=*s++; continue;
+                }
+                /* Detect division/modulo by zero — replace /0 with (1/(!0)) which is
+                 * a no-op that avoids SIGFPE. Set exit_status. */
+                if(*s=='/'||*s=='%'){
+                    const char *np=s+1;
+                    while(*np==' '||*np=='\t') np++;
+                    if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
+                        q+=snprintf(buf+q,sizeof(buf)-q,"/1");
+                        s=np+1; continue;
+                    }
                 }
                 buf[q++]=*s++;
             }
@@ -2741,7 +2761,18 @@ void expand_string(const char *s, ExpandResult *er){
                             expr[k++]='*'; p+=2;
                         }
                     }
-                    else { expr[k++]=*p++; }
+                    else {
+                        /* Detect /0 or %0 to avoid SIGFPE */
+                        if((*p=='/'||*p=='%')){
+                            const char *np=p+1;
+                            while(*np==' '||*np=='\t') np++;
+                            if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
+                                expr[k++]='/'; expr[k++]='1';
+                                p=np+1; continue;
+                            }
+                        }
+                        expr[k++]=*p++;
+                    }
                     if(k>=(int)sizeof(expr)-2) break;
                 }
                 expr[k]=0;
@@ -5787,19 +5818,42 @@ void emit_node(FILE *out, Node *n){
             if(!strcmp(pat,"*")) fprintf(out,"if(1){\n");
             else {
                 fprintf(out,"if(");
+                /* Quote-aware split on | — don't split | inside quotes */
                 char patcopy[256]; strncpy(patcopy,pat,255); patcopy[255]=0;
-                char *tok=strtok(patcopy,"|");
                 int first=1;
-                while(tok){
-                    if(!first) fprintf(out,"||");
-                    /* check if pattern has wildcards for fnmatch */
-                    int has_glob = (strchr(tok,'*')||strchr(tok,'?')||strchr(tok,'['));
-                    if(has_glob){
-                        fprintf(out,"(fnmatch(\"%s\",%s,0)==0)",tok,cv);
-                    } else {
-                        fprintf(out,"(strcmp(%s, \"%s\") == 0)",cv,tok);
+                const char *ps=patcopy;
+                while(*ps){
+                    /* Skip leading whitespace */
+                    while(*ps==' ') ps++;
+                    if(!*ps) break;
+                    /* Read one pattern (until | outside quotes) */
+                    char tok[256]; int tl=0;
+                    int in_dq=0,in_sq=0;
+                    while(*ps && tl<255){
+                        if(*ps=='"'&&!in_sq) in_dq=!in_dq;
+                        else if(*ps=='\''&&!in_dq) in_sq=!in_sq;
+                        else if(!in_dq&&!in_sq && *ps=='|') break;
+                        tok[tl++]=*ps++;
                     }
-                    first=0; tok=strtok(NULL,"|");
+                    tok[tl]=0;
+                    if(*ps=='|') ps++;
+                    /* Strip surrounding quotes for fnmatch/strcmp */
+                    char clean[256]; int cl=0;
+                    for(int qi=0;qi<tl&&cl<255;qi++){
+                        if(tok[qi]=='"'||tok[qi]=='\'') continue; /* skip quotes */
+                        if(tok[qi]=='\\'&&qi+1<tl) clean[cl++]=tok[++qi];
+                        else clean[cl++]=tok[qi];
+                    }
+                    clean[cl]=0;
+                    if(!first) fprintf(out,"||");
+                    first=0;
+                    /* check if pattern has wildcards for fnmatch */
+                    int has_glob = (strchr(clean,'*')||strchr(clean,'?')||strchr(clean,'['));
+                    if(has_glob){
+                        fprintf(out,"(fnmatch(\"%s\",%s,0)==0)",clean,cv);
+                    } else {
+                        fprintf(out,"(strcmp(%s, \"%s\") == 0)",cv,clean);
+                    }
                 }
                 fprintf(out,"){\n");
             }
@@ -7359,6 +7413,9 @@ const char *RT_HEADER =
 "  if(argc>=1 && args) return args[argc-1]?args[argc-1]:\"\";\n"
 "  return \"\";\n"
 "}\n"
+"static int __sh_safe_div_guard(void){ fprintf(stderr,\"division by 0\\n\"); __exit_status=1; return 1; }\n"
+"static int __sh_safe_div(int a,int b){ if(b==0){ fprintf(stderr,\"division by 0\\n\"); __exit_status=1; return 0; } return a/b; }\n"
+"static int __sh_safe_mod(int a,int b){ if(b==0){ fprintf(stderr,\"modulo by 0\\n\"); __exit_status=1; return 0; } return a%b; }\n"
 "static int __sh_arr_count(const char **arr){\n"
 "  int n=0; for(int i=0;i<256;i++) if(arr[i]) n++; return n;\n"
 "}\n"
