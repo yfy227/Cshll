@@ -2212,7 +2212,13 @@ char *translate_expr(const char *tok){
     if(strncmp(tok,"$((",3)==0){
         char buf[4096]; int q=0;
         const char *s=tok+3;
-        while(*s && !(*s==')' && *(s+1)==')')){
+        int paren_depth=0; /* track nested parens to not stop at inner ) */
+        while(*s){
+            if(*s=='(') paren_depth++;
+            if(*s==')'){
+                if(paren_depth==0 && *(s+1)==')') break; /* end of $(( )) */
+                paren_depth--;
+            }
             if(*s=='$'){
                 s++;
                 char nm[128]; int j=0;
@@ -4740,6 +4746,16 @@ void emit_node(FILE *out, Node *n){
         }
         if(n->lineno==-2){
             /* string append: var+=value */
+            /* BUG-14 fix: if var is V_INT, use arithmetic += instead */
+            VarKind vk=get_var_kind(n->lhs);
+            if(vk==V_INT){
+                add_var(n->lhs,V_INT);
+                const char *cn=safe_cname(n->lhs);
+                char *e=translate_arith(n->rhs);
+                fprintf(out,"    %s+=(%s);\n",cn,e);
+                free(e);
+                break;
+            }
             add_var(n->lhs,V_STR);
             const char *cn=safe_cname(n->lhs);
             if(strchr(n->rhs,'$')){
@@ -4753,9 +4769,20 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,",sizeof(%s)-strlen(%s)-1);\n",cn,cn);
                 expand_free(&er);
             } else {
-                char *esc=c_escape_literal(n->rhs);
+                /* BUG-06 fix: strip surrounding quotes from rhs before escaping */
+                const char *val=n->rhs;
+                int vlen=(int)strlen(val);
+                char *inner_str=NULL;
+                if(vlen>=2 && ((val[0]=='"'&&val[vlen-1]=='"') || (val[0]=='\''&&val[vlen-1]=='\''))){
+                    inner_str=malloc(vlen-1);
+                    memcpy(inner_str,val+1,vlen-2);
+                    inner_str[vlen-2]=0;
+                    val=inner_str;
+                }
+                char *esc=c_escape_literal(val);
                 fprintf(out,"    strncat(%s,\"%s\",sizeof(%s)-strlen(%s)-1);\n",cn,esc,cn,cn);
                 free(esc);
+                free(inner_str);
             }
             break;
         }
@@ -6909,19 +6936,28 @@ const char *RT_HEADER =
 "}\n"
 "static void __sh_printf(const char *fmt,...){\n"
 "  /* Shell-style printf: all args are strings, %d/%i convert via atoi */\n"
+"  /* Supports format modifiers: %05d, %-10s, %.2f, etc. */\n"
 "  va_list ap; va_start(ap,fmt);\n"
 "  const char *p=fmt;\n"
 "  while(*p){\n"
 "    if(*p=='%' && *(p+1)){\n"
 "      p++;\n"
-"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); printf(\"%d\",s?atoi(s):0); }\n"
-"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); fputs(s?s:\"(null)\",stdout); }\n"
+"      /* collect format modifiers: flags, width, .precision */\n"
+"      char mods[32]; int mi=0;\n"
+"      while(*p && (*p=='-'||*p=='+'||*p==' '||*p=='#'||*p=='0'||\n"
+"             (*p>='1'&&*p<='9')||*p=='.'||*p=='*') && mi<30){\n"
+"        mods[mi++]=*p++;\n"
+"      }\n"
+"      mods[mi]=0;\n"
+"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sd\",mods); printf(f,s?atoi(s):0); }\n"
+"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%ss\",mods); printf(f,s?s:\"\"); }\n"
 "      else if(*p=='c'){ const char *s=va_arg(ap,const char*); putchar(s?s[0]:' '); }\n"
-"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); printf(\"%x\",s?atoi(s):0); }\n"
-"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); printf(\"%X\",s?atoi(s):0); }\n"
-"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); printf(\"%o\",s?atoi(s):0); }\n"
+"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sx\",mods); printf(f,s?atoi(s):0); }\n"
+"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sX\",mods); printf(f,s?atoi(s):0); }\n"
+"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%so\",mods); printf(f,s?atoi(s):0); }\n"
+"      else if(*p=='f'||*p=='e'||*p=='g'||*p=='E'||*p=='G'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sf\",mods); printf(f,s?atof(s):0.0); }\n"
 "      else if(*p=='%'){ putchar('%'); }\n"
-"      else { putchar('%'); putchar(*p); }\n"
+"      else { putchar('%'); fputs(mods,stdout); putchar(*p); }\n"
 "    } else { putchar(*p); }\n"
 "    p++;\n"
 "  }\n"
@@ -6935,14 +6971,21 @@ const char *RT_HEADER =
 "  while(*p && bi<bufsz-1){\n"
 "    if(*p=='%' && *(p+1)){\n"
 "      p++;\n"
-"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%d\",s?atoi(s):0); }\n"
-"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%s\",s?s:\"\"); }\n"
+"      char mods[32]; int mi=0;\n"
+"      while(*p && (*p=='-'||*p=='+'||*p==' '||*p=='#'||*p=='0'||\n"
+"             (*p>='1'&&*p<='9')||*p=='.'||*p=='*') && mi<30){\n"
+"        mods[mi++]=*p++;\n"
+"      }\n"
+"      mods[mi]=0;\n"
+"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sd\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?atoi(s):0); }\n"
+"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%ss\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?s:\"\"); }\n"
 "      else if(*p=='c'){ const char *s=va_arg(ap,const char*); buf[bi++]=s?s[0]:' '; }\n"
-"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%x\",s?atoi(s):0); }\n"
-"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%X\",s?atoi(s):0); }\n"
-"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%o\",s?atoi(s):0); }\n"
+"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sx\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?atoi(s):0); }\n"
+"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sX\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?atoi(s):0); }\n"
+"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%so\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?atoi(s):0); }\n"
+"      else if(*p=='f'||*p=='e'||*p=='g'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sf\",mods); bi+=snprintf(buf+bi,bufsz-bi,f,s?atof(s):0.0); }\n"
 "      else if(*p=='%'){ buf[bi++]='%'; }\n"
-"      else { buf[bi++]='%'; buf[bi++]=*p; }\n"
+"      else { buf[bi++]='%'; for(int j=0;j<mi;j++) buf[bi++]=mods[j]; buf[bi++]=*p; }\n"
 "    } else { buf[bi++]=*p; }\n"
 "    p++;\n"
 "  }\n"
@@ -7310,7 +7353,36 @@ const char *RT_HEADER =
 "static void __attribute__((unused)) __b_dirs(void){ char cwd[4096]; getcwd(cwd,sizeof(cwd)); printf(\"%s\\n\",cwd); }\n"
 "static void __attribute__((unused)) __b_seq(int s,int st,int e){ if(st>0) for(int i=s;i<=e;i+=st) printf(\"%d\\n\",i); else for(int i=s;i>=e;i+=st) printf(\"%d\\n\",i); }\n"
 "static void __attribute__((unused)) __b_yes(const char *msg){ while(1){ printf(\"%s\\n\",msg?msg:\"y\"); fflush(stdout); } }\n"
-"static void __attribute__((unused)) __b_source(const char *f){ if(!f||!*f) return; FILE *fp=fopen(f,\"r\"); if(!fp) return; char line[4096]; while(fgets(line,sizeof(line),fp)){ char cmd[4200]; snprintf(cmd,sizeof(cmd),\"%s\",line); /* remove trailing newline */ int l=(int)strlen(cmd); if(l>0&&cmd[l-1]=='\\n') cmd[l-1]=0; if(cmd[0]&&cmd[0]!='#') system(cmd); } fclose(fp); }\n"
+"static void __attribute__((unused)) __b_source(const char *f){\n"
+"  if(!f||!*f) return;\n"
+"  FILE *fp=fopen(f,\"r\");\n"
+"  if(!fp) return;\n"
+"  char line[8192];\n"
+"  while(fgets(line,sizeof(line),fp)){\n"
+"    int l=(int)strlen(line);\n"
+"    if(l>0&&line[l-1]=='\\n') line[l-1]=0;\n"
+"    if(!line[0]||line[0]=='#') continue;\n"
+"    /* try to handle VAR=value assignments inline (no system call) */\n"
+"    char *eq=strchr(line,'=');\n"
+"    if(eq && eq>line){\n"
+"      /* check it's a simple assignment (no spaces before =) */\n"
+"      char *sp=strchr(line,' ');\n"
+"      if(!sp || sp>eq){\n"
+"        *eq=0; char *val=eq+1;\n"
+"        /* strip surrounding quotes from val */\n"
+"        int vl=(int)strlen(val);\n"
+"        if(vl>=2 && ((val[0]=='\"'&&val[vl-1]=='\"')||(val[0]=='\\''&&val[vl-1]=='\\''))){\n"
+"          val[vl-1]=0; val++;\n"
+"        }\n"
+"        setenv(line,val,1);\n"
+"        continue;\n"
+"      }\n"
+"    }\n"
+"    /* for non-assignment lines, fall back to system */\n"
+"    system(line);\n"
+"  }\n"
+"  fclose(fp);\n"
+"}\n"
 "static void __attribute__((unused)) __b_eval(const char **a){ char cmd[8192]=\"\"; for(const char **p=a;*p;p++){ if(*cmd) strncat(cmd,\" \",sizeof(cmd)-strlen(cmd)-1); strncat(cmd,*p,sizeof(cmd)-strlen(cmd)-1); } system(cmd); }\n"
 "static void __attribute__((unused)) __b_nohup(const char *first,...){ va_list ap; va_start(ap,first); char cmd[8192]; snprintf(cmd,sizeof(cmd),\"nohup %s\",first); const char *p; while((p=va_arg(ap,const char*))!=NULL){ strncat(cmd,\" \",sizeof(cmd)-strlen(cmd)-1); strncat(cmd,p,sizeof(cmd)-strlen(cmd)-1); } va_end(ap); strncat(cmd,\" >/dev/null 2>&1 &\",sizeof(cmd)-strlen(cmd)-1); system(cmd); }\n"
 "static void __attribute__((unused)) __b_time(const char *cmd){ clock_t t0=clock(); system(cmd); clock_t t1=clock(); fprintf(stderr,\"real %.3fs\\n\",(double)(t1-t0)/CLOCKS_PER_SEC); }\n"
