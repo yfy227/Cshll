@@ -6071,8 +6071,18 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                     for(int i=cs;i<ntoks;i++) if(!strcmp(toks[i],";;")){dsi=i;break;}
                     int ce=(dsi>=0)?dsi:ntoks;
                     if(ce>cs){
-                        Node *bc=make_cmd(toks+cs,ce-cs,lineno);
-                        parser_append(bc);
+                        /* Dispatch each ; separated sub-segment in case body */
+                        int __cs2=cs;
+                        while(__cs2<ce){
+                            int __ce2=ce; int __d2=0;
+                            for(int i=__cs2;i<ce;i++){
+                                if(!strcmp(toks[i],"[")||!strcmp(toks[i],"(")||!strcmp(toks[i],"[[")) __d2++;
+                                else if(!strcmp(toks[i],"]")||!strcmp(toks[i],")")||!strcmp(toks[i],"]]")) __d2--;
+                                else if(!__d2 && !strcmp(toks[i],";")){ __ce2=i; break; }
+                            }
+                            if(__ce2>__cs2) dispatch_segment(toks+__cs2, __ce2-__cs2, lineno);
+                            __cs2=__ce2+1;
+                        }
                     }
                     if(dsi>=0) parse_insert=NULL;
                 }
