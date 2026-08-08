@@ -4937,12 +4937,12 @@ void emit_node(FILE *out, Node *n){
                     if(is_num_key && akey[0])
                         fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
                     else
-                        fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                        fprintf(out,"strdup(__sh_fmt(\"%s\"",er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                     if(is_num_key && akey[0])
-                        fprintf(out,");\n");
-                    else
                         fprintf(out,"));\n");
+                    else
+                        fprintf(out,")));\n");
                     expand_free(&er);
                 } else {
                     if(is_num_key && akey[0])
@@ -4952,10 +4952,10 @@ void emit_node(FILE *out, Node *n){
                 }
             } else if(strchr(aval,'$')){
                 ExpandResult er; expand_string(aval,&er);
-                fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                fprintf(out,"strdup(__sh_fmt(\"%s\"",er.fmt);
                 for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                 if(is_num_key && akey[0])
-                    fprintf(out,");\n");
+                    fprintf(out,"));\n");
                 else
                     fprintf(out,"));\n");
                 expand_free(&er);
@@ -5733,7 +5733,24 @@ void emit_node(FILE *out, Node *n){
     }
 
     case NODE_TRAP:
-        fprintf(out,"    __b_trap(\"%s\",%d);\n",n->trap_action?n->trap_action:"",n->trap_sig);
+        {
+            const char *action=n->trap_action?n->trap_action:"";
+            int sig=n->trap_sig;
+            /* Check if action is a bare user function name (no quotes, spaces, or special chars) */
+            int is_simple_name=1;
+            for(const char *p=action;*p;p++){
+                if(!isalnum((unsigned char)*p)&&*p!='_'){ is_simple_name=0; break; }
+            }
+            if(is_simple_name && is_user_func(action) && sig==0){
+                /* EXIT trap with user function: register wrapper */
+                fprintf(out,"    atexit(__b_trap_exit_handler); __sh_trap_actions[0]=\"%s\"; __sh_trap_is_func[0]=1; __sh_trap_func[0]=(void(*)(int,char**))%s;\n",action,safe_cname(action));
+            } else if(is_simple_name && is_user_func(action) && sig>0){
+                /* Signal trap with user function */
+                fprintf(out,"    __sh_trap_actions[%d]=\"%s\"; __sh_trap_is_func[%d]=1; __sh_trap_func[%d]=(void(*)(int,char**))%s; signal(%d,__b_trap_sighandler);\n",sig,action,sig,sig,safe_cname(action),sig);
+            } else {
+                fprintf(out,"    __b_trap(\"%s\",%d);\n",action,sig);
+            }
+        }
         break;
 
     default: break;
@@ -6850,8 +6867,28 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         /* { ...; } group */
         if(ntoks>=1 && !strcmp(toks[0],"{")){
             Node *nd=new_node(NODE_GROUP,lineno);
-            nd->left=make_cmd(toks+1,ntoks-1,lineno);
-            parser_append(nd); return;
+            Node **_pi=parse_insert;
+            parser_append(nd);
+            BlkFrame fr={BLK_GROUP,nd,&nd->left,_pi};
+            parser_push(fr);
+            parse_insert=&nd->left;
+            /* Dispatch remaining tokens on same line as body */
+            if(ntoks>1){
+                /* Split on ; and dispatch each sub-segment */
+                int __cs=1;
+                while(__cs<ntoks){
+                    int __ce=ntoks; int __d=0;
+                    for(int i=__cs;i<ntoks;i++){
+                        if(!strcmp(toks[i],"[")||!strcmp(toks[i],"(")||!strcmp(toks[i],"[[")) __d++;
+                        else if(!strcmp(toks[i],"]")||!strcmp(toks[i],")")||!strcmp(toks[i],"]]")) __d--;
+                        else if(!__d && !strcmp(toks[i],";")){ __ce=i; break; }
+                        else if(!strcmp(toks[i],"}")){ __ce=i; break; }
+                    }
+                    if(__ce>__cs) dispatch_segment(toks+__cs, __ce-__cs, lineno);
+                    __cs=__ce+1;
+                }
+            }
+            return;
         }
 
         /* background */
@@ -7762,7 +7799,9 @@ const char *RT_HEADER =
 "static void __attribute__((unused)) __b_bg(void){ /* stub */ }\n"
 "static void __attribute__((unused)) __b_fg(void){ /* stub */ }\n"
 "static const char *__sh_trap_actions[32];\n"
-"static void __b_trap_run(int sig){ if(sig>=0&&sig<32&&__sh_trap_actions[sig]&&__sh_trap_actions[sig][0]) system(__sh_trap_actions[sig]); }\n"
+"static int __sh_trap_is_func[32]={0};\n"
+"static void (*__sh_trap_func[32])(int,char**)={NULL};\n"
+"static void __b_trap_run(int sig){ if(sig>=0&&sig<32&&__sh_trap_actions[sig]&&__sh_trap_actions[sig][0]){ if(__sh_trap_is_func[sig]&&__sh_trap_func[sig]){ __sh_trap_func[sig](0,NULL); } else { system(__sh_trap_actions[sig]); } } }\n"
 "static void __b_trap_exit_handler(void){ __b_trap_run(0); }\n"
 "static void __b_trap_sighandler(int sig){ __b_trap_run(sig); }\n"
 "static void __attribute__((unused)) __b_trap(const char *action,int sig){ if(!action||action[0]==0) return; if(sig<0||sig>=32) return; __sh_trap_actions[sig]=action; if(sig==0) atexit(__b_trap_exit_handler); else signal(sig,__b_trap_sighandler); }\n"
