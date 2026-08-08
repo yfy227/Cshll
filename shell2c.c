@@ -1479,7 +1479,12 @@ int tokenize(const char *line, char **toks, int maxtoks){
                 /* Skip $(...) and $((...)) inside double-quoted strings */
                 if(*p=='$'&&*(p+1)=='('){
                     p+=2; int d=1;
-                    while(*p&&d){ if(*p=='(')d++; else if(*p==')')d--; p++; }
+                    while(*p&&d){
+                        if(*p=='"'){ p++; while(*p&&*p!='"')p++; if(*p)p++; continue; }
+                        if(*p=='\''){ p++; while(*p&&*p!='\'')p++; if(*p)p++; continue; }
+                        if(*p=='(')d++; else if(*p==')')d--;
+                        p++;
+                    }
                     continue;
                 }
                 p++;
@@ -3610,6 +3615,18 @@ char *emit_word(FILE *out, const char *word){
                     } else {
                         unescaped[ui++] = *p++;
                     }
+                } else if(*p == '$' && *(p+1)=='('){
+                    /* $(...) inside double quotes — copy intact, skip inner quotes */
+                    unescaped[ui++] = *p++;
+                    unescaped[ui++] = *p++;
+                    int d=1;
+                    while(*p && d && ui<(int)sizeof(unescaped)-1){
+                        if(*p=='"'){ unescaped[ui++]=*p++; while(*p&&*p!='"'&&ui<(int)sizeof(unescaped)-1) unescaped[ui++]=*p++; if(*p=='"') unescaped[ui++]=*p++; continue; }
+                        if(*p=='\''){ unescaped[ui++]=*p++; while(*p&&*p!='\''&&ui<(int)sizeof(unescaped)-1) unescaped[ui++]=*p++; if(*p=='\'') unescaped[ui++]=*p++; continue; }
+                        if(*p=='(')d++; else if(*p==')')d--;
+                        unescaped[ui++]=*p++;
+                    }
+                    has_dollar = 1;
                 } else if(*p == '$'){
                     has_dollar = 1;
                     unescaped[ui++] = *p++;
