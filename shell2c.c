@@ -1782,7 +1782,11 @@ char *translate_brace_expansion(const char *body){
         while(*p && *p!='}') name[j++]=*p++;
         name[j]=0;
         char r[512];
-        snprintf(r,sizeof(r),"__sh_indirect(\"%s\")",name);
+        if(!strcmp(name,"#")){
+            /* ${!#} = last positional parameter */
+            snprintf(r,sizeof(r),"__sh_indirect_args(__sh_argc,__sh_args)");
+        } else
+            snprintf(r,sizeof(r),"__sh_indirect(\"%s\")",name);
         return xstrdup(r);
     }
     /* read name up to operator */
@@ -7260,6 +7264,11 @@ const char *RT_HEADER =
 "  buf[0]=0;\n"
 "  for(int i=0;i<argc;i++){ if(i>0) strncat(buf,\" \",8192-strlen(buf)-1); strncat(buf,args[i]?args[i]:\"\",8192-strlen(buf)-1); }\n"
 "  return buf;\n"
+"}\n"
+"/* ${!#} — return last positional arg */\n"
+"static const char *__sh_indirect_args(int argc, char **args){\n"
+"  if(argc>=1 && args) return args[argc-1]?args[argc-1]:\"\";\n"
+"  return \"\";\n"
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
 "  int n=0; for(int i=0;i<256;i++) if(arr[i]) n++; return n;\n"
