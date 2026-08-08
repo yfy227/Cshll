@@ -1787,7 +1787,18 @@ char *translate_brace_expansion(const char *body){
             }
         } else {
             if(*p=='}') p++;
-            snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
+            /* BUG-10 fix: for non-numeric indices (associative arrays),
+             * use __sh_assoc_get helper function */
+            int is_numeric=1;
+            for(const char *q=idx;*q;q++){
+                if(!isdigit((unsigned char)*q) && *q!='+' && *q!='-' && *q!='$' && *q!='('){ is_numeric=0; break; }
+            }
+            if(is_numeric && idx[0]){
+                snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
+            } else {
+                /* String key — use associative lookup */
+                snprintf(r,sizeof(r),"__sh_assoc_get(__arr_%s,\"%s\")",safe_cname(name),idx);
+            }
         }
         return xstrdup(r);
     }
@@ -3586,6 +3597,28 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     }
     if(!strcmp(cmd,"echo")){ emit_echo(out,argv,ac); return; }
     if(!strcmp(cmd,"printf")){
+        /* BUG-16 fix: printf -v var format args → __sh_sprintf into var */
+        if(ac>=3 && !strcmp(argv[1],"-v")){
+            const char *vname=argv[2];
+            if(!is_known_var(vname)) add_var(vname,V_STR);
+            const char *fmt=argv[3];
+            int flen=(int)strlen(fmt);
+            int is_literal=(flen>=2 && fmt[0]=='"' && fmt[flen-1]=='"');
+            if(is_literal && !strchr(fmt,'$')){
+                fprintf(out,"    __sh_sprintf(%s,sizeof(%s),%s",safe_cname(vname),safe_cname(vname),fmt);
+            } else {
+                char *w=emit_word(out,argv[3]);
+                fprintf(out,"    { const char *__pf=%s; __sh_sprintf(%s,sizeof(%s),__pf",w,safe_cname(vname),safe_cname(vname));
+                free(w);
+            }
+            for(int i=4;i<ac;i++){ char *a=emit_word(out,argv[i]); fprintf(out,",%s",a); free(a); }
+            if(is_literal && !strchr(fmt,'$')){
+                fprintf(out,");\n");
+            } else {
+                fprintf(out,"); }\n");
+            }
+            return;
+        }
         if(ac>=2){
             /* printf format string: don't escape % like echo does */
             const char *fmt = argv[1];
@@ -4034,6 +4067,38 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     if(!strcmp(cmd,"unset")){
         for(int i=1;i<ac;i++){
             fprintf(out,"    unsetenv(\"%s\"); %s[0]='\\0';\n",argv[i],safe_cname(argv[i]));
+        }
+        return;
+    }
+    if(!strcmp(cmd,"let")){
+        /* BUG-11 fix: let x=5+3 → evaluate arithmetic and assign */
+        for(int i=1;i<ac;i++){
+            const char *expr=argv[i];
+            /* find = (not ==) */
+            const char *eq=strchr(expr,'=');
+            if(eq && eq[1]!='='){
+                char vn[128]; int vl=(int)(eq-expr);
+                if(vl>=(int)sizeof(vn)) vl=(int)sizeof(vn)-1;
+                memcpy(vn,expr,vl); vn[vl]=0;
+                if(!is_known_var(vn)) add_var(vn,V_INT);
+                /* use translate_arith for the expression part */
+                char rhs_expr[256]; int rl=(int)strlen(eq+1);
+                if(rl>=(int)sizeof(rhs_expr)) rl=(int)sizeof(rhs_expr)-1;
+                memcpy(rhs_expr,eq+1,rl); rhs_expr[rl]=0;
+                char *e=translate_arith(rhs_expr);
+                VarKind vk=get_var_kind(vn);
+                if(vk==V_STR){
+                    fprintf(out,"    snprintf(%s,sizeof(%s),\"%%d\",(%s));\n",safe_cname(vn),safe_cname(vn),e);
+                } else {
+                    fprintf(out,"    %s=(%s);\n",safe_cname(vn),e);
+                }
+                free(e);
+            } else {
+                /* let "x++" or "x>5" — evaluate as boolean */
+                char *e=translate_arith(expr);
+                fprintf(out,"    __exit_status=((%s)!=0);\n",e);
+                free(e);
+            }
         }
         return;
     }
@@ -4572,17 +4637,17 @@ void emit_node(FILE *out, Node *n){
                 strncpy(akey,n->rhs,sizeof(akey)-1); akey[sizeof(akey)-1]=0;
                 aval[0]=0;
             }
-            /* find next free index in array */
-            fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
-            /* if key is numeric, use as index; otherwise just append */
+            /* if key is numeric, use as index; otherwise use assoc set */
             int is_num_key=1;
             for(const char *q=akey;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num_key=0; break; } }
             if(is_num_key && akey[0]){
+                fprintf(out,"    int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
                 fprintf(out,"    int __idx=atoi(\"%s\");\n",akey);
                 fprintf(out,"    if(__idx>=64) __idx=63;\n");
                 fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
             } else {
-                fprintf(out,"    __arr_%s[__ai++]=",safe_cname(n->lhs));
+                /* BUG-10 fix: use __sh_assoc_set for string keys */
+                fprintf(out,"    __sh_assoc_set(__arr_%s,\"%s\",",safe_cname(n->lhs),akey);
             }
             /* emit value */
             if(aval[0]=='"'){
@@ -4592,21 +4657,36 @@ void emit_node(FILE *out, Node *n){
                 inner[il]=0;
                 if(strchr(inner,'$')){
                     ExpandResult er; expand_string(inner,&er);
-                    fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                    if(is_num_key && akey[0])
+                        fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
+                    else
+                        fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
-                    fprintf(out,");\n");
+                    if(is_num_key && akey[0])
+                        fprintf(out,");\n");
+                    else
+                        fprintf(out,"));\n");
                     expand_free(&er);
                 } else {
-                    fprintf(out,"strdup(\"%s\");\n",inner);
+                    if(is_num_key && akey[0])
+                        fprintf(out,"strdup(\"%s\");\n",inner);
+                    else
+                        fprintf(out,"strdup(\"%s\"));\n",inner);
                 }
             } else if(strchr(aval,'$')){
                 ExpandResult er; expand_string(aval,&er);
                 fprintf(out,"__sh_fmt(\"%s\"",er.fmt);
                 for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
-                fprintf(out,");\n");
+                if(is_num_key && akey[0])
+                    fprintf(out,");\n");
+                else
+                    fprintf(out,"));\n");
                 expand_free(&er);
             } else {
-                fprintf(out,"strdup(\"%s\");\n",aval);
+                if(is_num_key && akey[0])
+                    fprintf(out,"strdup(\"%s\");\n",aval);
+                else
+                    fprintf(out,"strdup(\"%s\"));\n",aval);
             }
             fprintf(out,"    }\n");
             break;
@@ -4716,8 +4796,10 @@ void emit_node(FILE *out, Node *n){
                     fprintf(out,");\n");
                     expand_free(&er);
                     fprintf(out,"    char *__sp=__tw_%d;\n",id);
-                    fprintf(out,"    while(*__sp){ while(*__sp==' '||*__sp=='\\t')__sp++; if(!*__sp)break;\n");
-                    fprintf(out,"    char *__se=__sp; while(*__se&&*__se!=' '&&*__se!='\\t')__se++;\n");
+                    /* BUG-12 fix: use IFS for word splitting */
+                    fprintf(out,"    const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \\t\\n\";\n");
+                    fprintf(out,"    while(*__sp){ while(*__sp&&strchr(__ifs,*__sp))__sp++; if(!*__sp)break;\n");
+                    fprintf(out,"    char *__se=__sp; while(*__se&&!strchr(__ifs,*__se))__se++;\n");
                     fprintf(out,"    char __sc=*__se; *__se=0; __arr_%s[__an%d++]=strdup(__sp); *__se=__sc; __sp=__se; if(*__sp)__sp++; }\n",safe_cname(n->lhs),n->lineno);
                     fprintf(out,"    }\n");
                 } else if(strchr(items[i],'$')){
@@ -4731,7 +4813,17 @@ void emit_node(FILE *out, Node *n){
                     fprintf(out,"    __arr_%s[__an%d++]=strdup(__tw_%d);\n",safe_cname(n->lhs),n->lineno,id);
                 } else {
                     char *esc = c_escape_literal(items[i]);
-                    fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,esc);
+                    /* BUG-19 fix: detect glob patterns and expand at runtime */
+                    int has_glob=0;
+                    for(const char *g=items[i];*g;g++){
+                        if(*g=='*'||*g=='?'||*g=='['){ has_glob=1; break; }
+                    }
+                    if(has_glob){
+                        /* emit glob expansion */
+                        fprintf(out,"    { glob_t __g; if(glob(\"%s\",0,NULL,&__g)==0){ for(unsigned __gi=0;__gi<__g.gl_pathc&&__an%d<63;__gi++) __arr_%s[__an%d++]=strdup(__g.gl_pathv[__gi]); } globfree(&__g); }\n",esc,n->lineno,safe_cname(n->lhs),n->lineno);
+                    } else {
+                        fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,esc);
+                    }
                     free(esc);
                 }
             }
@@ -4792,6 +4884,9 @@ void emit_node(FILE *out, Node *n){
                     char *esc=c_escape_literal(tmp);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
                             safe_cname(n->lhs),esc,safe_cname(n->lhs));
+                    /* BUG-12 fix: sync IFS and other special vars to environment */
+                    if(!strcmp(n->lhs,"IFS"))
+                        fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
                     free(esc);
                 } else {
                     char *esc=c_escape_literal(val);
@@ -4965,6 +5060,9 @@ void emit_node(FILE *out, Node *n){
             fprintf(out,"    exit(0); } else { __sh_last_bg_pid=(int)__bg; }\n");
             fprintf(out,"    }\n");
         }
+        /* BUG-15 fix: set -e — check __exit_status after each command */
+        if(!is_bg)
+            fprintf(out,"    if(__sh_set_e && __exit_status!=0) exit(__exit_status);\n");
         break;
     }
 
@@ -5035,11 +5133,13 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,"    {\n");
                 fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
                 fprintf(out,"    char *__sv=__sbuf;\n");
+                /* BUG-12 fix: use IFS for word splitting */
+                fprintf(out,"    const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \\t\\n\";\n");
                 fprintf(out,"    while(*__sv){\n");
-                fprintf(out,"        while(*__sv==' '||*__sv=='\\t'||*__sv=='\\n')__sv++;\n");
+                fprintf(out,"        while(*__sv&&strchr(__ifs,*__sv))__sv++;\n");
                 fprintf(out,"        if(!*__sv)break;\n");
                 fprintf(out,"        char *__se=__sv;\n");
-                fprintf(out,"        while(*__se&&*__se!=' '&&*__se!='\\t'&&*__se!='\\n')__se++;\n");
+                fprintf(out,"        while(*__se&&!strchr(__ifs,*__se))__se++;\n");
                 fprintf(out,"        char __sc=*__se; *__se=0;\n");
                 VarKind vk=get_var_kind(n->for_var);
                 if(vk==V_INT)
@@ -5316,7 +5416,7 @@ void emit_functions(FILE *out, Node *n){
             max_arg=3;
         }
         for(int i=1;i<=max_arg;i++)
-            fprintf(out,"    char __sh_arg%d[1024]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],1023);\n",
+            fprintf(out,"    char __sh_arg%d[4096]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],4095);\n",
                     i,i,i,i);
         /* Scan for local variables and save them */
         char locals[32][128]; int nloc=0;
@@ -5979,8 +6079,30 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         }
         if(!strcmp(kw,"trap")){
             Node *nd=new_node(NODE_TRAP,lineno);
-            if(ntoks>=3){ nd->trap_action=xstrdup(toks[1]); nd->trap_sig=atoi(toks[2]); }
-            else if(ntoks>=2){ nd->trap_action=xstrdup(toks[1]); nd->trap_sig=0; }
+            if(ntoks>=3){
+                /* Strip surrounding quotes from trap action */
+                char *act=toks[1]; int alen=(int)strlen(act);
+                if(alen>=2 && ((act[0]=='\''&&act[alen-1]=='\'') || (act[0]=='"'&&act[alen-1]=='"'))){
+                    char *tmp=malloc(alen-1); memcpy(tmp,act+1,alen-2); tmp[alen-2]=0;
+                    nd->trap_action=tmp;
+                } else nd->trap_action=xstrdup(toks[1]);
+                /* Map signal names to numbers */
+                if(!strcmp(toks[2],"EXIT")||!strcmp(toks[2],"0")) nd->trap_sig=0;
+                else if(!strcmp(toks[2],"INT")||!strcmp(toks[2],"SIGINT")) nd->trap_sig=2;
+                else if(!strcmp(toks[2],"TERM")||!strcmp(toks[2],"SIGTERM")) nd->trap_sig=15;
+                else if(!strcmp(toks[2],"HUP")||!strcmp(toks[2],"SIGHUP")) nd->trap_sig=1;
+                else if(!strcmp(toks[2],"USR1")||!strcmp(toks[2],"SIGUSR1")) nd->trap_sig=10;
+                else if(!strcmp(toks[2],"USR2")||!strcmp(toks[2],"SIGUSR2")) nd->trap_sig=12;
+                else nd->trap_sig=atoi(toks[2]);
+            }
+            else if(ntoks>=2){
+                char *act=toks[1]; int alen=(int)strlen(act);
+                if(alen>=2 && ((act[0]=='\''&&act[alen-1]=='\'') || (act[0]=='"'&&act[alen-1]=='"'))){
+                    char *tmp=malloc(alen-1); memcpy(tmp,act+1,alen-2); tmp[alen-2]=0;
+                    nd->trap_action=tmp;
+                } else nd->trap_action=xstrdup(toks[1]);
+                nd->trap_sig=0;
+            }
             parser_append(nd); return;
         }
 
@@ -6410,7 +6532,8 @@ Node *parse_script(FILE *f){
                                     trimmed=h;
                                 } else trimmed=hdline;
                                 if(strcmp(trimmed,delim)==0) break;
-                                strncat(hdtext,hdline,sizeof(hdtext)-strlen(hdtext)-2);
+                                /* BUG-09 fix: use trimmed (tab-stripped) line when <<- is used */
+                                strncat(hdtext,trimmed,sizeof(hdtext)-strlen(hdtext)-2);
                                 strcat(hdtext,"\n");
                             }
                             heredoc_store(hdtext, !quoted);
@@ -6522,6 +6645,17 @@ const char *RT_HEADER =
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
 "  int n=0; while(arr[n]) n++; return n;\n"
+"}\n"
+"/* BUG-10 fix: associative array helpers — store as key,value,key,value,... */\n"
+"static const char *__sh_assoc_get(const char **arr,const char *key){\n"
+"  for(int i=0;arr[i]&&arr[i+1];i+=2){ if(strcmp(arr[i],key)==0) return arr[i+1]; }\n"
+"  return \"\";\n"
+"}\n"
+"static void __sh_assoc_set(const char **arr,const char *key,const char *val){\n"
+"  for(int i=0;i<62;i+=2){\n"
+"    if(!arr[i]){ arr[i]=strdup(key); arr[i+1]=strdup(val); return; }\n"
+"    if(arr[i]&&strcmp(arr[i],key)==0){ free((void*)arr[i+1]); arr[i+1]=strdup(val); return; }\n"
+"  }\n"
 "}\n"
 "static long __sh_pow(long base,long exp){\n"
 "  if(exp<0) return 0;\n"
@@ -6660,6 +6794,27 @@ const char *RT_HEADER =
 "  }\n"
 "  va_end(ap); fflush(stdout);\n"
 "}\n"
+"/* BUG-16 fix: printf -v variant — write to buffer instead of stdout */\n"
+"static void __sh_sprintf(char *buf, int bufsz, const char *fmt,...){\n"
+"  va_list ap; va_start(ap,fmt);\n"
+"  int bi=0;\n"
+"  const char *p=fmt;\n"
+"  while(*p && bi<bufsz-1){\n"
+"    if(*p=='%' && *(p+1)){\n"
+"      p++;\n"
+"      if(*p=='d'||*p=='i'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%d\",s?atoi(s):0); }\n"
+"      else if(*p=='s'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%s\",s?s:\"\"); }\n"
+"      else if(*p=='c'){ const char *s=va_arg(ap,const char*); buf[bi++]=s?s[0]:' '; }\n"
+"      else if(*p=='x'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%x\",s?atoi(s):0); }\n"
+"      else if(*p=='X'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%X\",s?atoi(s):0); }\n"
+"      else if(*p=='o'){ const char *s=va_arg(ap,const char*); bi+=snprintf(buf+bi,bufsz-bi,\"%o\",s?atoi(s):0); }\n"
+"      else if(*p=='%'){ buf[bi++]='%'; }\n"
+"      else { buf[bi++]='%'; buf[bi++]=*p; }\n"
+"    } else { buf[bi++]=*p; }\n"
+"    p++;\n"
+"  }\n"
+"  buf[bi]=0; va_end(ap);\n"
+"}\n"
 "/* Elegant output helpers — reduce repetitive fputs+putchar patterns */\n"
 "static void __sh_puts(const char *s){ fputs(s,stdout); putchar('\\n'); }\n"
 "static void __sh_putf(const char *fmt,...){\n"
@@ -6691,9 +6846,10 @@ const char *RT_HEADER =
 "  va_list ap; va_start(ap,flags);\n"
 "  int show_all=0,long_fmt=0,rev=0;\n"
 "  for(const char *f=flags;f&&*f;f++){ if(*f=='a')show_all=1; if(*f=='l')long_fmt=1; if(*f=='r')rev=1; }\n"
-"  const char *path; int first=1;\n"
+"  const char *path; int first=1; int had_arg=0;\n"
 "  while((path=va_arg(ap,const char*))!=NULL){\n"
-"    DIR *dp=opendir(path[0]?path:\".\"); if(!dp){perror(path);continue;}\n"
+"    had_arg=1;\n"
+"    DIR *dp=opendir(path[0]?path:\".\"); if(!dp){fprintf(stderr,\"ls: cannot access '%s': %s\\n\",path,strerror(errno));__exit_status=2;continue;}\n"
 "    if(!first) printf(\"\\n\");\n    first=0;\n"
 "    struct dirent *e; struct stat st; char full[4096];\n"
 "    while((e=readdir(dp))){ if(!show_all&&e->d_name[0]=='.') continue;\n"
@@ -6702,7 +6858,7 @@ const char *RT_HEADER =
 "    }\n"
 "    closedir(dp);\n"
 "  }\n"
-"  if(first){ DIR *dp=opendir(\".\"); if(dp){ struct dirent *e; while((e=readdir(dp)))if(show_all||e->d_name[0]!='.')printf(\"%s\\n\",e->d_name); closedir(dp);} }\n"
+"  if(!had_arg){ DIR *dp=opendir(\".\"); if(dp){ struct dirent *e; while((e=readdir(dp)))if(show_all||e->d_name[0]!='.')printf(\"%s\\n\",e->d_name); closedir(dp);} }\n"
 "  va_end(ap);\n"
 "}\n"
 "static int __attribute__((unused)) __b_cp(const char *s,const char *d){\n"
@@ -7006,7 +7162,11 @@ const char *RT_HEADER =
 "static void __attribute__((unused)) __b_jobs(void){ /* stub */ }\n"
 "static void __attribute__((unused)) __b_bg(void){ /* stub */ }\n"
 "static void __attribute__((unused)) __b_fg(void){ /* stub */ }\n"
-"static void __attribute__((unused)) __b_trap(const char *action,int sig){ if(action[0]==0) return; if(sig>0) signal(sig,SIG_DFL); /* simplified */ }\n"
+"static const char *__sh_trap_actions[32];\n"
+"static void __b_trap_run(int sig){ if(sig>=0&&sig<32&&__sh_trap_actions[sig]&&__sh_trap_actions[sig][0]) system(__sh_trap_actions[sig]); }\n"
+"static void __b_trap_exit_handler(void){ __b_trap_run(0); }\n"
+"static void __b_trap_sighandler(int sig){ __b_trap_run(sig); }\n"
+"static void __attribute__((unused)) __b_trap(const char *action,int sig){ if(!action||action[0]==0) return; if(sig<0||sig>=32) return; __sh_trap_actions[sig]=action; if(sig==0) atexit(__b_trap_exit_handler); else signal(sig,__b_trap_sighandler); }\n"
 "static void __attribute__((unused)) __b_type(const char *cmd){ printf(\"%s is a shell builtin\\n\",cmd); }\n"
 "static void __attribute__((unused)) __b_command(const char *first,...){ va_list ap; va_start(ap,first); char cmd[8192]; snprintf(cmd,sizeof(cmd),\"%s\",first); const char *p; while((p=va_arg(ap,const char*))!=NULL){ strncat(cmd,\" \",sizeof(cmd)-strlen(cmd)-1); strncat(cmd,p,sizeof(cmd)-strlen(cmd)-1); } va_end(ap); system(cmd); }\n"
 "static void __attribute__((unused)) __b_alias(const char *a){ if(!a){ system(\"alias\"); return; } }\n"
@@ -7017,7 +7177,7 @@ const char *RT_HEADER =
 "static void __attribute__((unused)) __b_dirs(void){ char cwd[4096]; getcwd(cwd,sizeof(cwd)); printf(\"%s\\n\",cwd); }\n"
 "static void __attribute__((unused)) __b_seq(int s,int st,int e){ if(st>0) for(int i=s;i<=e;i+=st) printf(\"%d\\n\",i); else for(int i=s;i>=e;i+=st) printf(\"%d\\n\",i); }\n"
 "static void __attribute__((unused)) __b_yes(const char *msg){ while(1){ printf(\"%s\\n\",msg?msg:\"y\"); fflush(stdout); } }\n"
-"static void __attribute__((unused)) __b_source(const char *f){ (void)f; }\n"
+"static void __attribute__((unused)) __b_source(const char *f){ if(!f||!*f) return; FILE *fp=fopen(f,\"r\"); if(!fp) return; char line[4096]; while(fgets(line,sizeof(line),fp)){ char cmd[4200]; snprintf(cmd,sizeof(cmd),\"%s\",line); /* remove trailing newline */ int l=(int)strlen(cmd); if(l>0&&cmd[l-1]=='\\n') cmd[l-1]=0; if(cmd[0]&&cmd[0]!='#') system(cmd); } fclose(fp); }\n"
 "static void __attribute__((unused)) __b_eval(const char **a){ char cmd[8192]=\"\"; for(const char **p=a;*p;p++){ if(*cmd) strncat(cmd,\" \",sizeof(cmd)-strlen(cmd)-1); strncat(cmd,*p,sizeof(cmd)-strlen(cmd)-1); } system(cmd); }\n"
 "static void __attribute__((unused)) __b_nohup(const char *first,...){ va_list ap; va_start(ap,first); char cmd[8192]; snprintf(cmd,sizeof(cmd),\"nohup %s\",first); const char *p; while((p=va_arg(ap,const char*))!=NULL){ strncat(cmd,\" \",sizeof(cmd)-strlen(cmd)-1); strncat(cmd,p,sizeof(cmd)-strlen(cmd)-1); } va_end(ap); strncat(cmd,\" >/dev/null 2>&1 &\",sizeof(cmd)-strlen(cmd)-1); system(cmd); }\n"
 "static void __attribute__((unused)) __b_time(const char *cmd){ clock_t t0=clock(); system(cmd); clock_t t1=clock(); fprintf(stderr,\"real %.3fs\\n\",(double)(t1-t0)/CLOCKS_PER_SEC); }\n"
@@ -7052,6 +7212,44 @@ const char *RT_HEADER =
 static void prescan_register_vars(Node *n){
     while(n){
         if(n->type==NODE_CMD && n->argv){
+            /* BUG-03 fix: export VAR=val — register variable before emit */
+            if(n->argv[0] && !strcmp(n->argv[0],"export")){
+                for(int i=1;i<n->argc;i++){
+                    const char *s=n->argv[i];
+                    if(!s) continue;
+                    const char *eq=strchr(s,'=');
+                    if(eq){
+                        char vn[128]; int vl=(int)(eq-s);
+                        if(vl>=(int)sizeof(vn)) vl=(int)sizeof(vn)-1;
+                        memcpy(vn,s,vl); vn[vl]=0;
+                        if(vn[0] && !is_known_var(vn))
+                            add_var(vn,V_STR);
+                    }
+                }
+            }
+            /* BUG-11 fix: let x=expr — register variable before emit */
+            if(n->argv[0] && !strcmp(n->argv[0],"let")){
+                for(int i=1;i<n->argc;i++){
+                    const char *s=n->argv[i];
+                    if(!s) continue;
+                    /* strip surrounding quotes */
+                    const char *ss=s; int slen=(int)strlen(ss);
+                    if(slen>=2 && ((ss[0]=='"'&&ss[slen-1]=='"')||(ss[0]=='\''&&ss[slen-1]=='\''))){ ss++; slen-=2; }
+                    const char *eq=strchr(ss,'=');
+                    if(eq && eq[1]!='='){
+                        char vn[128]; int vl=(int)(eq-ss);
+                        if(vl>=(int)sizeof(vn)) vl=(int)sizeof(vn)-1;
+                        memcpy(vn,ss,vl); vn[vl]=0;
+                        if(vn[0] && !is_known_var(vn))
+                            add_var(vn,V_INT);
+                    }
+                }
+            }
+            /* BUG-16 fix: printf -v var — register variable before emit */
+            if(n->argv[0] && !strcmp(n->argv[0],"printf") && n->argc>=3 && !strcmp(n->argv[1],"-v")){
+                if(!is_known_var(n->argv[2]))
+                    add_var(n->argv[2],V_STR);
+            }
             for(int i=0;i<n->argc;i++){
                 const char *s=n->argv[i];
                 if(!s) continue;
@@ -7281,7 +7479,8 @@ int main(int argc, char **argv){
 
     /* global variables */
     fprintf(fout,"/* ---- user variables ---- */\n");
-    for(int i=0;i<=9;i++) fprintf(fout,"static char __sh_arg%d[1024]=\"\";\n",i);
+    /* BUG-18 fix: increase buffer from 1024 to 4096 */
+    for(int i=0;i<=9;i++) fprintf(fout,"static char __sh_arg%d[4096]=\"\";\n",i);
     for(int i=0;i<var_count;i++){
         const char *cn=safe_cname(var_table[i].name);
         if(var_table[i].kind==V_INT)
@@ -7289,7 +7488,7 @@ int main(int argc, char **argv){
         else if(var_table[i].kind==V_ARRAY)
             fprintf(fout,"static const char *__arr_%s[64]={NULL};\n",cn);
         else
-            fprintf(fout,"static char %s[1024]=\"\";\n",cn);
+            fprintf(fout,"static char %s[4096]=\"\";\n",cn);
     }
     fprintf(fout,"\n");
 
