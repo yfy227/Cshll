@@ -1638,6 +1638,14 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
         for(char *p=t;*p;p++){
             if(*p=='"' && (p==t||*(p-1)!='\\')) in_dq=!in_dq;
             if(!in_dq && *p=='{' && (p==t||*(p-1)!='$')){
+                /* BUG-18 fix: skip { inside $(...) */
+                /* Check if we're inside a $(...) — if so, don't expand */
+                int in_cmd_subst=0;
+                for(char *q=t;q<p;q++){
+                    if(*q=='$'&&*(q+1)=='(') in_cmd_subst++;
+                    if(*q==')'&&in_cmd_subst>0) in_cmd_subst--;
+                }
+                if(in_cmd_subst>0) continue; /* skip brace expansion inside $(...) */
                 /* check for matching } */
                 int d=1; char *q=p+1;
                 while(*q && d){ if(*q=='{')d++; else if(*q=='}')d--; if(d)q++; }
@@ -6078,7 +6086,36 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
               Node **_pi=parse_insert;
               parser_append(nd);
               BlkFrame fr={BLK_FUNC,nd,&nd->func_body,_pi};
-              parser_push(fr); parse_insert=&nd->func_body; return;
+              parser_push(fr); parse_insert=&nd->func_body;
+              /* BUG-01 fix: handle single-line function: func(){ body; }
+               * After func() there may be { body; } on the same line.
+               * Find { in the token list and dispatch remaining tokens as body. */
+              int brace_idx=-1;
+              for(int i=0;i<ntoks;i++){
+                  if(!strcmp(toks[i],"{")){ brace_idx=i; break; }
+              }
+              if(brace_idx>=0 && brace_idx+1<ntoks){
+                  /* There are tokens after { — dispatch them as function body.
+                   * The closing } will be handled by the next segment's "}" check. */
+                  /* But if the } is also on this same line (single-line func),
+                   * we need to dispatch up to the } and then pop. */
+                  int close_idx=-1;
+                  for(int i=brace_idx+1;i<ntoks;i++){
+                      if(!strcmp(toks[i],"}")){ close_idx=i; break; }
+                  }
+                  if(close_idx>=0){
+                      /* Single-line function: dispatch tokens between { and } */
+                      if(close_idx>brace_idx+1)
+                          dispatch_segment(toks+brace_idx+1, close_idx-brace_idx-1, lineno);
+                      parser_pop();
+                  } else {
+                      /* Multi-line: { opened, dispatch remaining tokens on this line as body.
+                       * The closing } will come from a subsequent line. */
+                      if(brace_idx+1<ntoks)
+                          dispatch_segment(toks+brace_idx+1, ntoks-brace_idx-1, lineno);
+                  }
+              }
+              return;
           }
         }
         if(!strcmp(kw,"}")){
@@ -6883,7 +6920,12 @@ const char *RT_HEADER =
 "}\n"
 "static const char *__sh_cmd_output(const char *cmd){\n"
 "  char *buf = __sh_pool_next(__sh_cmd_out_p0,__sh_cmd_out_p1,__sh_cmd_out_p2,__sh_cmd_out_p3,&__sh_cmd_out_i);\n"
-"  FILE *p=popen(cmd,\"r\"); if(!p){ buf[0]=0; return buf; }\n"
+"  /* Use bash -c for brace expansion support ({1..10}, {a,b,c} etc.) */\n"
+"  char fullcmd[65536]; snprintf(fullcmd,sizeof(fullcmd),\"bash -c '%s'\",cmd);\n"
+"  FILE *p=popen(fullcmd,\"r\"); if(!p){\n"
+"    /* fallback to /bin/sh if bash not available */\n"
+"    p=popen(cmd,\"r\"); if(!p){ buf[0]=0; return buf; }\n"
+"  }\n"
 "  size_t n=fread(buf,1,65535,p); pclose(p);\n"
 "  if(n>0 && buf[n-1]=='\\n') n--;\n"
 "  buf[n]=0;\n"

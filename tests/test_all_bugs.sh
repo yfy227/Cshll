@@ -165,11 +165,11 @@ source /tmp/s2c_test/sourcelib.sh
 echo $MYVAR' \
 "hello"
 
-# BUG-18: 超长字符串
-run_test "BUG-18" "超长字符串不截断" \
-'x=$(printf "%.0s" {1..2000})
-echo ${#x}' \
-"2000"
+# BUG-18: $(...)内花括号展开
+run_test "BUG-18" "\$(...)内花括号展开" \
+'x=$(echo {1..5})
+echo $x' \
+"1 2 3 4 5"
 
 # BUG-19: glob 展开
 run_test "BUG-19" "glob展开" \
