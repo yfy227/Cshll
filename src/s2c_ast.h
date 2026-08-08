@@ -14,7 +14,7 @@ typedef enum {
     NODE_FUNC, NODE_RETURN, NODE_BREAK, NODE_CONTINUE, NODE_EXIT,
     NODE_AND, NODE_OR, NODE_NOT, NODE_SUBSHELL, NODE_GROUP,
     NODE_LOCAL, NODE_EXPORT, NODE_UNSET, NODE_SOURCE, NODE_EVAL,
-    NODE_TRAP, NODE_SET
+    NODE_TRAP, NODE_SET, NODE_SELECT, NODE_UNTIL, NODE_ARITH
 } NodeType;
 
 typedef struct Redir {
@@ -61,7 +61,7 @@ typedef struct NodeExt {
     char *heredoc_text;
     /* case */
     char *case_var;
-    char *case_pats[64]; struct NodeExt *case_bodies[64]; int case_count;
+    char *case_pats[128]; struct NodeExt *case_bodies[128]; int case_count;
     struct NodeExt *case_default;
     /* trap */
     char *trap_action; int trap_sig;

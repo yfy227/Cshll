@@ -61,10 +61,10 @@ extern void emit_vm_runtime(FILE *out);
 typedef struct {
     VmBuf *bc;
     VmConstPool *cp;
-    int loop_stack[64];       /* loop start PCs for continue */
-    int break_patches[64];    /* patch locations for break jumps */
+    int loop_stack[256];       /* loop start PCs for continue */
+    int break_patches[256];    /* patch locations for break jumps */
     int break_count;          /* number of pending break patches */
-    int cont_patches[64];    /* patch locations for continue jumps */
+    int cont_patches[256];    /* patch locations for continue jumps */
     int cont_count;          /* number of pending continue patches */
     int loop_depth;
 } VmCompilerState;
@@ -1085,6 +1085,15 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
         case NODE_FOR:
             vmc_compile_for(vs, n);
             break;
+        case NODE_SELECT:
+            /* SELECT not supported in VM mode — skip for now */
+            break;
+        case NODE_UNTIL:
+            /* handled as while_negate */
+            break;
+        case NODE_ARITH:
+            /* standalone ((expr)) — evaluate and discard */
+            break;
         case NODE_FUNC:
             vmc_compile_func(vs, n);
             break;
@@ -1412,7 +1421,7 @@ Redir *new_redir(int fd,const char *file,int append,
 /* L4  Tokenizer                                                      */
 /* ================================================================== */
 
-static char _tok_pool[131072];
+static char _tok_pool[524288];
 static int  _tok_pool_pos=0;
 
 static char *pool_dup(const char *s,int len){
@@ -1619,8 +1628,8 @@ int tokenize(const char *line, char **toks, int maxtoks){
 /* Expand brace patterns in a token list.
  * Handles: {a,b,c}, {1..10}, {a..z}, prefix{a,b}suffix */
 int expand_braces(char **toks, int ntoks, int maxtoks){
-    char *out[1024]; int no=0;
-    for(int i=0;i<ntoks && no<1024;i++){
+    char *out[4096]; int no=0;
+    for(int i=0;i<ntoks && no<maxtoks-1;i++){
         char *t=toks[i];
         /* find { in the token (but not ${, and not inside double quotes) */
         char *bp=NULL;
@@ -1675,7 +1684,7 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
         }
         /* comma-separated list: {a,b,c} */
         {
-            char *items[64]; int ni=0;
+            char *items[256]; int ni=0;
             char *p=body; char *start=p;
             int dd=0;
             while(*p){
@@ -2425,6 +2434,13 @@ char *translate_expr(const char *tok){
         }
         while(isalnum((unsigned char)*p)||*p=='_') name[j++]=*p++;
         name[j]=0;
+        /* Intercept bash special variables */
+        if(!strcmp(name,"RANDOM")||!strcmp(name,"SECONDS")||!strcmp(name,"LINENO")||
+           !strcmp(name,"BASHPID")||!strcmp(name,"SHLVL")||!strcmp(name,"HOSTTYPE")||
+           !strcmp(name,"OSTYPE")||!strcmp(name,"MACHTYPE")){
+            char r[256]; snprintf(r,sizeof(r),"__sh_special_var(\"%s\")",name);
+            return xstrdup(r);
+        }
         return xstrdup(var_c_expr(name));
     }
     return xstrdup(tok);
@@ -3009,10 +3025,10 @@ char *translate_cond(const char *cond){
         s=tmp;
         /* tokenize on spaces, handle && || ! */
         /* simple approach: split into words, build expression */
-        char *words[64]; int nw=0;
+        char *words[256]; int nw=0;
         char *save; char *cp=strdup(s);
         char *tk=strtok_r(cp," \t",&save);
-        while(tk && nw<64){ words[nw++]=tk; tk=strtok_r(NULL," \t",&save); }
+        while(tk && nw<256){ words[nw++]=tk; tk=strtok_r(NULL," \t",&save); }
         words[nw]=NULL;
         int wi=0; int bi=0;
         bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
@@ -4744,7 +4760,7 @@ void emit_node(FILE *out, Node *n){
             /* array */
             add_var(n->lhs,V_ARRAY);
             const char *p=n->rhs+1;
-            char items[64][256]; int ni=0;
+            char items[128][256]; int ni=0;
             while(*p && *p!=')'){
                 while(*p==' '||*p=='\t') p++;
                 if(*p==')') break;
@@ -4820,7 +4836,7 @@ void emit_node(FILE *out, Node *n){
                     }
                     if(has_glob){
                         /* emit glob expansion */
-                        fprintf(out,"    { glob_t __g; if(glob(\"%s\",0,NULL,&__g)==0){ for(unsigned __gi=0;__gi<__g.gl_pathc&&__an%d<63;__gi++) __arr_%s[__an%d++]=strdup(__g.gl_pathv[__gi]); } globfree(&__g); }\n",esc,n->lineno,safe_cname(n->lhs),n->lineno);
+                        fprintf(out,"    { glob_t __g; if(glob(\"%s\",0,NULL,&__g)==0){ for(unsigned __gi=0;__gi<__g.gl_pathc&&__an%d<255;__gi++) __arr_%s[__an%d++]=strdup(__g.gl_pathv[__gi]); } globfree(&__g); }\n",esc,n->lineno,safe_cname(n->lhs),n->lineno);
                     } else {
                         fprintf(out,"    __arr_%s[__an%d++]=strdup(\"%s\");\n",safe_cname(n->lhs),n->lineno,esc);
                     }
@@ -4988,7 +5004,7 @@ void emit_node(FILE *out, Node *n){
     case NODE_BACKGROUND:{
         int is_bg=(n->type==NODE_BACKGROUND);
         /* collect argv without redirects */
-        char *argv[64]; int ac=0;
+        char *argv[256]; int ac=0;
         Redir *rl=n->redirs;
         Redir *rl_tail=NULL;
         for(Redir *t=rl;t;t=t->next) rl_tail=t;  /* find list tail */
@@ -5260,6 +5276,40 @@ void emit_node(FILE *out, Node *n){
         break;
     }
 
+    /* SELECT loop: print menu, read input, execute body */
+    case NODE_SELECT:{
+        const char *vn=safe_cname(n->for_var);
+        fprintf(out,"    {\n");
+        fprintf(out,"    for(;;){\n");
+        fprintf(out,"    int __si=1;\n");
+        for(int i=0;i<n->for_len;i++){
+            char *esc=c_escape_literal(n->for_list[i]);
+            fprintf(out,"    printf(\"%%d) %s\\n\",__si++);\n",esc?esc:"");
+            free(esc);
+        }
+        fprintf(out,"    printf(\"#? \"); fflush(stdout);\n");
+        fprintf(out,"    char __sl[4096]; if(!fgets(__sl,sizeof(__sl),stdin)) break;\n");
+        fprintf(out,"    __sl[strcspn(__sl,\"\\r\\n\")]=0;\n");
+        fprintf(out,"    int __sn=atoi(__sl);\n");
+        fprintf(out,"    if(__sn<1||__sn>%d) continue;\n",n->for_len);
+        fprintf(out,"    setenv(\"REPLY\",__sl,1);\n");
+        fprintf(out,"    switch(__sn){\n");
+        for(int i=0;i<n->for_len;i++){
+            char *esc=c_escape_literal(n->for_list[i]);
+            fprintf(out,"    case %d: strncpy(%s,\"%s\",sizeof(%s)-1); break;\n",
+                    i+1, vn, esc?esc:"", vn);
+            free(esc);
+        }
+        fprintf(out,"    default: break;\n");
+        fprintf(out,"    }\n");
+        emit_node(out,n->body);
+        fprintf(out,"    }\n");
+        fprintf(out,"    }\n");
+        break;
+    }
+
+    case NODE_UNTIL: break;  /* handled as while_negate */
+    case NODE_ARITH: break;  /* ((expr)) as statement */
     case NODE_FUNC: break;
 
     case NODE_BREAK:    fprintf(out,"    break;\n"); break;
@@ -5456,11 +5506,14 @@ void emit_functions(FILE *out, Node *n){
 
 /* BlkFrame, BlkKind, blk_stack, blk_top, parse_root, parse_insert
  * are declared in s2c_parse.h. Definitions here: */
-BlkFrame blk_stack[STACK_MAX];
-int blk_top=0;
+/* Dynamic linked-list stack — no depth limit */
+BlkFrame *blk_top=NULL;
 Node *parse_root=NULL;
 Node **parse_insert=NULL;
 /* pending_pipe_cmd and pipe_restore_needed declared in L8 emitter section */
+
+/* blk_depth: track nesting depth for diagnostics (no functional limit) */
+static int blk_depth=0;
 
 static Node **chain_tail(Node **hp){
     if(!hp) return NULL;
@@ -5477,13 +5530,21 @@ static void parser_append(Node *n){
 }
 
 static void parser_push(BlkFrame fr){
-    if(blk_top>=STACK_MAX){fprintf(stderr,"stack overflow\n");return;}
-    blk_stack[blk_top++]=fr;
+    BlkFrame *p=(BlkFrame*)malloc(sizeof(BlkFrame));
+    if(!p){fprintf(stderr,"parser_push: out of memory\n");return;}
+    *p=fr;
+    p->next=blk_top;
+    blk_top=p;
+    blk_depth++;
 }
 
 static void parser_pop(void){
-    if(blk_top<=0) return;
-    Node **pi=blk_stack[--blk_top].parent_insert;
+    if(!blk_top) return;
+    BlkFrame *p=blk_top;
+    Node **pi=p->parent_insert;
+    blk_top=p->next;
+    blk_depth--;
+    free(p);
     if(pi) parse_insert=chain_tail(pi);
     else{
         if(parse_root){Node *sc=parse_root;while(sc->next)sc=sc->next;parse_insert=&sc->next;}
@@ -5694,12 +5755,12 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         const char *kw=toks[0];
 
         if(!strcmp(kw,"esac")){
-            if(blk_top>0&&blk_stack[blk_top-1].kind==BLK_CASE) parser_pop();
+            if(blk_top&&blk_top->kind==BLK_CASE) parser_pop();
             return;
         }
         /* BLK_CASE body */
-        if(blk_top>0&&blk_stack[blk_top-1].kind==BLK_CASE){
-            Node *cnd=blk_stack[blk_top-1].node;
+        if(blk_top&&blk_top->kind==BLK_CASE){
+            Node *cnd=blk_top->node;
             int pp=-1;
             for(int i=0;i<ntoks;i++) if(!strcmp(toks[i],")")){pp=i;break;}
             if(pp>=1){
@@ -5799,8 +5860,8 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             return;
         }
         if(!strcmp(kw,"elif")){
-            if(blk_top>0){
-                BlkFrame *fr=&blk_stack[blk_top-1]; Node *pif=fr->node;
+            if(blk_top){
+                BlkFrame *fr=blk_top; Node *pif=fr->node;
                 char cb[2048]="";
                 for(int i=1;i<ntoks;i++){
                     if(!strcmp(toks[i],"then")||!strcmp(toks[i],";")) break;
@@ -5819,8 +5880,8 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             } return;
         }
         if(!strcmp(kw,"else")){
-            if(blk_top>0){
-                BlkFrame *fr=&blk_stack[blk_top-1]; Node *pif=fr->node;
+            if(blk_top){
+                BlkFrame *fr=blk_top; Node *pif=fr->node;
                 fr->kind=BLK_IF_ELSE;
                 parse_insert=&pif->else_blk;
             } return;
@@ -5935,6 +5996,25 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             BlkFrame fr={BLK_WHILE,nd,&nd->while_body,_pi};
             parser_push(fr); parse_insert=&nd->while_body; return;
         }
+        /* select var in list; do ... done */
+        if(!strcmp(kw,"select")){
+            Node *nd=new_node(NODE_SELECT,lineno);
+            /* parse: select var in item1 item2 ... */
+            if(ntoks>=4 && !strcmp(toks[2],"in")){
+                nd->for_var=xstrdup(toks[1]);
+                add_var(toks[1],V_STR);
+                nd->for_list=malloc(sizeof(char*)*(ntoks-2));
+                nd->for_len=0;
+                for(int i=3;i<ntoks;i++){
+                    if(!strcmp(toks[i],"do")) break;
+                    nd->for_list[nd->for_len++]=xstrdup(toks[i]);
+                }
+            }
+            Node **_pi=parse_insert;
+            parser_append(nd);
+            BlkFrame fr={BLK_SELECT,nd,&nd->body,_pi};
+            parser_push(fr); parse_insert=&nd->body; return;
+        }
         if(!strcmp(kw,"done")){ parser_pop(); return; }
 
         if(!strcmp(kw,"case")){
@@ -5972,9 +6052,9 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
           }
         }
         if(!strcmp(kw,"}")){
-            if(blk_top>0&&(blk_stack[blk_top-1].kind==BLK_FUNC||
-                            blk_stack[blk_top-1].kind==BLK_CASE||
-                            blk_stack[blk_top-1].kind==BLK_GROUP))
+            if(blk_top&&(blk_top->kind==BLK_FUNC||
+                         blk_top->kind==BLK_CASE||
+                         blk_top->kind==BLK_GROUP))
                 parser_pop();
             return;
         }
@@ -6016,7 +6096,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 start++;
             }
             /* merge name=value tokens (name= and "value" are separate tokens) */
-            char merged[64][512]; int nm=0;
+            char merged[128][512]; int nm=0;
             int i=start;
             while(i<ntoks && nm<63){
                 char *eq=strchr(toks[i],'=');
@@ -6054,7 +6134,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 }
             }
             /* create NODE_LOCAL with merged tokens */
-            char *mtoks[64];
+            char *mtoks[256];
             for(int j=0;j<nm;j++) mtoks[j]=merged[j];
             Node *nd=make_cmd(mtoks,nm,lineno);
             nd->type=NODE_LOCAL;
@@ -6344,7 +6424,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
 }
 
 Node *parse_script(FILE *f){
-    char line[8192]; int lineno=0;
+    char line[16384]; int lineno=0;
     blk_top=0; parse_root=NULL; parse_insert=NULL;
     while(fgets(line,sizeof(line),f)){
         lineno++;
@@ -6521,7 +6601,7 @@ Node *parse_script(FILE *f){
                         }
                         delim[di]=0;
                         if(di>0){
-                            char hdtext[16384]=""; char hdline[2048];
+                            char hdtext[65536]=""; char hdline[8192];
                             while(fgets(hdline,sizeof(hdline),f)){
                                 lineno++;
                                 hdline[strcspn(hdline,"\r\n")]=0;
@@ -6549,11 +6629,11 @@ Node *parse_script(FILE *f){
                 scan+=2;
             }
         }
-        char linecopy[8192]; strncpy(linecopy,t,8191); linecopy[8191]=0;
-        char *toks[512]; int ntoks=tokenize(linecopy,toks,512);
+        char linecopy[16384]; strncpy(linecopy,t,16383); linecopy[16383]=0;
+        char *toks[2048]; int ntoks=tokenize(linecopy,toks,2048);
         if(!ntoks) continue;
         /* expand brace patterns */
-        ntoks=expand_braces(toks,ntoks,512);
+        ntoks=expand_braces(toks,ntoks,2048);
         /* split on top-level ';' and dispatch each segment */
         {
             int __ss=0;
@@ -6593,6 +6673,56 @@ const char *RT_HEADER =
 "static int __sh_set_e=0;\n"
 "static int __sh_set_u=0;\n"
 "static int __sh_set_x=0;\n"
+"/* Bash special variables */\n"
+"static int __sh_lineno=0;\n"
+"static int __sh_pipestatus[16]={0};\n"
+"static int __sh_shlvl=1;\n"
+"static unsigned int __sh_rand_seed=0;\n"
+"static time_t __sh_start_time=0;\n"
+"/* __sh_getenv_special: resolve bash special vars (uses static buffer, no pool dependency) */\n"
+"static const char *__sh_special_var(const char *name){\n"
+"  static char __sv_buf[256];\n"
+"  if(!strcmp(name,\"RANDOM\")){\n"
+"    if(!__sh_rand_seed) __sh_rand_seed=(unsigned int)time(NULL)^(unsigned int)getpid();\n"
+"    __sh_rand_seed=__sh_rand_seed*1103515245+12345;\n"
+"    snprintf(__sv_buf,sizeof(__sv_buf),\"%d\",(__sh_rand_seed/65536)%32768); return __sv_buf;\n"
+"  }\n"
+"  if(!strcmp(name,\"SECONDS\")){\n"
+"    snprintf(__sv_buf,sizeof(__sv_buf),\"%ld\",(long)(time(NULL)-__sh_start_time)); return __sv_buf;\n"
+"  }\n"
+"  if(!strcmp(name,\"LINENO\")){\n"
+"    snprintf(__sv_buf,sizeof(__sv_buf),\"%d\",__sh_lineno); return __sv_buf;\n"
+"  }\n"
+"  if(!strcmp(name,\"BASHPID\")){\n"
+"    snprintf(__sv_buf,sizeof(__sv_buf),\"%d\",(int)getpid()); return __sv_buf;\n"
+"  }\n"
+"  if(!strcmp(name,\"SHLVL\")){\n"
+"    snprintf(__sv_buf,sizeof(__sv_buf),\"%d\",__sh_shlvl); return __sv_buf;\n"
+"  }\n"
+"  if(!strcmp(name,\"PIPESTATUS\")){ return \"0\"; }\n"
+"  if(!strcmp(name,\"HOSTTYPE\")){\n"
+"#if defined(__x86_64__) || defined(__amd64__)\n"
+"    return \"x86_64\";\n"
+"#elif defined(__aarch64__)\n"
+"    return \"aarch64\";\n"
+"#elif defined(__arm__)\n"
+"    return \"arm\";\n"
+"#else\n"
+"    return \"unknown\";\n"
+"#endif\n"
+"  }\n"
+"  if(!strcmp(name,\"OSTYPE\")){\n"
+"#if defined(__linux__)\n"
+"    return \"linux-gnu\";\n"
+"#elif defined(__APPLE__)\n"
+"    return \"darwin\";\n"
+"#else\n"
+"    return \"unknown\";\n"
+"#endif\n"
+"  }\n"
+"  if(!strcmp(name,\"MACHTYPE\")){ return __sh_special_var(\"HOSTTYPE\"); }\n"
+"  return NULL;\n"
+"}\n"
 "\n"
 "/* ---- rotating buffer pools (safe for nested calls) ---- */\n"
 "/* 4-slot pools: calling a function 4+ times in one expression still\n"
@@ -6652,7 +6782,7 @@ const char *RT_HEADER =
 "  return \"\";\n"
 "}\n"
 "static void __sh_assoc_set(const char **arr,const char *key,const char *val){\n"
-"  for(int i=0;i<62;i+=2){\n"
+"  for(int i=0;i<254;i+=2){\n"
 "    if(!arr[i]){ arr[i]=strdup(key); arr[i+1]=strdup(val); return; }\n"
 "    if(arr[i]&&strcmp(arr[i],key)==0){ free((void*)arr[i+1]); arr[i+1]=strdup(val); return; }\n"
 "  }\n"
@@ -7486,7 +7616,7 @@ int main(int argc, char **argv){
         if(var_table[i].kind==V_INT)
             fprintf(fout,"static int %s=0;\n",cn);
         else if(var_table[i].kind==V_ARRAY)
-            fprintf(fout,"static const char *__arr_%s[64]={NULL};\n",cn);
+            fprintf(fout,"static const char *__arr_%s[256]={NULL};\n",cn);
         else
             fprintf(fout,"static char %s[4096]=\"\";\n",cn);
     }
@@ -7510,9 +7640,10 @@ int main(int argc, char **argv){
     fprintf(fout,"int main(int _argc, char **_argv){\n");
     fprintf(fout,"    setvbuf(stdout, NULL, _IONBF, 0);\n");
     fprintf(fout,"    setvbuf(stdin, NULL, _IONBF, 0);\n");
+    fprintf(fout,"    __sh_start_time=time(NULL);\n");
     fprintf(fout,"    __sh_argc = _argc - 1;\n");
     for(int i=0;i<=9;i++)
-        fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 1023);\n",i,i,i);
+        fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
     fprintf(fout,"\n");
     emit_node(fout,script);
     /* Inject dead code decoys if obfuscation is enabled */

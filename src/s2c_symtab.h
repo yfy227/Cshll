@@ -11,7 +11,7 @@
 typedef enum { V_INT, V_STR, V_ARRAY, V_UNKNOWN } VarKind;
 typedef struct { char name[128]; VarKind kind; int is_local; } VarInfo;
 
-#define MAX_VARS 4096
+#define MAX_VARS 16384
 extern VarInfo var_table[MAX_VARS];
 extern int var_count;
 
@@ -21,7 +21,7 @@ int is_known_var(const char *name);
 const char *var_c_expr(const char *name);
 
 /* Function table */
-#define MAX_FUNCS 512
+#define MAX_FUNCS 2048
 extern char *func_table[MAX_FUNCS];
 extern int func_count;
 

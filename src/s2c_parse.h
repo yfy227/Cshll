@@ -9,29 +9,31 @@
 #include "s2c_ast.h"
 #include "s2c_symtab.h"
 
-#define STACK_MAX 64
+/* Dynamic stack — no fixed limit, eliminates nesting depth truncation */
+/* STACK_MAX removed; blk_stack is now a heap-allocated linked list */
 
 typedef enum {
     BLK_IF_THEN, BLK_IF_ELIF, BLK_IF_ELSE,
-    BLK_FOR, BLK_WHILE, BLK_FUNC, BLK_CASE, BLK_SUBSHELL, BLK_GROUP
+    BLK_FOR, BLK_WHILE, BLK_FUNC, BLK_CASE, BLK_SUBSHELL, BLK_GROUP,
+    BLK_SELECT, BLK_UNTIL
 } BlkKind;
 
 /* Forward declare NodeExt for BlkFrame */
 struct NodeExt;
-typedef struct {
+typedef struct BlkFrame {
     int kind;
     struct NodeExt *node;
     struct NodeExt **insert;
     struct NodeExt **parent_insert;
+    struct BlkFrame *next;  /* linked list — replaces fixed array */
 } BlkFrame;
 
-/* blk_stack defined in shell2c.c */
-/* blk_top defined in shell2c.c */
-/* parse_root defined in shell2c.c */
-/* parse_insert defined in shell2c.c */
+/* blk_top is now the head pointer of the linked list (NULL = empty) */
+/* blk_stack name removed — use blk_top directly */
+/* blk_top, parse_root, parse_insert defined in shell2c.c */
 
 /* Tokenizer */
-#define MAX_TOKS 512
+#define MAX_TOKS 2048
 /* tokenize defined in shell2c.c */
 /* expand_braces defined in shell2c.c */
 
