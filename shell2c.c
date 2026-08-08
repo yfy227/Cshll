@@ -1540,8 +1540,13 @@ int tokenize(const char *line, char **toks, int maxtoks){
         if(*p==']'&&*(p+1)==']'){ toks[n++]=(char*)"]]"; p+=2; continue; }
         if(*p=='['){             toks[n++]=(char*)"[";  p++;  continue; }
         if(*p==']'){             toks[n++]=(char*)"]";  p++;  continue; }
-        /* { and } are NOT separate tokens — they're part of words for brace expansion.
-         * Standalone { and } (surrounded by spaces) will be bare word tokens. */
+        /* { and } as standalone tokens when surrounded by whitespace or start/end */
+        if(*p=='{' && (p==line || isspace((unsigned char)*(p-1))) && (isspace((unsigned char)*(p+1)) || *(p+1)==';' || *(p+1)==0)){
+            toks[n++]=(char*)"{"; p++; continue;
+        }
+        if(*p=='}' && (isspace((unsigned char)*(p-1)) || *(p-1)==';') && (isspace((unsigned char)*(p+1)) || *(p+1)==';' || *(p+1)==0)){
+            toks[n++]=(char*)"}"; p++; continue;
+        }
         if(*p=='('&&*(p+1)=='('){ toks[n++]=(char*)"(("; p+=2; continue; }
         if(*p==')'&&*(p+1)==')'){ toks[n++]=(char*)"))"; p+=2; continue; }
         if(*p=='('){             toks[n++]=(char*)"(";  p++;  continue; }
