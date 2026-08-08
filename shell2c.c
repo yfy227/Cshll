@@ -1819,7 +1819,14 @@ char *translate_brace_expansion(const char *body){
                 snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
             } else {
                 /* String key — use associative lookup */
-                snprintf(r,sizeof(r),"__sh_assoc_get(__arr_%s,\"%s\")",safe_cname(name),idx);
+                /* If idx is $var, translate to runtime expression */
+                if(idx[0]=='$' && idx[1]){
+                    char *e=translate_expr(idx);
+                    snprintf(r,sizeof(r),"__sh_assoc_get(__arr_%s,%s)",safe_cname(name),e);
+                    free(e);
+                } else {
+                    snprintf(r,sizeof(r),"__sh_assoc_get(__arr_%s,\"%s\")",safe_cname(name),idx);
+                }
             }
         }
         return xstrdup(r);
@@ -2038,11 +2045,21 @@ static char *expand_cmd_subst(const char *cmd){
                     p++;
                 }
                 nm[j]=0;
-                VarKind vk=get_var_kind(nm);
-                fmt[fi++]='%'; fmt[fi++]=(vk==V_INT)?'d':'s';
-                if(ai>0) args[ai++]=',';
-                ai+=snprintf(args+ai,sizeof(args)-ai,"%s",safe_cname(nm));
-                has_var=1;
+                /* Intercept bash special variables */
+                if(!strcmp(nm,"RANDOM")||!strcmp(nm,"SECONDS")||!strcmp(nm,"LINENO")||
+                   !strcmp(nm,"BASHPID")||!strcmp(nm,"SHLVL")||!strcmp(nm,"HOSTTYPE")||
+                   !strcmp(nm,"OSTYPE")||!strcmp(nm,"MACHTYPE")){
+                    fmt[fi++]='%'; fmt[fi++]='s';
+                    if(ai>0) args[ai++]=',';
+                    ai+=snprintf(args+ai,sizeof(args)-ai,"__sh_special_var(\"%s\")",nm);
+                    has_var=1;
+                } else {
+                    VarKind vk=get_var_kind(nm);
+                    fmt[fi++]='%'; fmt[fi++]=(vk==V_INT)?'d':'s';
+                    if(ai>0) args[ai++]=',';
+                    ai+=snprintf(args+ai,sizeof(args)-ai,"%s",safe_cname(nm));
+                    has_var=1;
+                }
             } else {
                 fmt[fi++]='$';
             }
@@ -2866,12 +2883,15 @@ char *translate_operand(const char *tok){
     /* unquoted: translate, and if it's a bare literal word (no $, not a
      * known variable, not a number) wrap as C string literal */
     char *e=translate_expr(tok);
-    if(tok[0]!='$' && !strchr(tok,'$') && get_var_kind(tok)==V_UNKNOWN
-       && strncmp(tok,"$((",3)!=0){
+    if(tok[0]!='$' && !strchr(tok,'$') && strncmp(tok,"$((",3)!=0){
         const char *p=tok; if(*p=='-'||*p=='+') p++;
         int isnum=*p!='\0';
         for(const char *q=p;*q;q++){ if(!isdigit((unsigned char)*q)){ isnum=0; break; } }
-        if(!isnum){
+        /* Check if this is a real declared variable (not a false-positive registration) */
+        int is_real_var = is_known_var(tok) && (tok[0]=='_' || (tok[0]>='a'&&tok[0]<='z') || (tok[0]>='A'&&tok[0]<='Z'));
+        /* In [[ ]] context, bare words are string literals unless they're clearly variables
+         * that were explicitly assigned (V_STR vars assigned with =, or V_INT with declare -i) */
+        if(!isnum && !is_real_var){
             char *r=malloc(strlen(e)+4);
             sprintf(r,"\"%s\"",e); free(e); return r;
         }
@@ -6404,6 +6424,35 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             int oi=find_op(toks,ntoks,"||");
             /* || has lower precedence: if || exists, split there first */
             if(oi>=0){
+                /* Check if left side starts with [[ — generate if-else */
+                if(oi>=2 && !strcmp(toks[0],"[[" )){
+                    /* Find ]] in left side */
+                    int close_idx=-1;
+                    for(int i=1;i<oi;i++){ if(!strcmp(toks[i],"]]")){ close_idx=i; break; } }
+                    if(close_idx>=1){
+                        char cb[2048]="";
+                        for(int i=1;i<close_idx;i++){
+                            if(i>1) strcat(cb," ");
+                            strncat(cb,toks[i],sizeof(cb)-strlen(cb)-1);
+                        }
+                        char cond[2100]; snprintf(cond,sizeof(cond),"[[ %s ]]",cb);
+                        Node *ifnd=new_node(NODE_IF,lineno);
+                        ifnd->cond=xstrdup(cond);
+                        BlkFrame ifr={BLK_IF_THEN,ifnd,&ifnd->then_blk,parse_insert};
+                        parser_append(ifnd);
+                        parser_push(ifr);
+                        /* then_blk: tokens between ]] and || (e.g. && echo "nomatch") */
+                        if(close_idx+1<oi){
+                            parse_insert=&ifnd->then_blk;
+                            dispatch_segment(toks+close_idx+1, oi-close_idx-1, lineno);
+                        }
+                        /* else_blk: right side of || */
+                        parse_insert=&ifnd->else_blk;
+                        dispatch_segment(toks+oi+1,ntoks-oi-1,lineno);
+                        parser_pop();
+                        return;
+                    }
+                }
                 Node *nd=new_node(NODE_OR,lineno);
                 Node **_pi=parse_insert;
                 parser_append(nd);
