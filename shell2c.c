@@ -5490,6 +5490,24 @@ void emit_node(FILE *out, Node *n){
             } else {
             /* For-loop with literal list: use stack-allocated array, no malloc/strdup */
             fprintf(out,"    {\n");
+            /* Check if any list item contains glob chars */
+            int has_glob=0;
+            for(int i=0;i<n->for_len;i++){
+                for(const char *g=n->for_list[i];*g;g++){
+                    if(*g=='*'||*g=='?'||*g=='['){ has_glob=1; break; }
+                }
+                if(has_glob) break;
+            }
+            if(has_glob && n->for_len<=16){
+                /* Use runtime glob() for each item */
+                fprintf(out,"    const char *__fl%d[256]; int __nfl%d=0;\n",n->lineno,n->lineno);
+                for(int i=0;i<n->for_len;i++){
+                    char *esc=c_escape_literal(n->for_list[i]);
+                    fprintf(out,"    { glob_t __g; if(glob(\"%s\",0,NULL,&__g)==0){ for(unsigned __gi=0;__gi<__g.gl_pathc&&__nfl%d<255;__gi++) __fl%d[__nfl%d++]=strdup(__g.gl_pathv[__gi]); } globfree(&__g); }\n",esc,n->lineno,n->lineno,n->lineno);
+                    free(esc);
+                }
+                fprintf(out,"    __fl%d[__nfl%d]=NULL;\n",n->lineno,n->lineno);
+            } else {
             fprintf(out,"    const char *__fl%d[] = {",n->lineno);
             for(int i=0;i<n->for_len;i++){
                 char *w=emit_word(out,n->for_list[i]);
@@ -5500,6 +5518,7 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,"NULL};\n");
             else
                 fprintf(out,", NULL};\n");
+            }
             fprintf(out,"    for (int __fi%d = 0; __fl%d[__fi%d]; __fi%d++) {\n",
                     n->lineno,n->lineno,n->lineno,n->lineno);
             VarKind vk=get_var_kind(n->for_var);
@@ -7203,7 +7222,7 @@ const char *RT_HEADER =
 "  return buf;\n"
 "}\n"
 "static int __sh_arr_count(const char **arr){\n"
-"  int n=0; while(arr[n]) n++; return n;\n"
+"  int n=0; for(int i=0;i<256;i++) if(arr[i]) n++; return n;\n"
 "}\n"
 "/* BUG-10 fix: associative array helpers — store as key,value,key,value,... */\n"
 "static const char *__sh_assoc_get(const char **arr,const char *key){\n"
