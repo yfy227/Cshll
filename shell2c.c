@@ -2276,6 +2276,30 @@ char *translate_expr(const char *tok){
                 if(j>0){
                     VarKind vk=get_var_kind(nm);
                     const char *cn=safe_cname(nm);
+                    /* Check for array access: var[$key] or var[N] */
+                    if(vk==V_ARRAY && *s=='['){
+                        s++; /* skip [ */
+                        /* Read the index expression until ] */
+                        char idxexpr[256]; int ii=0;
+                        int d=1;
+                        while(*s && d && ii<255){
+                            if(*s=='[') d++;
+                            else if(*s==']'){ d--; if(d==0) break; }
+                            idxexpr[ii++]=*s++;
+                        }
+                        idxexpr[ii]=0; if(*s==']') s++;
+                        /* Translate the index expression */
+                        char *ie=translate_arith(idxexpr);
+                        const char *pre="atoi(__arr_";
+                        while(*pre) buf[q++]=*pre++;
+                        while(*cn) buf[q++]=*cn++;
+                        buf[q++]='['; buf[q++]='a'; buf[q++]='t'; buf[q++]='o'; buf[q++]='i'; buf[q++]='(';
+                        const char *iep=ie;
+                        while(*iep) buf[q++]=*iep++;
+                        free(ie);
+                        buf[q++]=')'; buf[q++]=']'; buf[q++]=')';
+                        continue;
+                    }
                     if(vk==V_STR){
                         const char *pre="atoi("; const char *suf=")";
                         while(*pre) buf[q++]=*pre++;
@@ -2303,6 +2327,23 @@ char *translate_expr(const char *tok){
                 nm[j]=0;
                 VarKind vk=get_var_kind(nm);
                 const char *cn=safe_cname(nm);
+                /* Check for array access: var[idx] or var[$key] */
+                if(vk==V_ARRAY && *s=='['){
+                    s++; /* skip [ */
+                    char idxexpr[256]; int ii=0;
+                    int bd=1;
+                    while(*s && bd && ii<255){
+                        if(*s=='[') bd++;
+                        else if(*s==']'){ bd--; if(bd==0) break; }
+                        idxexpr[ii++]=*s++;
+                    }
+                    idxexpr[ii]=0; if(*s==']') s++;
+                    char *ie=translate_arith(idxexpr);
+                    /* ie is already an int expression from translate_arith */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"atoi(__arr_%s[%s])",cn,ie);
+                    free(ie);
+                    continue;
+                }
                 /* check for = assignment (not ==) — register as int var */
                 {
                     const char *np=s; while(*np==' '||*np=='\t') np++;
@@ -3088,11 +3129,42 @@ char *translate_cond(const char *cond){
         while(rp2>0 && isspace((unsigned char)tmp2[rp2-1])) tmp2[--rp2]=0;
         if(rp2>=1 && tmp2[rp2-1]==']') tmp2[--rp2]=0;
         /* Now process tmp2 same as [[ ]] body */
+        /* Custom tokenizer that protects $((...)), $(...), ${...}, and quotes */
         char *words[256]; int nw=0;
-        char *save; char *cp=strdup(tmp2);
-        char *tk=strtok_r(cp," \t",&save);
-        while(tk && nw<256){ words[nw++]=tk; tk=strtok_r(NULL," \t",&save); }
-        words[nw]=NULL;
+        {
+            char *cp=strdup(tmp2);
+            const char *p=cp;
+            while(*p && nw<255){
+                while(*p==' '||*p=='\t') p++;
+                if(!*p) break;
+                const char *start=p;
+                int dq=0,sq=0;
+                while(*p){
+                    if(*p=='"'&&!sq) dq=!dq;
+                    else if(*p=='\''&&!dq) sq=!sq;
+                    else if(!dq&&!sq){
+                        if(*p=='$'&&(*(p+1)=='('||*(p+1)=='{')){
+                            char open=*++p; int d=1; p++;
+                            while(*p&&d){
+                                if(*p=='('&&open=='(') d++;
+                                else if(*p==')'&&open=='(') d--;
+                                else if(*p=='{'&&open=='{') d++;
+                                else if(*p=='}'&&open=='{') d--;
+                                if(d) p++;
+                            }
+                            if(*p) p++;
+                            continue;
+                        }
+                        if(*p==' '||*p=='\t') break;
+                    }
+                    p++;
+                }
+                int len=p-start;
+                char *w=malloc(len+1); memcpy(w,start,len); w[len]=0;
+                words[nw++]=w;
+            }
+            words[nw]=NULL;
+        }
         int wi=0; int bi=0;
         bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
         while(wi<nw){
@@ -3140,7 +3212,6 @@ char *translate_cond(const char *cond){
         }
         bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
         buf[bi]=0;
-        free(cp);
         return buf;
         } /* end if(has_close) */
     } /* end if([ ) */
@@ -3156,12 +3227,43 @@ char *translate_cond(const char *cond){
         else if(rp>=1 && tmp[rp-1]==']'){ tmp[--rp]=0; } /* single ] */
         s=tmp;
         /* tokenize on spaces, handle && || ! */
-        /* simple approach: split into words, build expression */
+        /* Custom tokenizer that protects $((...)), $(...), ${...}, and quotes */
         char *words[256]; int nw=0;
-        char *save; char *cp=strdup(s);
-        char *tk=strtok_r(cp," \t",&save);
-        while(tk && nw<256){ words[nw++]=tk; tk=strtok_r(NULL," \t",&save); }
-        words[nw]=NULL;
+        {
+            char *cp=strdup(s);
+            const char *p=cp;
+            while(*p && nw<255){
+                while(*p==' '||*p=='\t') p++;
+                if(!*p) break;
+                const char *start=p;
+                int dq=0,sq=0;
+                while(*p){
+                    if(*p=='"'&&!sq) dq=!dq;
+                    else if(*p=='\''&&!dq) sq=!sq;
+                    else if(!dq&&!sq){
+                        if(*p=='$'&&(*(p+1)=='('||*(p+1)=='{')){
+                            /* skip $(...), $((...)), ${...} */
+                            char open=*++p; int d=1; p++;
+                            while(*p&&d){
+                                if(*p=='('&&open=='(') d++;
+                                else if(*p==')'&&open=='(') d--;
+                                else if(*p=='{'&&open=='{') d++;
+                                else if(*p=='}'&&open=='{') d--;
+                                if(d) p++;
+                            }
+                            if(*p) p++;
+                            continue;
+                        }
+                        if(*p==' '||*p=='\t') break;
+                    }
+                    p++;
+                }
+                int len=p-start;
+                char *w=malloc(len+1); memcpy(w,start,len); w[len]=0;
+                words[nw++]=w;
+            }
+            words[nw]=NULL;
+        }
         int wi=0; int bi=0;
         bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
         while(wi<nw){
@@ -3268,7 +3370,6 @@ char *translate_cond(const char *cond){
         }
         bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
         buf[bi]=0; /* ensure null termination */
-        free(cp);
         return buf;
     }
     /* [ ... ] */
@@ -3773,6 +3874,11 @@ void emit_command(FILE *out, char **argv, int ac, int id){
             const char *fmt = argv[1];
             int flen = (int)strlen(fmt);
             int is_literal = (flen>=2 && fmt[0]=='"' && fmt[flen-1]=='"');
+            /* Pre-emit non-literal args to temp buffers first */
+            char *argstrs[64]; int nargstrs=0;
+            for(int i=2;i<ac && nargstrs<63;i++){
+                argstrs[nargstrs++]=emit_word(out,argv[i]);
+            }
             if(is_literal && !strchr(fmt,'$')){
                 /* Literal format string — use directly */
                 fprintf(out,"    __sh_printf(%s", fmt);
@@ -3782,7 +3888,7 @@ void emit_command(FILE *out, char **argv, int ac, int id){
                 fprintf(out,"    { const char *__pf=%s; __sh_printf(__pf",w);
                 free(w);
             }
-            for(int i=2;i<ac;i++){ char *a=emit_word(out,argv[i]); fprintf(out,",%s",a); free(a); }
+            for(int i=0;i<nargstrs;i++){ fprintf(out,",%s",argstrs[i]); free(argstrs[i]); }
             if(is_literal && !strchr(fmt,'$')){
                 fprintf(out,");\n");
             } else {
@@ -4796,8 +4902,18 @@ void emit_node(FILE *out, Node *n){
                 if(is_var_key){
                     /* Runtime evaluation: use atoi(var) as index */
                     char *e=translate_expr(akey);
-                    fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
-                    fprintf(out,"    int __idx=%s; if(__idx<0)__idx=0; if(__idx>=256)__idx=255;\n",e);
+                    /* Check if var is string type — need atoi */
+                    const char *vname=akey+1;
+                    if(*vname=='{') vname++;
+                    VarKind vk=get_var_kind(vname);
+                    if(vk==V_STR)
+                        fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
+                    else
+                        fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
+                    if(vk==V_STR)
+                        fprintf(out,"    int __idx=atoi(%s); if(__idx<0)__idx=0; if(__idx>=256)__idx=255;\n",e);
+                    else
+                        fprintf(out,"    int __idx=%s; if(__idx<0)__idx=0; if(__idx>=256)__idx=255;\n",e);
                     free(e);
                     fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
                 }else{
