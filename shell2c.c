@@ -5294,6 +5294,13 @@ void emit_node(FILE *out, Node *n){
                     /* parse array elements */
                     const char *p=eq+2; /* skip =( */
                     int idx=0;
+                    /* Check for ("$@") or ("$*") — expand args */
+                    if(*p=='"' && ((*(p+1)=='$' && (*(p+2)=='@'||*(p+2)=='*')) || (*(p+1)=='$' && *(p+2)=='{' && (*(p+3)=='@'||*(p+3)=='*')))){
+                        /* Expand $@ / $* into array elements */
+                        fprintf(out,"    { int __ai=0; for(int __j=0;__j<__sh_argc&&__ai<255;__j++){ __arr_%s[__ai++]=strdup(__sh_args[__j]?__sh_args[__j]:\"\"); } __arr_%s[__ai]=NULL; }\n",cn,cn);
+                        /* skip past the whole ("$@") or ("${@}") */
+                        continue;
+                    }
                     while(*p && *p!=')'){
                         while(*p==' '||*p=='\t') p++;
                         if(*p==')') break;
