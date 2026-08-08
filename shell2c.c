@@ -3572,6 +3572,19 @@ char *emit_word(FILE *out, const char *word){
             cmd[ci++]=*p++;
         }
         cmd[ci]=0;
+        /* Check if cmd is a bare user function name */
+        int is_bare_func = 1;
+        for(const char *c=cmd;*c;c++){
+            if(!isalnum((unsigned char)*c)&&*c!='_'){ is_bare_func=0; break; }
+        }
+        if(is_bare_func && is_user_func(cmd)){
+            /* User function: capture output to a temp file, return its path */
+            int id=tmp_id++;
+            fprintf(out,"    /* proc_subst for user func %s */\n",cmd);
+            fprintf(out,"    char __ps_%d[128]; { const char *__out=__sh_capture_fn((void(*)(int,char**))%s,0,NULL); FILE *__tf=tmpfile(); if(__tf){ fputs(__out,__tf); fflush(__tf); int __tfd=fileno(__tf); snprintf(__ps_%d,sizeof(__ps_%d),\"/dev/fd/%%d\",__tfd); } else { __ps_%d[0]=0; } }\n",id,cmd,id,id,id);
+            char *r=malloc(32); snprintf(r,32,"__ps_%d",id);
+            return r;
+        }
         /* escape for C string */
         char esc[2100]; int ei=0;
         for(int i=0;cmd[i]&&ei<(int)sizeof(esc)-4;i++){
@@ -5578,12 +5591,32 @@ void emit_node(FILE *out, Node *n){
             pipe_restore_needed=1;
             /* fall through to normal while handling, but mark for restore */
         }
+        /* Check if condition starts with IFS= assignment before read */
+        const char *cond_str = n->while_cond ? n->while_cond : "";
+        const char *read_start = NULL;
+        char ifs_value[256] = "";
+        if(!strncmp(cond_str,"IFS=",4)){
+            /* Extract IFS value */
+            const char *vp=cond_str+4;
+            if(*vp=='"'){
+                vp++; int il=0;
+                while(*vp&&*vp!='"'&&il<255) ifs_value[il++]=*vp++;
+                if(*vp=='"') vp++; /* skip closing quote */
+            } else {
+                int il=0;
+                while(*vp&&*vp!=' '&&il<255) ifs_value[il++]=*vp++;
+            }
+            /* Find 'read' after IFS= */
+            while(*vp==' ') vp++;
+            if(!strncmp(vp,"read",4)) read_start=vp;
+        } else if(!strncmp(cond_str,"read",4) && (cond_str[4]==' '||cond_str[4]==0)){
+            read_start=cond_str;
+        }
         /* Check if condition is a read command (while read -r line) */
-        if(n->while_cond && !strncmp(n->while_cond,"read",4) &&
-           (n->while_cond[4]==' '||n->while_cond[4]==0)){
+        if(read_start){
             /* Parse read variables from condition */
             char vars[8][128]; int nv=0;
-            const char *p=n->while_cond+4;
+            const char *p=read_start+4;
             while(*p && nv<8){
                 while(*p==' '||*p=='\t') p++;
                 if(!*p) break;
@@ -5594,6 +5627,12 @@ void emit_node(FILE *out, Node *n){
                 if(vl>0){ add_var(vars[nv],V_STR); nv++; }
             }
             fprintf(out,"    { char __rb[4096];\n");
+            if(ifs_value[0]){
+                /* Set IFS for this loop */
+                char *esc=c_escape_literal(ifs_value);
+                fprintf(out,"    const char *__ifs=\"%s\";\n",esc);
+                free(esc);
+            }
             if(n->while_negate){
                 fprintf(out,"    while(!fgets(__rb,sizeof(__rb),stdin)){\n");
             } else {
@@ -5603,11 +5642,19 @@ void emit_node(FILE *out, Node *n){
             if(nv==1){
                 fprintf(out,"    strncpy(%s,__rb,sizeof(%s)-1);\n",safe_cname(vars[0]),safe_cname(vars[0]));
             } else if(nv>1){
-                fprintf(out,"    char *__sp=__rb; int __vi=0; char *__tok=strtok(__sp,\" \\t\");\n");
-                fprintf(out,"    while(__tok&&__vi<%d){ switch(__vi){\n",nv);
-                for(int i=0;i<nv;i++)
-                    fprintf(out,"    case %d: strncpy(%s,__tok,sizeof(%s)-1); break;\n",i,safe_cname(vars[i]),safe_cname(vars[i]));
-                fprintf(out,"    } __vi++; __tok=strtok(NULL,\" \\t\"); }\n");
+                if(ifs_value[0]){
+                    fprintf(out,"    char *__sp=__rb; int __vi=0; char *__tok=strtok(__sp,__ifs);\n");
+                    fprintf(out,"    while(__tok&&__vi<%d){ switch(__vi){\n",nv);
+                    for(int i=0;i<nv;i++)
+                        fprintf(out,"    case %d: strncpy(%s,__tok,sizeof(%s)-1); break;\n",i,safe_cname(vars[i]),safe_cname(vars[i]));
+                    fprintf(out,"    } __vi++; __tok=strtok(NULL,__ifs); }\n");
+                } else {
+                    fprintf(out,"    char *__sp=__rb; int __vi=0; char *__tok=strtok(__sp,\" \\t\");\n");
+                    fprintf(out,"    while(__tok&&__vi<%d){ switch(__vi){\n",nv);
+                    for(int i=0;i<nv;i++)
+                        fprintf(out,"    case %d: strncpy(%s,__tok,sizeof(%s)-1); break;\n",i,safe_cname(vars[i]),safe_cname(vars[i]));
+                    fprintf(out,"    } __vi++; __tok=strtok(NULL,\" \\t\"); }\n");
+                }
             }
             emit_node(out,n->while_body);
             fprintf(out,"    }\n    }\n");
@@ -6355,9 +6402,9 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             char cb[2048]="";
             for(int i=1;i<ntoks;i++){
                 if(!strcmp(toks[i],"do")||!strcmp(toks[i],";")) break;
-                /* skip VAR=VALUE prefixes (e.g. IFS= read -r line) */
+                /* skip VAR=VALUE prefixes but keep them in condition for emit */
                 if(is_assignment(toks[i]) && i<ntoks-1 && strcmp(toks[i+1],"do")!=0 && strcmp(toks[i+1],";")!=0){
-                    continue;
+                    /* Don't skip — include in condition for emit-time processing */
                 }
                 /* register read variables */
                 if(!strcmp(toks[i],"read")){
