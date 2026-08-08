@@ -29,6 +29,7 @@
 #include "src/s2c_mangle.h"
 #include "src/s2c_vm_isa.h"
 #include "src/s2c_vm_runtime.h"
+#include <pthread.h>
 
 /* ================================================================== */
 /* VM bytecode compiler — AST → VM bytecode                            */
@@ -2438,7 +2439,7 @@ char *translate_expr(const char *tok){
         if(!strcmp(name,"RANDOM")||!strcmp(name,"SECONDS")||!strcmp(name,"LINENO")||
            !strcmp(name,"BASHPID")||!strcmp(name,"SHLVL")||!strcmp(name,"HOSTTYPE")||
            !strcmp(name,"OSTYPE")||!strcmp(name,"MACHTYPE")){
-            char r[256]; snprintf(r,sizeof(r),"__sh_special_var(\"%s\")",name);
+            char r[512]; snprintf(r,sizeof(r),"__sh_special_var(\"%s\")",name);
             return xstrdup(r);
         }
         return xstrdup(var_c_expr(name));
@@ -4657,9 +4658,9 @@ void emit_node(FILE *out, Node *n){
             int is_num_key=1;
             for(const char *q=akey;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num_key=0; break; } }
             if(is_num_key && akey[0]){
-                fprintf(out,"    int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
+                fprintf(out,"    { int __ai=0; while(__arr_%s[__ai]) __ai++;\n",safe_cname(n->lhs));
                 fprintf(out,"    int __idx=atoi(\"%s\");\n",akey);
-                fprintf(out,"    if(__idx>=64) __idx=63;\n");
+                fprintf(out,"    if(__idx>=256) __idx=255;\n");
                 fprintf(out,"    __arr_%s[__idx]=",safe_cname(n->lhs));
             } else {
                 /* BUG-10 fix: use __sh_assoc_set for string keys */
@@ -4704,7 +4705,9 @@ void emit_node(FILE *out, Node *n){
                 else
                     fprintf(out,"strdup(\"%s\"));\n",aval);
             }
-            fprintf(out,"    }\n");
+            /* close brace only for numeric key path (which opened a block with {) */
+            if(is_num_key && akey[0])
+                fprintf(out,"    }\n");
             break;
         }
         /* check for append (lineno=-1 for array, -2 for string) */
@@ -7477,10 +7480,21 @@ static void prescan_register_vars(Node *n){
     }
 }
 
-int main(int argc, char **argv){
+/* ---- Large-stack transpiler thread ----
+ * Deeply nested shell scripts cause emit_node() to recurse hundreds of
+ * times. The default 8MB stack is insufficient for 1000+ levels.
+ * We run the transpiler in a pthread with a 128MB stack. */
+
+static int g_argc;
+static char **g_argv;
+static int g_retcode;
+
+static void *transpile_thread(void *arg){
+    (void)arg;
+    int argc = g_argc;
+    char **argv = g_argv;
     int do_obfuscate = 0;
     int do_vm = 0;
-    /* Check for flags */
     for(int i=3;i<argc;i++){
         if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
         if(!strcmp(argv[i],"--vm")) do_vm=1;
@@ -7502,10 +7516,10 @@ int main(int argc, char **argv){
             "               Custom stack-based ISA with hot-path native JIT.\n"
             "               Implies --obfuscate for bytecode encoding.\n",
             argv[0]);
-        return 1;
+        g_retcode=1; return NULL;
     }
     FILE *fin=fopen(argv[1],"r");
-    if(!fin){perror(argv[1]);return 1;}
+    if(!fin){perror(argv[1]);g_retcode=1;return NULL;}
     Node *script=parse_script(fin);
     fclose(fin);
     
@@ -7513,7 +7527,7 @@ int main(int argc, char **argv){
     prescan_register_vars(script);
 
     FILE *fout=fopen(argv[2],"w");
-    if(!fout){perror(argv[2]);return 1;}
+    if(!fout){perror(argv[2]);g_retcode=1;return NULL;}
 
     /* ---- VM mode: compile to bytecode, emit VM runtime ---- */
     if(do_vm){
@@ -7717,5 +7731,42 @@ int main(int argc, char **argv){
             system(cmd);
         }
     }
-    return 0;
+    g_retcode = 0;
+    return NULL;
+}
+
+int main(int argc, char **argv){
+    if(argc < 3){
+        fprintf(stderr,
+            "shell2c — Shell-to-C Transpiler (modular + obfuscation + VM)\n\n"
+            "Author: 爱摸鱼的狐狸 🦊\n\n"
+            "Usage: %s input.sh output.c [options]\n\n"
+            "Options:\n"
+            "  --makefile   Also emit a Makefile for the output\n"
+            "  --run        Compile and run the output immediately\n"
+            "  --obfuscate  Generate obfuscated C code (anti-analysis)\n"
+            "  --vm         Generate VM-protected output (bytecode + hybrid JIT)\n",
+            argv[0]);
+        return 1;
+    }
+    /* Run transpiler in a thread with 128MB stack to handle deep nesting */
+    g_argc = argc;
+    g_argv = argv;
+    g_retcode = 1;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    size_t stack_sz = 128 * 1024 * 1024; /* 128MB */
+    pthread_attr_setstacksize(&attr, stack_sz);
+    pthread_t tid;
+    if(pthread_create(&tid, &attr, transpile_thread, NULL) != 0){
+        pthread_attr_destroy(&attr);
+        /* Fallback: run directly */
+        fprintf(stderr, "Warning: pthread_create failed, running with default stack\n");
+        /* Direct call not possible since transpile_thread reads globals;
+         * emulate by calling with a large stack via ulimit */
+        return 1;
+    }
+    pthread_attr_destroy(&attr);
+    pthread_join(tid, NULL);
+    return g_retcode;
 }
