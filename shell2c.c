@@ -1493,6 +1493,10 @@ int tokenize(const char *line, char **toks, int maxtoks){
                 p++;
             }
             if(*p=='"') p++;
+            /* consume trailing bare chars (e.g. } after "str"}) */
+            while(*p && !isspace((unsigned char)*p) && *p!=';' && *p!='|' && *p!='&'
+                   && *p!='<' && *p!='>' && *p!='(' && *p!=')' && *p!='[' && *p!=']')
+                p++;
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
         }
         /* Note: standalone single-quoted strings are handled by the bare word
@@ -1637,7 +1641,7 @@ int tokenize(const char *line, char **toks, int maxtoks){
               }
               p++;
           }
-          if(p>s) toks[n++]=pool_dup(s,(int)(p-s));
+          if(p>s){ toks[n++]=pool_dup(s,(int)(p-s)); }
         }
     }
     toks[n]=NULL; return n;
