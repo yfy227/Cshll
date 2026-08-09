@@ -1257,6 +1257,9 @@ static const char *C_KEYWORDS_EXT[] = {
     "open","close","read","write","lseek","dup","dup2","pipe","fork","exec",
     "wait","waitpid","getpid","getppid","getuid","getgid","getenv","setenv",
     "chdir","getcwd","opendir","readdir","closedir","stat","fstat","lstat",
+    "on_exit","atexit","signal","system","popen","pclose","tmpfile","fopen","fclose",
+    "fread","fwrite","fgetc","fputc","fputs","fgets","clearerr","fileno","fseek",
+    "ftell","rewind","remove","rename","time","srand","rand","qsort","sort",
     NULL
 };
 
@@ -3220,6 +3223,7 @@ char *translate_cond(const char *cond){
                     !strcmp(words[wi+1],"!=")||!strcmp(words[wi+1],"<=")||
                     !strcmp(words[wi+1],">=")||!strcmp(words[wi+1],"<")||
                     !strcmp(words[wi+1],">")||!strcmp(words[wi+1],"=~")||
+                    !strcmp(words[wi+1],"\\<")||!strcmp(words[wi+1],"\\>")||
                     !strcmp(words[wi+1],"-eq")||!strcmp(words[wi+1],"-ne")||
                     !strcmp(words[wi+1],"-lt")||!strcmp(words[wi+1],"-le")||
                     !strcmp(words[wi+1],"-gt")||!strcmp(words[wi+1],"-ge")||
@@ -3319,6 +3323,7 @@ char *translate_cond(const char *cond){
                     !strcmp(words[wi+1],"=")||!strcmp(words[wi+1],"==")||
                     !strcmp(words[wi+1],"!=")||!strcmp(words[wi+1],"<")||
                     !strcmp(words[wi+1],">")||!strcmp(words[wi+1],"=~")||
+                    !strcmp(words[wi+1],"\\<")||!strcmp(words[wi+1],"\\>")||
                     !strcmp(words[wi+1],"-eq")||!strcmp(words[wi+1],"-ne")||
                     !strcmp(words[wi+1],"-lt")||!strcmp(words[wi+1],"-le")||
                     !strcmp(words[wi+1],"-gt")||!strcmp(words[wi+1],"-ge")||
@@ -6113,6 +6118,12 @@ void extract_array_assign(const char *t, char *name, int name_sz, char *key, int
     int kl=(int)(rb-lb-1);
     if(kl>=key_sz) kl=key_sz-1;
     memcpy(key,lb+1,kl); key[kl]=0;
+    /* Strip surrounding quotes from key */
+    { int kl2=(int)strlen(key);
+      if(kl2>=2 && ((key[0]=='"'&&key[kl2-1]=='"') || (key[0]=='\''&&key[kl2-1]=='\''))){
+        memmove(key,key+1,kl2-2); key[kl2-2]=0;
+      }
+    }
     const char *eq=rb+1;
     *is_append=0;
     if(*eq=='+'){ *is_append=1; eq++; }
@@ -7214,6 +7225,33 @@ Node *parse_script(FILE *f){
                                         t[cur_len]=0;
                                     }
                                 }
+                                /* Check if next line is the closing ) for $(...) */
+                                {
+                                    char peek[256];
+                                    if(fgets(peek,sizeof(peek),f)){
+                                        /* strip newline */
+                                        int pl=strlen(peek);
+                                        while(pl>0 && (peek[pl-1]=='\n'||peek[pl-1]=='\r')) peek[--pl]=0;
+                                        /* If it's just ), append to current line */
+                                        if(strcmp(peek,")")==0 && cur_len<(int)sizeof(line)-2){
+                                            t[cur_len++]=')';
+                                            t[cur_len]=0;
+                                        } else {
+                                            /* Not ), push back as next line */
+                                            /* Re-add newline */
+                                            peek[pl]='\n'; peek[pl+1]=0;
+                                            /* Can't ungetc a whole line, but we can prepend to a buffer */
+                                            /* Simple approach: process as part of current line */
+                                            if(cur_len+pl+1 < (int)sizeof(line)-1){
+                                                t[cur_len++]='\n';
+                                                memcpy(t+cur_len,peek,pl+1);
+                                                cur_len+=pl;
+                                                t[cur_len]=0;
+                                            }
+                                        }
+                                        lineno++;
+                                    }
+                                }
                             }
                             scan+=2;
                             continue;
@@ -7304,6 +7342,7 @@ const char *RT_HEADER =
 "\n"
 "static int __exit_status=0;\n"
 "static int __sh_argc=0;\n"
+"static char **__sh_args=NULL;\n"
 "static int __sh_last_bg_pid=0;\n"
 "static int __sh_set_e=0;\n"
 "static int __sh_set_u=0;\n"
@@ -8357,6 +8396,7 @@ static void *transpile_thread(void *arg){
     fprintf(fout,"    setvbuf(stdin, NULL, _IONBF, 0);\n");
     fprintf(fout,"    __sh_start_time=time(NULL);\n");
     fprintf(fout,"    __sh_argc = _argc - 1;\n");
+    fprintf(fout,"    __sh_args = _argv + 1;\n");
     for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
     fprintf(fout,"\n");
