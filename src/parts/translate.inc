@@ -340,6 +340,8 @@ static char *expand_cmd_subst(const char *cmd){
             }
         } else {
             if(*p=='"'||*p=='\\') fmt[fi++]='\\';
+            if(*p=='\n'){ fmt[fi++]='\\'; fmt[fi++]='n'; p++; continue; }
+            if(*p=='\t'){ fmt[fi++]='\\'; fmt[fi++]='t'; p++; continue; }
             fmt[fi++]=*p++;
         }
     }
@@ -473,13 +475,13 @@ char *translate_arith(const char *expr){
                 }
             }
         } else {
-            /* Detect division/modulo by zero — replace /0 with /(0||1) */
+            /* Detect division/modulo by zero — emit runtime check + fallback */
             if(*s=='/'||*s=='%'){
                 const char *np=s+1;
                 while(*np==' '||*np=='\t') np++;
                 if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
-                    /* /0 or %0 — replace /0 with /1 to avoid SIGFPE */
-                    q+=snprintf(buf+q,sizeof(buf)-q,"/1");
+                    /* /0 or %0 — emit runtime error + safe fallback */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"%c(__sh_div_zero(),1)",*s);
                     s=np+1; continue;
                 }
             }

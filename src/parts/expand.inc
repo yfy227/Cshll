@@ -286,12 +286,16 @@ void expand_string(const char *s, ExpandResult *er){
                         }
                     }
                     else {
-                        /* Detect /0 or %0 to avoid SIGFPE */
+                        /* Detect /0 or %0 — emit runtime error + safe fallback */
                         if((*p=='/'||*p=='%')){
                             const char *np=p+1;
                             while(*np==' '||*np=='\t') np++;
                             if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
-                                expr[k++]='/'; expr[k++]='1';
+                                expr[k++]=*p; expr[k++]='('; expr[k++]='_'; expr[k++]='_';
+                                expr[k++]='s'; expr[k++]='h'; expr[k++]='_'; expr[k++]='d';
+                                expr[k++]='i'; expr[k++]='v'; expr[k++]='_'; expr[k++]='z';
+                                expr[k++]='e'; expr[k++]='r'; expr[k++]='o'; expr[k++]='(';
+                                expr[k++]=')'; expr[k++]=','; expr[k++]='1'; expr[k++]=')';
                                 p=np+1; continue;
                             }
                         }
@@ -372,8 +376,10 @@ void expand_string(const char *s, ExpandResult *er){
                         snprintf(r,sizeof(r),"__sh_cmd_output(%s)",expanded);
                     } else {
                         char esc[1050]; int e=0;
-                        for(int i=0;cmd[i]&&e<(int)sizeof(esc)-4;i++){
+                        for(int i=0;cmd[i]&&e<(int)sizeof(esc)-6;i++){
                             if(cmd[i]=='"'||cmd[i]=='\\') esc[e++]='\\';
+                            if(cmd[i]=='\n'){ esc[e++]='\\'; esc[e++]='n'; continue; }
+                            if(cmd[i]=='\t'){ esc[e++]='\\'; esc[e++]='t'; continue; }
                             esc[e++]=cmd[i];
                         }
                         esc[e]=0;
