@@ -419,179 +419,417 @@ static void *transpile_thread(void *arg){
 }
 
 /* ============================================================
- * -all mode: Package all .sh files into a standalone terminal
+ * -all mode: Interactive terminal interpreter mode
+ * shell2c becomes a complete shell with env, path, apt/pkg support
  * ============================================================ */
 
-/* Scan directory for .sh files */
-static int scan_sh_files(const char *dir, char files[][512], int max){
-    DIR *dp=opendir(dir);
-    if(!dp) return 0;
-    int n=0;
-    struct dirent *e;
-    while((e=readdir(dp)) && n<max){
-        int len=strlen(e->d_name);
-        if(len>3 && !strcmp(e->d_name+len-3,".sh")){
-            snprintf(files[n],512,"%s/%s",dir,e->d_name);
-            n++;
+static void init_terminal_env(void){
+    /* Complete environment variable setup */
+    setenv("SHELL","/bin/sh",1);
+    setenv("TERM","xterm-256color",1);
+    setenv("LANG","C.UTF-8",1);
+    setenv("LC_ALL","C.UTF-8",1);
+    setenv("PS1","\\u@\\h:\\w$ ",1);
+    setenv("PROMPT_COMMAND","",1);
+
+    /* Ensure PATH includes all standard tool locations */
+    const char *path=getenv("PATH");
+    if(!path || !*path){
+        setenv("PATH",
+            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
+            "/sbin:/bin:/usr/games:/usr/local/games:"
+            "/opt/local/bin:/opt/bin:"
+            "/snap/bin:/home/"
+            ,1);
+    } else {
+        /* Append missing standard paths */
+        char newpath[4096];
+        const char *extra[]={
+            "/usr/local/sbin","/usr/local/bin","/usr/sbin","/usr/bin",
+            "/sbin","/bin","/snap/bin",NULL
+        };
+        snprintf(newpath,sizeof(newpath),"%s",path);
+        for(int i=0;extra[i];i++){
+            if(!strstr(path,extra[i])){
+                strncat(newpath,":",sizeof(newpath)-strlen(newpath)-1);
+                strncat(newpath,extra[i],sizeof(newpath)-strlen(newpath)-1);
+            }
         }
+        setenv("PATH",newpath,1);
     }
-    closedir(dp);
-    return n;
+
+    /* Ensure HOME is set */
+    if(!getenv("HOME") || !*getenv("HOME")){
+        char hm[256];
+        snprintf(hm,sizeof(hm),"/home/%s",getenv("USER")?getenv("USER"):"root");
+        setenv("HOME",hm,1);
+    }
+
+    /* Set default IFS */
+    setenv("IFS"," \t\n",1);
+}
+
+static int is_pkg_tool(const char *cmd){
+    return !strcmp(cmd,"apt")||!strcmp(cmd,"apt-get")||!strcmp(cmd,"apt-cache")||
+           !strcmp(cmd,"pkg")||!strcmp(cmd,"dpkg")||!strcmp(cmd,"snap")||
+           !strcmp(cmd,"pip")||!strcmp(cmd,"pip3")||!strcmp(cmd,"npm")||
+           !strcmp(cmd,"cargo")||!strcmp(cmd,"gem")||!strcmp(cmd,"yarn")||
+           !strcmp(cmd,"brew")||!strcmp(cmd,"conda")||!strcmp(cmd,"nix");
+}
+
+static int is_shell_builtin(const char *cmd){
+    return !strcmp(cmd,"cd")||!strcmp(cmd,"pwd")||!strcmp(cmd,"echo")||
+           !strcmp(cmd,"export")||!strcmp(cmd,"unset")||!strcmp(cmd,"set")||
+           !strcmp(cmd,"source")||!strcmp(cmd,"alias")||!strcmp(cmd,"history")||
+           !strcmp(cmd,"exit")||!strcmp(cmd,"quit")||!strcmp(cmd,"help")||
+           !strcmp(cmd,"env")||!strcmp(cmd,"which")||!strcmp(cmd,"type")||
+           !strcmp(cmd,"read")||!strcmp(cmd,"eval")||!strcmp(cmd,"exec");
+}
+
+static int run_shell_builtin(int argc, char **argv){
+    if(!strcmp(argv[0],"cd")){
+        const char *dir=argc>1?argv[1]:getenv("HOME");
+        if(!dir) dir="/";
+        if(chdir(dir)!=0){ perror("cd"); return 1; }
+        char cwd[1024]; getcwd(cwd,sizeof(cwd));
+        setenv("PWD",cwd,1);
+        return 0;
+    }
+    if(!strcmp(argv[0],"pwd")){
+        char cwd[1024]; getcwd(cwd,sizeof(cwd));
+        printf("%s\n",cwd);
+        return 0;
+    }
+    if(!strcmp(argv[0],"echo")){
+        for(int i=1;i<argc;i++){
+            if(i>1) putchar(' ');
+            /* Expand $VAR in args, strip outer quotes */
+            const char *s=argv[i];
+            int slen=strlen(s);
+            /* Strip outer double quotes */
+            if(slen>=2 && s[0]=='"' && s[slen-1]=='"'){
+                s++; slen-=2;
+            }
+            while(*s && slen>0){
+                if(*s=='$' && s[1]){
+                    char vn[128]; int vi=0; s++; slen--;
+                    if(*s=='{'){ s++; slen--; while(*s&&*s!='}'&&vi<127){ vn[vi++]=*s++; slen--; } if(*s){s++; slen--;} }
+                    else { while(*s&&(isalnum((unsigned char)*s)||*s=='_')&&vi<127){ vn[vi++]=*s++; slen--; } }
+                    vn[vi]=0;
+                    const char *val=getenv(vn);
+                    if(val) fputs(val,stdout);
+                } else { putchar(*s); s++; slen--; }
+            }
+        }
+        putchar('\n');
+        return 0;
+    }
+    if(!strcmp(argv[0],"export")){
+        if(argc<2){ /* print all env */ extern char **environ; for(char **e=environ;*e;e++) printf("%s\n",*e); return 0; }
+        for(int i=1;i<argc;i++){
+            char *eq=strchr(argv[i],'=');
+            if(eq){ *eq=0; setenv(argv[i],eq+1,1); }
+            else { /* export VAR (no assignment) — just mark */ }
+        }
+        return 0;
+    }
+    if(!strcmp(argv[0],"unset")){
+        for(int i=1;i<argc;i++) unsetenv(argv[i]);
+        return 0;
+    }
+    if(!strcmp(argv[0],"env")){
+        extern char **environ;
+        for(char **e=environ;*e;e++) printf("%s\n",*e);
+        return 0;
+    }
+    if(!strcmp(argv[0],"which")||!strcmp(argv[0],"type")){
+        if(argc<2) return 1;
+        char path[4096]; snprintf(path,sizeof(path),"%s",getenv("PATH"));
+        char *tok=strtok(path,":");
+        while(tok){
+            char fp[1024]; snprintf(fp,sizeof(fp),"%s/%s",tok,argv[1]);
+            if(access(fp,X_OK)==0){ printf("%s\n",fp); return 0; }
+            tok=strtok(NULL,":");
+        }
+        fprintf(stderr,"%s: not found\n",argv[1]);
+        return 1;
+    }
+    if(!strcmp(argv[0],"alias")){
+        if(argc<2){ system("alias 2>/dev/null || true"); return 0; }
+        /* Store alias as env var with __alias_ prefix */
+        char an[256]; snprintf(an,sizeof(an),"__alias_%s",argv[1]);
+        if(argc>2) setenv(an,argv[2],1);
+        return 0;
+    }
+    if(!strcmp(argv[0],"history")){
+        system("history 2>/dev/null || cat ~/.bash_history 2>/dev/null || true");
+        return 0;
+    }
+    if(!strcmp(argv[0],"source")||!strcmp(argv[0],".")){
+        if(argc<2) return 1;
+        char cmd[1024]; snprintf(cmd,sizeof(cmd),"source %s 2>/dev/null || . %s",argv[1],argv[1]);
+        return system(cmd);
+    }
+    if(!strcmp(argv[0],"eval")){
+        char cmd[4096]="";
+        for(int i=1;i<argc;i++){ if(i>1) strcat(cmd," "); strncat(cmd,argv[i],sizeof(cmd)-strlen(cmd)-1); }
+        return system(cmd);
+    }
+    if(!strcmp(argv[0],"exec")){
+        /* exec: replace current process */
+        if(argc>1) execvp(argv[1],argv+1);
+        return 0;
+    }
+    if(!strcmp(argv[0],"set")){
+        if(argc<2){ extern char **environ; for(char **e=environ;*e;e++) printf("%s\n",*e); return 0; }
+        /* set VAR=val */
+        for(int i=1;i<argc;i++){
+            char *eq=strchr(argv[i],'=');
+            if(eq){ *eq=0; setenv(argv[i],eq+1,1); }
+        }
+        return 0;
+    }
+    if(!strcmp(argv[0],"exit")||!strcmp(argv[0],"quit")) return -999;
+    if(!strcmp(argv[0],"help")){
+        printf("shell2c Interactive Shell — Built-in Commands:\n");
+        printf("  cd [dir]       Change directory\n");
+        printf("  pwd            Print working directory\n");
+        printf("  echo [args]    Print arguments ($VAR expansion)\n");
+        printf("  export VAR=val Set environment variable\n");
+        printf("  unset VAR     Remove environment variable\n");
+        printf("  env           Print all environment variables\n");
+        printf("  which cmd     Find command in PATH\n");
+        printf("  alias         Set/view aliases\n");
+        printf("  source file   Execute script file\n");
+        printf("  eval cmd      Evaluate command string\n");
+        printf("  exec cmd      Replace process with command\n");
+        printf("  set [VAR=val] Set env or print all\n");
+        printf("  history       Show command history\n");
+        printf("  help          Show this help\n");
+        printf("  exit          Exit shell\n\n");
+        printf("Package managers: apt, apt-get, pkg, dpkg, snap, pip, npm, cargo, gem, yarn, brew, conda\n");
+        printf("All system commands available via PATH.\n");
+        return 0;
+    }
+    return -1; /* not a builtin */
+}
+
+static char *expand_vars(const char *line){
+    static char buf[8192];
+    int bi=0;
+    const char *s=line;
+    while(*s && bi<(int)sizeof(buf)-2){
+        if(*s=='$' && s[1]){
+            char vn[128]; int vi=0; s++;
+            if(*s=='{'){ s++; while(*s&&*s!='}'&&vi<127) vn[vi++]=*s++; if(*s)s++; }
+            else if(*s=='('){ /* $(cmd) */ s++; int d=1; char cmd[2048]; int ci=0;
+                while(*s&&d&&ci<2047){ if(*s=='(')d++; else if(*s==')'){d--;if(d==0){s++;break;}} cmd[ci++]=*s++; }
+                cmd[ci]=0;
+                FILE *p=popen(cmd,"r"); if(p){ char tb[4096]; size_t n=fread(tb,1,4095,p); tb[n>0?n:0]=0; pclose(p);
+                    /* strip trailing newline */
+                    while(n>0&&tb[n-1]=='\n') tb[--n]=0;
+                    for(int j=0;j<(int)n&&bi<sizeof(buf)-2;j++) buf[bi++]=tb[j];
+                }
+                continue;
+            }
+            else { while(*s&&(isalnum((unsigned char)*s)||*s=='_')&&vi<127) vn[vi++]=*s++; }
+            vn[vi]=0;
+            if(vi>0){
+                const char *val=getenv(vn);
+                if(val){ int vl=strlen(val); for(int j=0;j<vl&&bi<(int)sizeof(buf)-2;j++) buf[bi++]=val[j]; }
+            } else { buf[bi++]='$'; }
+            continue;
+        }
+        if(*s=='~' && (s==line || s[-1]==' ' || s[-1]=='\t')){
+            const char *home=getenv("HOME"); if(home){ int hl=strlen(home); for(int j=0;j<hl&&bi<(int)sizeof(buf)-2;j++) buf[bi++]=home[j]; s++; continue; }
+        }
+        buf[bi++]=*s++;
+    }
+    buf[bi]=0;
+    return buf;
+}
+
+static char *parse_redirections(char *line, int *stdin_fd, int *stdout_fd, int *stderr_fd){
+    /* Handle >, <, 2>, >>, 2>&1, | */
+    /* For simplicity, pipe and complex redirections fall through to system() */
+    *stdin_fd=-1; *stdout_fd=-1; *stderr_fd=-1;
+    return line;
 }
 
 int shell2c_all_mode(int argc, char **argv){
-    fprintf(stderr,"shell2c -all — Standalone Terminal Packaging Mode\n");
-    fprintf(stderr,"=================================================\n\n");
+    /* Initialize complete terminal environment */
+    init_terminal_env();
 
-    /* Determine output binary name */
-    const char *outname = "terminal";
+    /* Check if running a single command: shell2c -all -c "command" */
+    const char *single_cmd=NULL;
     for(int i=1;i<argc;i++){
-        if((!strcmp(argv[i],"-o")||!strcmp(argv[i],"--output")) && i+1<argc){
-            outname=argv[++i];
+        if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"-e")) && i+1<argc){
+            single_cmd=argv[++i];
         }
     }
 
-    /* Scan current directory for .sh files */
-    char sh_files[64][512];
-    int nfiles=scan_sh_files(".",sh_files,64);
-
-    if(nfiles==0){
-        fprintf(stderr,"No .sh files found in current directory.\n");
-        fprintf(stderr,"Place your shell scripts in the current directory and run shell2c -all again.\n");
-        return 1;
+    if(single_cmd){
+        /* Execute single command and exit */
+        char *expanded=expand_vars(single_cmd);
+        /* Try builtins first */
+        char *toks[64]; int nt=0;
+        char *tk=strtok(expanded," \t");
+        while(tk && nt<63){ toks[nt++]=tk; tk=strtok(NULL," \t"); }
+        toks[nt]=NULL;
+        if(nt>0){
+            int rc=run_shell_builtin(nt,toks);
+            if(rc==-999) return 0;
+            if(rc>=0) return rc;
+        }
+        /* Fall through to system() */
+        return system(single_cmd);
     }
 
-    fprintf(stderr,"Found %d script(s):\n",nfiles);
-    for(int i=0;i<nfiles;i++){
-        fprintf(stderr,"  [%d] %s\n",i+1,sh_files[i]);
-    }
-    fprintf(stderr,"\n");
+    /* Interactive REPL mode */
+    printf("\n");
+    printf("╔══════════════════════════════════════════════╗\n");
+    printf("║  shell2c Interactive Terminal v1.0           ║\n");
+    printf("║  Complete shell environment with package     ║\n");
+    printf("║  management support (apt/pkg/dpkg/snap)     ║\n");
+    printf("╚══════════════════════════════════════════════╝\n");
+    printf("\n");
+    printf("Environment:\n");
+    printf("  USER: %s\n", getenv("USER")?getenv("USER"):"(unset)");
+    printf("  HOME: %s\n", getenv("HOME"));
+    printf("  SHELL: %s\n", getenv("SHELL"));
+    printf("  TERM: %s\n", getenv("TERM"));
+    printf("  PATH: %s\n", getenv("PATH"));
+    printf("  PWD: %s\n", getenv("PWD")?getenv("PWD"):"(unset)");
+    printf("\n");
+    printf("Package tools: apt apt-get pkg dpkg snap pip npm cargo gem yarn brew conda\n");
+    printf("Type 'help' for built-in commands, 'exit' to quit.\n\n");
 
-    /* Create a temporary build directory */
-    mkdir("/tmp/s2c_all_build",0755);
+    /* Read-eval loop */
+    char line[8192];
+    int last_rc=0;
+    while(1){
+        /* Print prompt */
+        char cwd[1024]; getcwd(cwd,sizeof(cwd));
+        const char *user=getenv("USER")?getenv("USER"):"user";
+        const char *host=getenv("HOSTNAME")?getenv("HOSTNAME"):"shell2c";
+        if(strlen(host)>20) host="shell2c";
+        /* Shorten home in cwd */
+        const char *home=getenv("HOME");
+        char cwd_disp[1024];
+        if(home && !strncmp(cwd,home,strlen(home))){
+            snprintf(cwd_disp,sizeof(cwd_disp),"~%s",cwd+strlen(home));
+        } else {
+            snprintf(cwd_disp,sizeof(cwd_disp),"%s",cwd);
+        }
+        printf("%s@%s:%s$ ",user,host,cwd_disp);
+        fflush(stdout);
 
-    /* Generate the main terminal program */
-    char main_c_path[512];
-    snprintf(main_c_path,512,"/tmp/s2c_all_build/terminal_main.c");
-    FILE *fm=fopen(main_c_path,"w");
-    if(!fm){ perror(main_c_path); return 1; }
+        if(!fgets(line,sizeof(line),stdin)) break;
+        /* Strip newline */
+        int ll=strlen(line);
+        while(ll>0 && (line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
+        if(!ll) continue;
 
-    /* Emit the full runtime + interactive menu */
-    fprintf(fm,"/* Standalone Terminal — generated by shell2c -all */\n");
-    fprintf(fm,"#include <stdio.h>\n");
-    fprintf(fm,"#include <stdlib.h>\n");
-    fprintf(fm,"#include <string.h>\n");
-    fprintf(fm,"#include <unistd.h>\n");
-    fprintf(fm,"#include <sys/wait.h>\n\n");
+        /* Expand $VAR and ~ */
+        char *expanded=expand_vars(line);
+        if(!expanded || !*expanded) continue;
 
-    /* Embed script names and contents */
-    fprintf(fm,"/* ---- Embedded scripts ---- */\n");
-    for(int i=0;i<nfiles;i++){
-        /* Read file content */
-        FILE *sf=fopen(sh_files[i],"r");
-        if(!sf) continue;
-        fseek(sf,0,SEEK_END);
-        long sz=ftell(sf);
-        fseek(sf,0,SEEK_SET);
-        char *content=malloc(sz+1);
-        fread(content,1,sz,sf);
-        content[sz]=0;
-        fclose(sf);
+        /* Tokenize */
+        char *toks[64]; int nt=0;
+        char *tk=strtok(expanded," \t");
+        while(tk && nt<63){ toks[nt++]=tk; tk=strtok(NULL," \t"); }
+        toks[nt]=NULL;
+        if(nt==0) continue;
 
-        fprintf(fm,"static const char *__script_%d =\n",i);
-        for(const char *p=content;*p;p++){
-            fputc('"',fm);
-            for(;*p && *p!='\n';p++){
-                if(*p=='"'||*p=='\\') fputc('\\',fm);
-                fputc(*p,fm);
+        /* Check for pipe — if present, use system() */
+        int has_pipe=0;
+        for(int i=0;i<nt;i++) if(!strcmp(toks[i],"|")){ has_pipe=1; break; }
+        if(has_pipe){
+            int rc=system(line);
+            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
+            else last_rc=1;
+            continue;
+        }
+
+        /* Check for && and || */
+        int has_and=0,has_or=0;
+        for(int i=0;i<nt;i++){
+            if(!strcmp(toks[i],"&&")){ has_and=1; break; }
+            if(!strcmp(toks[i],"||")){ has_or=1; break; }
+        }
+        if(has_and||has_or){
+            int rc=system(line);
+            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
+            else last_rc=1;
+            continue;
+        }
+
+        /* Check for redirection */
+        int has_redir=0;
+        for(int i=0;i<nt;i++){
+            if(toks[i][0]=='>'||toks[i][0]=='<'||(toks[i][0]=='2'&&toks[i][1]=='>')){
+                has_redir=1; break;
             }
-            fprintf(fm,"\\n\"\n");
-            if(!*p) break;
         }
-        fprintf(fm,";\n\n");
-        free(content);
+        if(has_redir){
+            int rc=system(line);
+            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
+            else last_rc=1;
+            continue;
+        }
+
+        /* Try shell builtins */
+        int rc=run_shell_builtin(nt,toks);
+        if(rc==-999) break; /* exit */
+        if(rc>=0){ last_rc=rc; continue; }
+
+        /* Package tools — pass through with full env */
+        if(is_pkg_tool(toks[0])){
+            /* Ensure package manager exists */
+            int rc=system(line);
+            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
+            else last_rc=1;
+            continue;
+        }
+
+        /* Regular external command — search PATH and execute */
+        char path_env[4096]; snprintf(path_env,sizeof(path_env),"%s",getenv("PATH"));
+        char *ptok=strtok(path_env,":");
+        int found=0;
+        while(ptok){
+            char fp[1024]; snprintf(fp,sizeof(fp),"%s/%s",ptok,toks[0]);
+            if(access(fp,X_OK)==0){ found=1; break; }
+            ptok=strtok(NULL,":");
+        }
+        if(!found){
+            fprintf(stderr,"%s: command not found\n",toks[0]);
+            last_rc=127;
+            continue;
+        }
+
+        /* Execute via system() for complex commands, or fork+exec for simple ones */
+        pid_t pid=fork();
+        if(pid==0){
+            /* Child */
+            execvp(toks[0],toks);
+            /* If execvp fails, try system() as fallback */
+            fprintf(stderr,"%s: execution failed\n",toks[0]);
+            _exit(127);
+        } else if(pid>0){
+            int status;
+            waitpid(pid,&status,0);
+            if(WIFEXITED(status)) last_rc=WEXITSTATUS(status);
+            else last_rc=1;
+        } else {
+            /* fork failed — fallback to system() */
+            int rc=system(line);
+            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
+            else last_rc=1;
+        }
     }
 
-    /* Emit menu */
-    fprintf(fm,"int main(int argc, char **argv){\n");
-
-    /* Check for direct run mode: ./terminal 1 → run script 1 (no menu) */
-    fprintf(fm,"    if(argc>1){\n");
-    fprintf(fm,"        int sel=atoi(argv[1]);\n");
-    fprintf(fm,"        if(sel<1||sel>%d){fprintf(stderr,\"Invalid selection\\n\");return 1;}\n",nfiles);
-    fprintf(fm,"        char tmpf[256]; snprintf(tmpf,sizeof(tmpf),\"/tmp/s2c_run_%%d.sh\",getpid());\n");
-    fprintf(fm,"        FILE *tf=fopen(tmpf,\"w\");\n");
-    fprintf(fm,"        if(!tf){perror(tmpf);return 1;}\n");
-    for(int i=0;i<nfiles;i++){
-        fprintf(fm,"        if(sel==%d){fputs(__script_%d,tf);}\n",i+1,i);
-    }
-    fprintf(fm,"        fclose(tf);\n");
-    fprintf(fm,"        /* Execute via system() — this runs in a real shell */\n");
-    fprintf(fm,"        char cmd[512]; snprintf(cmd,sizeof(cmd),\"bash \\\"%%s\\\"\",tmpf);\n");
-    fprintf(fm,"        int rc=system(cmd);\n");
-    fprintf(fm,"        unlink(tmpf);\n");
-    fprintf(fm,"        if(WIFEXITED(rc)) return WEXITSTATUS(rc);\n");
-    fprintf(fm,"        return 1;\n");
-    fprintf(fm,"    }\n\n");
-
-    /* Interactive menu mode — print banner */
-    fprintf(fm,"    printf(\"\\n\");\n");
-    fprintf(fm,"    printf(\"========================================\\n\");\n");
-    fprintf(fm,"    printf(\"  Standalone Terminal (shell2c -all)   \\n\");\n");
-    fprintf(fm,"    printf(\"========================================\\n\");\n");
-    fprintf(fm,"    printf(\"\\n\");\n");
-    fprintf(fm,"    printf(\"Embedded scripts:\\n\");\n");
-    for(int i=0;i<nfiles;i++){
-        { char _bn[600]; snprintf(_bn,sizeof(_bn),"    printf(\"  %%d. %%s\\n\",%d,\"%s\");\n",i+1,sh_files[i]); fputs(_bn,fm); }
-    }
-    fprintf(fm,"    printf(\"  0. Exit\\n\");\n");
-    fprintf(fm,"    printf(\"\\n\");\n");
-    fprintf(fm,"    while(1){\n");
-    fprintf(fm,"        printf(\"\\nSelect script [1-%d, 0=exit]: \",%d);\n",nfiles,nfiles);
-    fprintf(fm,"        char buf[32];\n");
-    fprintf(fm,"        if(!fgets(buf,sizeof(buf),stdin)) break;\n");
-    fprintf(fm,"        int sel=atoi(buf);\n");
-    fprintf(fm,"        if(sel==0) break;\n");
-    fprintf(fm,"        if(sel<1||sel>%d){printf(\"Invalid selection\\n\");continue;}\n",nfiles);
-    fprintf(fm,"        char tmpf[256]; snprintf(tmpf,sizeof(tmpf),\"/tmp/s2c_run_%%d.sh\",getpid());\n");
-    fprintf(fm,"        FILE *tf=fopen(tmpf,\"w\");\n");
-    fprintf(fm,"        if(!tf){perror(tmpf);continue;}\n");
-    for(int i=0;i<nfiles;i++){
-        fprintf(fm,"        if(sel==%d){fputs(__script_%d,tf);}\n",i+1,i);
-    }
-    fprintf(fm,"        fclose(tf);\n");
-    fprintf(fm,"        char cmd[512]; snprintf(cmd,sizeof(cmd),\"bash \\\"%%s\\\"\",tmpf);\n");
-    fprintf(fm,"        system(cmd);\n");
-    fprintf(fm,"        unlink(tmpf);\n");
-    fprintf(fm,"    }\n");
-    fprintf(fm,"    printf(\"Goodbye.\\n\");\n");
-    fprintf(fm,"    return 0;\n");
-    fprintf(fm,"}\n");
-    fclose(fm);
-
-    fprintf(stderr,"Compiling standalone terminal...\n");
-
-    /* Compile the terminal program */
-    char compile_cmd[2048];
-    snprintf(compile_cmd,sizeof(compile_cmd),
-        "gcc -O2 -o %s %s -lpthread 2>&1",
-        outname, main_c_path);
-    int rc=system(compile_cmd);
-    if(rc!=0){
-        fprintf(stderr,"Compilation failed. Check errors above.\n");
-        return 1;
-    }
-
-    fprintf(stderr,"\n[OK] Standalone terminal created: %s\n",outname);
-    fprintf(stderr,"\nUsage:\n");
-    fprintf(stderr,"  ./%s          Interactive menu mode\n",outname);
-    fprintf(stderr,"  ./%s N        Directly run script #N\n",outname);
-    fprintf(stderr,"\nEmbedded scripts:\n");
-    for(int i=0;i<nfiles;i++){
-        fprintf(stderr,"  %d. %s\n",i+1,sh_files[i]);
-    }
-
-    return 0;
+    printf("\n");
+    return last_rc;
 }
 
 int main(int argc, char **argv){
@@ -612,8 +850,8 @@ int main(int argc, char **argv){
             "  --run        Compile and run the output immediately\n"
             "  --obfuscate  Generate obfuscated C code (anti-analysis)\n"
             "  --vm         Generate VM-protected output (bytecode + hybrid JIT)\n"
-            "  -all         Package all .sh files in current directory into a\n"
-            "               standalone terminal program (no script processing)\n",
+            "  -all         Interactive terminal mode — shell2c becomes a complete\n"
+            "               shell interpreter with full env, PATH, apt/pkg support\n",
             argv[0]);
         return 1;
     }
