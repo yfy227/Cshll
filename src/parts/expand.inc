@@ -64,7 +64,59 @@ void expand_string(const char *s, ExpandResult *er){
                     else if(*p==')'){ if(d==0 && *(p+1)==')') { p+=2; break; } d--; }
                     if(*p=='$'){
                         p++;
-                        if(*p=='{'){
+                        /* Check for $(cmd...) command substitution inside $(( )) */
+                        if(*p=='(' && *(p+1)!='('){
+                            p++; /* skip ( */
+                            char cmd[1024]; int ci=0; int d=1;
+                            while(*p && d && ci<(int)sizeof(cmd)-1){
+                                if(*p=='(') d++;
+                                else if(*p==')'){ d--; if(d==0) break; }
+                                cmd[ci++]=*p++;
+                            }
+                            cmd[ci]=0; if(*p==')') p++;
+                            /* Extract function name */
+                            char fname[256]; int fi2=0;
+                            const char *sp=cmd;
+                            while(*sp==' '||*sp=='\t') sp++;
+                            while(*sp && *sp!=' ' && *sp!='\t' && fi2<(int)sizeof(fname)-1) fname[fi2++]=*sp++;
+                            fname[fi2]=0;
+                            if(is_user_func(fname)){
+                                const char *pre="atoi(__sh_capture_fn((void(*)(int,char**))";
+                                while(*pre && k<(int)sizeof(expr)-32) expr[k++]=*pre++;
+                                const char *cn=safe_cname(fname);
+                                while(*cn && k<(int)sizeof(expr)-32) expr[k++]=*cn++;
+                                /* Count args */
+                                const char *ap=cmd+fi2;
+                                while(*ap==' '||*ap=='\t') ap++;
+                                int nargs=0;
+                                expr[k++]='0';
+                                while(*ap && nargs<9){
+                                    while(*ap==' '||*ap=='\t') ap++;
+                                    if(!*ap) break;
+                                    char arg[256]; int al=0;
+                                    if(*ap=='"'){ ap++; while(*ap&&*ap!='"'&&al<255) arg[al++]=*ap++; if(*ap=='"')ap++; }
+                                    else { while(*ap&&*ap!=' '&&*ap!='\t'&&al<255) arg[al++]=*ap++; }
+                                    arg[al]=0;
+                                    if(al>0){
+                                        expr[k++]=','; expr[k++]='"';
+                                        for(int ai=0;ai<al&&k<(int)sizeof(expr)-8;ai++) expr[k++]=arg[ai];
+                                        expr[k++]='"'; nargs++;
+                                    }
+                                }
+                                expr[k++]=','; expr[k++]='N'; expr[k++]='U'; expr[k++]='L'; expr[k++]='L';
+                                expr[k++]=')'; expr[k++]=')';
+                            } else {
+                                /* External command → atoi(__sh_cmd_output("cmd")) */
+                                const char *pre="atoi(__sh_cmd_output(\"";
+                                while(*pre && k<(int)sizeof(expr)-32) expr[k++]=*pre++;
+                                for(int ei=0;cmd[ei]&&k<(int)sizeof(expr)-8;ei++){
+                                    if(cmd[ei]=='"'||cmd[ei]=='\\') expr[k++]='\\';
+                                    expr[k++]=cmd[ei];
+                                }
+                                const char *suf="\"))";
+                                while(*suf && k<(int)sizeof(expr)-8) expr[k++]=*suf++;
+                            }
+                        } else if(*p=='{'){
                             p++;
                             char nm[128]; int j=0;
                             while(*p&&*p!='}') nm[j++]=*p++;

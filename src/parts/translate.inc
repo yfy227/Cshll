@@ -557,7 +557,8 @@ char *translate_expr(const char *tok){
             if(*s=='$'){
                 s++;
                 /* Check for $(cmd...) command substitution inside $(( )) */
-                if(*s=='('){
+                /* But NOT $((...)) which is arithmetic */
+                if(*s=='(' && *(s+1)!='('){
                     s++; /* skip ( */
                     char cmd[1024]; int ci=0; int d=1;
                     while(*s && d && ci<(int)sizeof(cmd)-1){

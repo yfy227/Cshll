@@ -398,6 +398,10 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 BlkFrame *fr=blk_top; Node *pif=fr->node;
                 fr->kind=BLK_IF_ELSE;
                 parse_insert=&pif->else_blk;
+                /* Dispatch tokens after 'else' on same line (e.g., "else echo x; fi") */
+                if(ntoks>1){
+                    dispatch_segment(toks+1, ntoks-1, lineno);
+                }
             } return;
         }
         if(!strcmp(kw,"fi")){ parser_pop(); return; }
