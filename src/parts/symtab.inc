@@ -158,6 +158,9 @@ int heredoc_store(const char *text, int expand){
     heredoc_table[heredoc_count].expand = expand;
     return heredoc_count++;
 }
+int heredoc_peek(void){
+    return heredoc_next < heredoc_count;
+}
 const char *heredoc_consume(int *expand){
     if(heredoc_next>=heredoc_count){ if(expand)*expand=1; return ""; }
     if(expand) *expand = heredoc_table[heredoc_next].expand;

@@ -571,8 +571,9 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         if(!strcmp(n->argv[i], "<<") || !strncmp(n->argv[i], "<<", 2)){
             /* Consume heredoc from the table */
             extern const char *heredoc_consume(int *expand);
+            extern int heredoc_peek(void);
             int hd_expand = 1;
-            const char *hd_text = heredoc_consume(&hd_expand);
+            const char *hd_text = heredoc_peek() ? heredoc_consume(&hd_expand) : NULL;
             if(hd_text){
                 /* For cat <<EOF, print the heredoc content */
                 if(hd_expand){

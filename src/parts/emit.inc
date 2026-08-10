@@ -446,7 +446,13 @@ void emit_command(FILE *out, char **argv, int ac, int id){
         return;
     }
     if(!strcmp(cmd,"tr")){
-        if(ac>=3){
+        if(ac>=2 && !strcmp(argv[1],"-d")){
+            /* tr -d SET: delete characters in SET */
+            if(ac>=3){
+                char *a=emit_word(out,argv[2]);
+                fprintf(out,"    __b_tr_delete(%s);\n",a); free(a);
+            }
+        } else if(ac>=3){
             char *a=emit_word(out,argv[1]),*b=emit_word(out,argv[2]);
             fprintf(out,"    __b_tr(%s,%s);\n",a,b); free(a); free(b);
         }

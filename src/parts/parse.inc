@@ -539,16 +539,27 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             parser_push(fr); parse_insert=&nd->body; return;
         }
         if(!strcmp(kw,"done")){
-            /* Check for redirect after done (e.g., done < file) */
-            if(ntoks>2 && blk_top && (blk_top->kind==BLK_WHILE||blk_top->kind==BLK_UNTIL)){
+            /* Check for redirect after done (e.g., done < file, done << HD) */
+            if(blk_top && (blk_top->kind==BLK_WHILE||blk_top->kind==BLK_UNTIL)){
                 Node *wnd=blk_top->node;
-                for(int i=1;i+1<ntoks;i++){
-                    if(!strcmp(toks[i],"<")){
-                        Redir *r=new_redir(0,toks[i+1],0,-1,0,0,0);
-                        /* append to redir list */
-                        if(!wnd->redirs) wnd->redirs=r;
-                        else { Redir *p=wnd->redirs; while(p->next)p=p->next; p->next=r; }
+                /* Check for < file redirect */
+                if(ntoks>2){
+                    for(int i=1;i+1<ntoks;i++){
+                        if(!strcmp(toks[i],"<")){
+                            Redir *r=new_redir(0,toks[i+1],0,-1,0,0,0);
+                            if(!wnd->redirs) wnd->redirs=r;
+                            else { Redir *p=wnd->redirs; while(p->next)p=p->next; p->next=r; }
+                        }
                     }
+                }
+                /* Check for unconsumed heredoc (<<HD was pre-scanned and removed) */
+                if(heredoc_peek()){
+                    int hd_expand=1;
+                    const char *hd_text=heredoc_consume(&hd_expand);
+                    Redir *r=new_redir(0,NULL,0,-1,1,0,hd_text);
+                    r->hd_expand=hd_expand;
+                    if(!wnd->redirs) wnd->redirs=r;
+                    else { Redir *p=wnd->redirs; while(p->next)p=p->next; p->next=r; }
                 }
             }
             parser_pop(); return;
