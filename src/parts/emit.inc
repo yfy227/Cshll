@@ -1021,14 +1021,14 @@ void emit_command(FILE *out, char **argv, int ac, int id){
         if(nv==0) vars[nv++]="REPLY";
         if(read_array){
             add_var(vars[0],V_ARRAY);
-            fprintf(out,"    { char __rb[4096]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;\n");
+            fprintf(out,"    { char __rb[65536]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;\n");
             fprintf(out,"    int __ai=0; const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \t\";\n");
             fprintf(out,"    char *__sp=__rb; char *__tok=strtok(__sp,__ifs);\n");
             fprintf(out,"    while(__tok&&__ai<255){ __arr_%s[__ai++]=strdup(__tok); __tok=strtok(NULL,__ifs); } __arr_%s[__ai]=NULL;\n",safe_cname(vars[0]),safe_cname(vars[0]));
             fprintf(out,"    } }\n");
             return;
         }
-        fprintf(out,"    { char __rb[4096]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;");
+        fprintf(out,"    { char __rb[65536]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;");
         if(nv==1){
             fprintf(out,"    strncpy(%s,__rb,sizeof(%s)-1);",safe_cname(vars[0]),safe_cname(vars[0]));
         } else {
@@ -1610,7 +1610,7 @@ void emit_node(FILE *out, Node *n){
                     /* Unquoted variable expansion — word-split at runtime */
                     ExpandResult er; expand_string(items[i],&er);
                     int id=tmp_id++;
-                    fprintf(out,"    { char __tw_%d[4096]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    fprintf(out,"    { char __tw_%d[65536]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                     fprintf(out,");\n");
                     expand_free(&er);
@@ -1625,7 +1625,7 @@ void emit_node(FILE *out, Node *n){
                     /* Quoted or mixed item with $ — expand as single element */
                     ExpandResult er; expand_string(items[i],&er);
                     int id=tmp_id++;
-                    fprintf(out,"    char __tw_%d[4096]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    fprintf(out,"    char __tw_%d[65536]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                     fprintf(out,");\n");
                     expand_free(&er);
@@ -1963,7 +1963,7 @@ void emit_node(FILE *out, Node *n){
                 int is_args = (listexpr[0]=='@' || listexpr[0]=='*');
                 const char *vname = is_args ? "__sh_join_args(__sh_argc,__sh_args)" : safe_cname(listexpr);
                 fprintf(out,"    {\n");
-                fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
+                fprintf(out,"    char __sbuf[65536]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",vname);
                 fprintf(out,"    char *__sv=__sbuf;\n");
                 /* BUG-12 fix: use IFS for word splitting */
                 fprintf(out,"    const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \\t\\n\";\n");
@@ -1987,7 +1987,7 @@ void emit_node(FILE *out, Node *n){
                 /* $(cmd) — execute, word-split output, iterate */
                 char *w=emit_word(out,n->for_list[0]);
                 fprintf(out,"    {\n");
-                fprintf(out,"    char __sbuf[4096]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",w);
+                fprintf(out,"    char __sbuf[65536]; strncpy(__sbuf,%s,sizeof(__sbuf)-1); __sbuf[sizeof(__sbuf)-1]=0;\n",w);
                 free(w);
                 fprintf(out,"    char *__sv=__sbuf;\n");
                 /* Use IFS for word splitting (same as do_split_var path) */
@@ -2109,7 +2109,7 @@ void emit_node(FILE *out, Node *n){
                 vars[nv][vl]=0;
                 if(vl>0){ add_var(vars[nv],V_STR); nv++; }
             }
-            fprintf(out,"    { char __rb[4096];\n");
+            fprintf(out,"    { char __rb[65536];\n");
             if(ifs_value[0]){
                 /* Set IFS for this loop */
                 char *esc=c_escape_literal(ifs_value);
@@ -2173,7 +2173,7 @@ void emit_node(FILE *out, Node *n){
             free(esc);
         }
         fprintf(out,"    printf(\"#? \"); fflush(stdout);\n");
-        fprintf(out,"    char __sl[4096]; if(!fgets(__sl,sizeof(__sl),stdin)) break;\n");
+        fprintf(out,"    char __sl[65536]; if(!fgets(__sl,sizeof(__sl),stdin)) break;\n");
         fprintf(out,"    __sl[strcspn(__sl,\"\\r\\n\")]=0;\n");
         fprintf(out,"    int __sn=atoi(__sl);\n");
         fprintf(out,"    if(__sn<1||__sn>%d) continue;\n",n->for_len);
@@ -2391,7 +2391,7 @@ void emit_functions(FILE *out, Node *n){
             max_arg=3;
         }
         for(int i=1;i<=max_arg;i++)
-            fprintf(out,"    char __sh_arg%d[4096]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],4095);\n",
+            fprintf(out,"    char __sh_arg%d[65536]=\"\"; if(__sh_argc>=%d)strncpy(__sh_arg%d,__sh_args[%d-1],65535);\n",
                     i,i,i,i);
         /* Scan for local variables and save them */
         char locals[32][128]; int nloc=0;

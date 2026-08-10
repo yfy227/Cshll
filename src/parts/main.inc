@@ -285,7 +285,7 @@ static void *transpile_thread(void *arg){
     /* global variables */
     fprintf(fout,"/* ---- user variables ---- */\n");
     /* BUG-18 fix: increase buffer from 1024 to 4096 */
-    for(int i=0;i<=9;i++) fprintf(fout,"static char __sh_arg%d[4096]=\"\";\n",i);
+    for(int i=0;i<=9;i++) fprintf(fout,"static char __sh_arg%d[65536]=\"\";\n",i);
     for(int i=0;i<var_count;i++){
         const char *cn=safe_cname(var_table[i].name);
         if(var_table[i].kind==V_INT)
@@ -293,7 +293,7 @@ static void *transpile_thread(void *arg){
         else if(var_table[i].kind==V_ARRAY)
             fprintf(fout,"static const char *__arr_%s[256]={NULL};\n",cn);
         else
-            fprintf(fout,"static char %s[4096]=\"\";\n",cn);
+            fprintf(fout,"static char %s[65536]=\"\";\n",cn);
     }
     fprintf(fout,"\n");
 

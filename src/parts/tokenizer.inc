@@ -60,9 +60,20 @@ int tokenize(const char *line, char **toks, int maxtoks){
                 if(*p=='$'&&*(p+1)=='('){
                     p+=2; int d=1;
                     while(*p&&d){
-                        if(*p=='"'){ p++; while(*p&&*p!='"')p++; if(*p)p++; continue; }
+                        if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1)){p+=2;continue;} p++; } if(*p)p++; continue; }
                         if(*p=='\''){ p++; while(*p&&*p!='\'')p++; if(*p)p++; continue; }
                         if(*p=='(')d++; else if(*p==')')d--;
+                        p++;
+                    }
+                    continue;
+                }
+                /* Skip ${...} inside double-quoted strings — skip inner quotes too */
+                if(*p=='$'&&*(p+1)=='{'){
+                    p+=2; int d=1;
+                    while(*p&&d){
+                        if(*p=='"'){ p++; while(*p&&*p!='"'){ if(*p=='\\'&&*(p+1)){p+=2;continue;} p++; } if(*p)p++; continue; }
+                        if(*p=='\''){ p++; while(*p&&*p!='\'')p++; if(*p)p++; continue; }
+                        if(*p=='{')d++; else if(*p=='}')d--;
                         p++;
                     }
                     continue;
