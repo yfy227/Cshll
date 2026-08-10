@@ -860,6 +860,27 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 nd->rhs=xstrdup(arr_rhs);
                 add_var(nd->lhs,V_ARRAY);
             } else {
+                /* Check for VAR=val cmd args pattern (e.g., IFS=: read -ra p) */
+                /* If rhs is non-empty and there are more tokens, it's a prefix assignment */
+                if(rhs[0] && ntoks>1 && strncmp(rhs,"$((",3)!=0 && strncmp(rhs,"$(",2)!=0 && rhs[0]!='"'){
+                    /* VAR=val is just rhs; rest (toks[1..]) is a command */
+                    nd->rhs=xstrdup(rhs);
+                    /* Register variable type */
+                    if(strncmp(rhs,"$((",3)==0) add_var(nd->lhs,V_INT);
+                    else if(strncmp(rhs,"$(",2)==0) add_var(nd->lhs,V_STR);
+                    else{
+                        int inum=1; const char *r2=rhs;
+                        if(*r2=='-'||*r2=='+')r2++;
+                        if(!*r2)inum=0;
+                        while(*r2){if(!isdigit((unsigned char)*r2)){inum=0;break;}r2++;}
+                        if(inum&&rhs[0]) add_var(nd->lhs,V_INT);
+                        else add_var(nd->lhs,V_STR);
+                    }
+                    parser_append(nd);
+                    /* Dispatch remaining tokens as a separate command */
+                    dispatch_segment(toks+1, ntoks-1, lineno);
+                    return;
+                }
                 for(int i=1;i<ntoks;i++){
                     if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
                     if(rhs[0]) strncat(rhs," ",sizeof(rhs)-strlen(rhs)-1);

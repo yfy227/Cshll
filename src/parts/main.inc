@@ -315,6 +315,7 @@ static void *transpile_thread(void *arg){
     fprintf(fout,"int main(int _argc, char **_argv){\n");
     fprintf(fout,"    setvbuf(stdout, NULL, _IONBF, 0);\n");
     fprintf(fout,"    setvbuf(stdin, NULL, _IONBF, 0);\n");
+    fprintf(fout,"    setvbuf(stderr, NULL, _IONBF, 0);\n");
     fprintf(fout,"    __sh_start_time=time(NULL);\n");
     fprintf(fout,"    __sh_argc = _argc - 1;\n");
     fprintf(fout,"    __sh_args = _argv + 1;\n");

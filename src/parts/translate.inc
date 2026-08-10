@@ -474,6 +474,27 @@ char *translate_arith(const char *expr){
                     s=np+1; continue;
                 }
             }
+            /* ** → power operator */
+            if(*s=='*'&&*(s+1)=='*'){
+                /* Find base: last token in buf */
+                int bs=q;
+                while(bs>0 && (isalnum((unsigned char)buf[bs-1])||buf[bs-1]=='_')) bs--;
+                if(bs<q){
+                    char base[256]; int bl=q-bs;
+                    memcpy(base,buf+bs,bl); base[bl]=0;
+                    q=bs;
+                    const char *fn="(int)__sh_pow("; while(*fn) buf[q++]=*fn++;
+                    for(int bi=0;base[bi];bi++) buf[q++]=base[bi];
+                    buf[q++]=',';
+                    s+=2;
+                    while(*s==' ') s++;
+                    while(*s && *s!=')' && *s!=' ' && *s!='+' && *s!='-' && *s!='*' && *s!='/' && *s!='%' && q<(int)sizeof(buf)-4){
+                        buf[q++]=*s++;
+                    }
+                    buf[q++]=')';
+                    continue;
+                }
+            }
             buf[q++]=*s++;
         }
     }

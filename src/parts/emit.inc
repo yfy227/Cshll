@@ -1009,12 +1009,25 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     }
     if(!strcmp(cmd,"read")){
         const char *vars[8]; int nv=0;
+        int read_array=0;
         for(int i=1;i<ac;i++){
             if(!strcmp(argv[i],"-r")||!strcmp(argv[i],"-p")) continue;
-            if(argv[i][0]=='-') continue;
+            if(argv[i][0]=='-'){
+                for(const char *fc=argv[i];*fc;fc++) if(*fc=='a') read_array=1;
+                continue;
+            }
             if(nv<7) vars[nv++]=argv[i];
         }
         if(nv==0) vars[nv++]="REPLY";
+        if(read_array){
+            add_var(vars[0],V_ARRAY);
+            fprintf(out,"    { char __rb[4096]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;\n");
+            fprintf(out,"    int __ai=0; const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \t\";\n");
+            fprintf(out,"    char *__sp=__rb; char *__tok=strtok(__sp,__ifs);\n");
+            fprintf(out,"    while(__tok&&__ai<255){ __arr_%s[__ai++]=strdup(__tok); __tok=strtok(NULL,__ifs); } __arr_%s[__ai]=NULL;\n",safe_cname(vars[0]),safe_cname(vars[0]));
+            fprintf(out,"    } }\n");
+            return;
+        }
         fprintf(out,"    { char __rb[4096]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;");
         if(nv==1){
             fprintf(out,"    strncpy(%s,__rb,sizeof(%s)-1);",safe_cname(vars[0]),safe_cname(vars[0]));
@@ -1325,12 +1338,25 @@ void emit_command(FILE *out, char **argv, int ac, int id){
             }
         } else {
             /* system command via system() — supports ALL system commands */
+            /* Check for bash -c / sh -c pattern: need to quote the script argument */
+            int is_bash_c = (ac>=3 && !strcmp(argv[0],"bash") && !strcmp(argv[1],"-c"));
+            int is_sh_c   = (ac>=3 && !strcmp(argv[0],"sh") && !strcmp(argv[1],"-c"));
             fprintf(out,"    { char __cmd%d[8192]; int __cl=0;\n",id);
             for(int i=0;i<ac;i++){
-                char *w=emit_word(out,argv[i]);
                 if(i>0){ fprintf(out,"    __cmd%d[__cl++]=' ';\n",id); }
-                fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
-                free(w);
+                /* For bash -c / sh -c, the script argument (i>=2) needs quoting */
+                if((is_bash_c||is_sh_c) && i>=2){
+                    /* Quote the argument to preserve it as a single shell string */
+                    char *w=emit_word(out,argv[i]);
+                    fprintf(out,"    __cmd%d[__cl++]='\\'';\n",id);
+                    fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
+                    fprintf(out,"    __cmd%d[__cl++]='\\'';\n",id);
+                    free(w);
+                } else {
+                    char *w=emit_word(out,argv[i]);
+                    fprintf(out,"    __cl+=snprintf(__cmd%d+__cl,sizeof(__cmd%d)-__cl,\"%%s\",%s);\n",id,id,w);
+                    free(w);
+                }
             }
             fprintf(out,"    __exit_status=system(__cmd%d);\n",id);
             fprintf(out,"    if(WIFEXITED(__exit_status))__exit_status=WEXITSTATUS(__exit_status);\n");
