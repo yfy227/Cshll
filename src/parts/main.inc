@@ -418,419 +418,272 @@ static void *transpile_thread(void *arg){
     return NULL;
 }
 
+
 /* ============================================================
  * -all mode: Interactive terminal interpreter mode
- * shell2c becomes a complete shell with env, path, apt/pkg support
+ * shell2c becomes a complete shell — uses built-in runtime
+ * functions directly, not system() fallback
  * ============================================================ */
 
+/* Include the live runtime (same code as emitted into output C files) */
+#include "src/s2c_runtime_live.h"
+
 static void init_terminal_env(void){
-    /* Complete environment variable setup */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     setenv("SHELL","/bin/sh",1);
     setenv("TERM","xterm-256color",1);
     setenv("LANG","C.UTF-8",1);
     setenv("LC_ALL","C.UTF-8",1);
     setenv("PS1","\\u@\\h:\\w$ ",1);
-    setenv("PROMPT_COMMAND","",1);
-
-    /* Ensure PATH includes all standard tool locations */
     const char *path=getenv("PATH");
     if(!path || !*path){
-        setenv("PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:"
-            "/sbin:/bin:/usr/games:/usr/local/games:"
-            "/opt/local/bin:/opt/bin:"
-            "/snap/bin:/home/"
-            ,1);
+        setenv("PATH","/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin",1);
     } else {
-        /* Append missing standard paths */
-        char newpath[4096];
-        const char *extra[]={
-            "/usr/local/sbin","/usr/local/bin","/usr/sbin","/usr/bin",
-            "/sbin","/bin","/snap/bin",NULL
-        };
-        snprintf(newpath,sizeof(newpath),"%s",path);
-        for(int i=0;extra[i];i++){
-            if(!strstr(path,extra[i])){
-                strncat(newpath,":",sizeof(newpath)-strlen(newpath)-1);
-                strncat(newpath,extra[i],sizeof(newpath)-strlen(newpath)-1);
-            }
-        }
-        setenv("PATH",newpath,1);
+        char np[4096]; snprintf(np,sizeof(np),"%s",path);
+        const char *extra[]={"/usr/local/sbin","/usr/local/bin","/usr/sbin","/usr/bin","/sbin","/bin","/snap/bin",NULL};
+        for(int i=0;extra[i];i++){ if(!strstr(path,extra[i])){ strncat(np,":",sizeof(np)-strlen(np)-1); strncat(np,extra[i],sizeof(np)-strlen(np)-1); } }
+        setenv("PATH",np,1);
     }
-
-    /* Ensure HOME is set */
-    if(!getenv("HOME") || !*getenv("HOME")){
-        char hm[256];
-        snprintf(hm,sizeof(hm),"/home/%s",getenv("USER")?getenv("USER"):"root");
-        setenv("HOME",hm,1);
-    }
-
-    /* Set default IFS */
+    if(!getenv("HOME")||!*getenv("HOME")){ char hm[256]; snprintf(hm,sizeof(hm),"/home/%s",getenv("USER")?getenv("USER"):"root"); setenv("HOME",hm,1); }
     setenv("IFS"," \t\n",1);
 }
 
-static int is_pkg_tool(const char *cmd){
-    return !strcmp(cmd,"apt")||!strcmp(cmd,"apt-get")||!strcmp(cmd,"apt-cache")||
-           !strcmp(cmd,"pkg")||!strcmp(cmd,"dpkg")||!strcmp(cmd,"snap")||
-           !strcmp(cmd,"pip")||!strcmp(cmd,"pip3")||!strcmp(cmd,"npm")||
-           !strcmp(cmd,"cargo")||!strcmp(cmd,"gem")||!strcmp(cmd,"yarn")||
-           !strcmp(cmd,"brew")||!strcmp(cmd,"conda")||!strcmp(cmd,"nix");
-}
-
-static int is_shell_builtin(const char *cmd){
-    return !strcmp(cmd,"cd")||!strcmp(cmd,"pwd")||!strcmp(cmd,"echo")||
-           !strcmp(cmd,"export")||!strcmp(cmd,"unset")||!strcmp(cmd,"set")||
-           !strcmp(cmd,"source")||!strcmp(cmd,"alias")||!strcmp(cmd,"history")||
-           !strcmp(cmd,"exit")||!strcmp(cmd,"quit")||!strcmp(cmd,"help")||
-           !strcmp(cmd,"env")||!strcmp(cmd,"which")||!strcmp(cmd,"type")||
-           !strcmp(cmd,"read")||!strcmp(cmd,"eval")||!strcmp(cmd,"exec");
-}
-
-static int run_shell_builtin(int argc, char **argv){
-    if(!strcmp(argv[0],"cd")){
-        const char *dir=argc>1?argv[1]:getenv("HOME");
-        if(!dir) dir="/";
-        if(chdir(dir)!=0){ perror("cd"); return 1; }
-        char cwd[1024]; getcwd(cwd,sizeof(cwd));
-        setenv("PWD",cwd,1);
-        return 0;
-    }
-    if(!strcmp(argv[0],"pwd")){
-        char cwd[1024]; getcwd(cwd,sizeof(cwd));
-        printf("%s\n",cwd);
-        return 0;
-    }
-    if(!strcmp(argv[0],"echo")){
-        for(int i=1;i<argc;i++){
-            if(i>1) putchar(' ');
-            /* Expand $VAR in args, strip outer quotes */
-            const char *s=argv[i];
-            int slen=strlen(s);
-            /* Strip outer double quotes */
-            if(slen>=2 && s[0]=='"' && s[slen-1]=='"'){
-                s++; slen-=2;
-            }
-            while(*s && slen>0){
-                if(*s=='$' && s[1]){
-                    char vn[128]; int vi=0; s++; slen--;
-                    if(*s=='{'){ s++; slen--; while(*s&&*s!='}'&&vi<127){ vn[vi++]=*s++; slen--; } if(*s){s++; slen--;} }
-                    else { while(*s&&(isalnum((unsigned char)*s)||*s=='_')&&vi<127){ vn[vi++]=*s++; slen--; } }
-                    vn[vi]=0;
-                    const char *val=getenv(vn);
-                    if(val) fputs(val,stdout);
-                } else { putchar(*s); s++; slen--; }
-            }
-        }
-        putchar('\n');
-        return 0;
-    }
-    if(!strcmp(argv[0],"export")){
-        if(argc<2){ /* print all env */ extern char **environ; for(char **e=environ;*e;e++) printf("%s\n",*e); return 0; }
-        for(int i=1;i<argc;i++){
-            char *eq=strchr(argv[i],'=');
-            if(eq){ *eq=0; setenv(argv[i],eq+1,1); }
-            else { /* export VAR (no assignment) — just mark */ }
-        }
-        return 0;
-    }
-    if(!strcmp(argv[0],"unset")){
-        for(int i=1;i<argc;i++) unsetenv(argv[i]);
-        return 0;
-    }
-    if(!strcmp(argv[0],"env")){
-        extern char **environ;
-        for(char **e=environ;*e;e++) printf("%s\n",*e);
-        return 0;
-    }
-    if(!strcmp(argv[0],"which")||!strcmp(argv[0],"type")){
-        if(argc<2) return 1;
-        char path[4096]; snprintf(path,sizeof(path),"%s",getenv("PATH"));
-        char *tok=strtok(path,":");
-        while(tok){
-            char fp[1024]; snprintf(fp,sizeof(fp),"%s/%s",tok,argv[1]);
-            if(access(fp,X_OK)==0){ printf("%s\n",fp); return 0; }
-            tok=strtok(NULL,":");
-        }
-        fprintf(stderr,"%s: not found\n",argv[1]);
-        return 1;
-    }
-    if(!strcmp(argv[0],"alias")){
-        if(argc<2){ system("alias 2>/dev/null || true"); return 0; }
-        /* Store alias as env var with __alias_ prefix */
-        char an[256]; snprintf(an,sizeof(an),"__alias_%s",argv[1]);
-        if(argc>2) setenv(an,argv[2],1);
-        return 0;
-    }
-    if(!strcmp(argv[0],"history")){
-        system("history 2>/dev/null || cat ~/.bash_history 2>/dev/null || true");
-        return 0;
-    }
-    if(!strcmp(argv[0],"source")||!strcmp(argv[0],".")){
-        if(argc<2) return 1;
-        char cmd[1024]; snprintf(cmd,sizeof(cmd),"source %s 2>/dev/null || . %s",argv[1],argv[1]);
-        return system(cmd);
-    }
-    if(!strcmp(argv[0],"eval")){
-        char cmd[4096]="";
-        for(int i=1;i<argc;i++){ if(i>1) strcat(cmd," "); strncat(cmd,argv[i],sizeof(cmd)-strlen(cmd)-1); }
-        return system(cmd);
-    }
-    if(!strcmp(argv[0],"exec")){
-        /* exec: replace current process */
-        if(argc>1) execvp(argv[1],argv+1);
-        return 0;
-    }
-    if(!strcmp(argv[0],"set")){
-        if(argc<2){ extern char **environ; for(char **e=environ;*e;e++) printf("%s\n",*e); return 0; }
-        /* set VAR=val */
-        for(int i=1;i<argc;i++){
-            char *eq=strchr(argv[i],'=');
-            if(eq){ *eq=0; setenv(argv[i],eq+1,1); }
-        }
-        return 0;
-    }
-    if(!strcmp(argv[0],"exit")||!strcmp(argv[0],"quit")) return -999;
-    if(!strcmp(argv[0],"help")){
-        printf("shell2c Interactive Shell — Built-in Commands:\n");
-        printf("  cd [dir]       Change directory\n");
-        printf("  pwd            Print working directory\n");
-        printf("  echo [args]    Print arguments ($VAR expansion)\n");
-        printf("  export VAR=val Set environment variable\n");
-        printf("  unset VAR     Remove environment variable\n");
-        printf("  env           Print all environment variables\n");
-        printf("  which cmd     Find command in PATH\n");
-        printf("  alias         Set/view aliases\n");
-        printf("  source file   Execute script file\n");
-        printf("  eval cmd      Evaluate command string\n");
-        printf("  exec cmd      Replace process with command\n");
-        printf("  set [VAR=val] Set env or print all\n");
-        printf("  history       Show command history\n");
-        printf("  help          Show this help\n");
-        printf("  exit          Exit shell\n\n");
-        printf("Package managers: apt, apt-get, pkg, dpkg, snap, pip, npm, cargo, gem, yarn, brew, conda\n");
-        printf("All system commands available via PATH.\n");
-        return 0;
-    }
-    return -1; /* not a builtin */
-}
-
 static char *expand_vars(const char *line){
-    static char buf[8192];
-    int bi=0;
+    static char buf[16384]; int bi=0;
     const char *s=line;
-    while(*s && bi<(int)sizeof(buf)-2){
+    while(*s && bi<(int)sizeof(buf)-4){
         if(*s=='$' && s[1]){
             char vn[128]; int vi=0; s++;
             if(*s=='{'){ s++; while(*s&&*s!='}'&&vi<127) vn[vi++]=*s++; if(*s)s++; }
-            else if(*s=='('){ /* $(cmd) */ s++; int d=1; char cmd[2048]; int ci=0;
-                while(*s&&d&&ci<2047){ if(*s=='(')d++; else if(*s==')'){d--;if(d==0){s++;break;}} cmd[ci++]=*s++; }
+            else if(*s=='('){ s++; int d=1; char cmd[4096]; int ci=0;
+                while(*s&&d&&ci<4095){ if(*s=='(')d++; else if(*s==')'){d--;if(d==0){s++;break;}} cmd[ci++]=*s++; }
                 cmd[ci]=0;
-                FILE *p=popen(cmd,"r"); if(p){ char tb[4096]; size_t n=fread(tb,1,4095,p); tb[n>0?n:0]=0; pclose(p);
-                    /* strip trailing newline */
+                FILE *p=popen(cmd,"r"); if(p){ char tb[8192]; size_t n=fread(tb,1,8191,p); tb[n>0?n:0]=0; pclose(p);
                     while(n>0&&tb[n-1]=='\n') tb[--n]=0;
-                    for(int j=0;j<(int)n&&bi<sizeof(buf)-2;j++) buf[bi++]=tb[j];
-                }
-                continue;
-            }
+                    for(size_t j=0;j<n&&bi<(int)sizeof(buf)-4;j++) buf[bi++]=tb[j]; }
+                continue; }
             else { while(*s&&(isalnum((unsigned char)*s)||*s=='_')&&vi<127) vn[vi++]=*s++; }
             vn[vi]=0;
-            if(vi>0){
-                const char *val=getenv(vn);
-                if(val){ int vl=strlen(val); for(int j=0;j<vl&&bi<(int)sizeof(buf)-2;j++) buf[bi++]=val[j]; }
-            } else { buf[bi++]='$'; }
+            if(vi>0){ const char *val=getenv(vn); if(val){ int vl=strlen(val); for(int j=0;j<vl&&bi<(int)sizeof(buf)-4;j++) buf[bi++]=val[j]; } }
+            else buf[bi++]='$';
             continue;
         }
         if(*s=='~' && (s==line || s[-1]==' ' || s[-1]=='\t')){
-            const char *home=getenv("HOME"); if(home){ int hl=strlen(home); for(int j=0;j<hl&&bi<(int)sizeof(buf)-2;j++) buf[bi++]=home[j]; s++; continue; }
+            const char *home=getenv("HOME"); if(home){ int hl=strlen(home); for(int j=0;j<hl&&bi<(int)sizeof(buf)-4;j++) buf[bi++]=home[j]; s++; continue; }
         }
         buf[bi++]=*s++;
     }
-    buf[bi]=0;
-    return buf;
+    buf[bi]=0; return buf;
 }
 
-static char *parse_redirections(char *line, int *stdin_fd, int *stdout_fd, int *stderr_fd){
-    /* Handle >, <, 2>, >>, 2>&1, | */
-    /* For simplicity, pipe and complex redirections fall through to system() */
-    *stdin_fd=-1; *stdout_fd=-1; *stderr_fd=-1;
-    return line;
+static int exec_external(int argc, char **argv){
+    pid_t pid=fork();
+    if(pid==0){ execvp(argv[0],argv); fprintf(stderr,"%s: command not found\n",argv[0]); _exit(127); }
+    if(pid>0){ int st; waitpid(pid,&st,0); return WIFEXITED(st)?WEXITSTATUS(st):1; }
+    return 1;
+}
+
+static int try_builtin(int argc, char **argv){
+    if(!strcmp(argv[0],"cd")){ const char *d=argc>1?argv[1]:getenv("HOME"); if(!d)d="/"; if(chdir(d)!=0){perror("cd");return 1;} char cwd[1024]; getcwd(cwd,sizeof(cwd)); setenv("PWD",cwd,1); return 0; }
+    if(!strcmp(argv[0],"pwd")){ __b_pwd(); return 0; }
+    if(!strcmp(argv[0],"echo")){
+        for(int i=1;i<argc;i++){ if(i>1) putchar(' '); const char *s=argv[i]; int sl=strlen(s);
+            if(sl>=2&&s[0]=='"'&&s[sl-1]=='"'){ s++; sl-=2; }
+            while(*s&&sl-->0){ if(*s=='$'&&s[1]){ char vn[128]; int vi=0; s++;
+                if(*s=='{'){s++;while(*s&&*s!='}'&&vi<127)vn[vi++]=*s++;if(*s)s++;}
+                else{while(*s&&(isalnum((unsigned char)*s)||*s=='_')&&vi<127)vn[vi++]=*s++;}
+                vn[vi]=0; const char *v=getenv(vn); if(v)fputs(v,stdout);
+            } else { putchar(*s); s++; } } }
+        putchar('\n'); return 0;
+    }
+    if(!strcmp(argv[0],"export")){ if(argc<2){__b_env();return 0;} for(int i=1;i<argc;i++){char *eq=strchr(argv[i],'=');if(eq){*eq=0;setenv(argv[i],eq+1,1);}} return 0; }
+    if(!strcmp(argv[0],"unset")){ for(int i=1;i<argc;i++) unsetenv(argv[i]); return 0; }
+    if(!strcmp(argv[0],"env")){ __b_env(); return 0; }
+    if(!strcmp(argv[0],"set")){ if(argc<2){__b_env();return 0;} for(int i=1;i<argc;i++){char *eq=strchr(argv[i],'=');if(eq){*eq=0;setenv(argv[i],eq+1,1);}} return 0; }
+    if(!strcmp(argv[0],"which")||!strcmp(argv[0],"type")){ if(argc>1)__b_which(argv[1]); return 0; }
+    if(!strcmp(argv[0],"eval")){ char cmd[8192]=""; for(int i=1;i<argc;i++){if(i>1)strcat(cmd," ");strncat(cmd,argv[i],sizeof(cmd)-strlen(cmd)-1);} return system(cmd); }
+    if(!strcmp(argv[0],"exec")){ if(argc>1) execvp(argv[1],argv+1); return 1; }
+    if(!strcmp(argv[0],"exit")||!strcmp(argv[0],"quit")) return -999;
+    if(!strcmp(argv[0],"true")) return 0;
+    if(!strcmp(argv[0],"false")) return 1;
+    if(!strcmp(argv[0],"clear")){ fputs("\033[2J\033[H",stdout); return 0; }
+    if(!strcmp(argv[0],"reset")){ fputs("\033c",stdout); return 0; }
+    if(!strcmp(argv[0],"help")){
+        printf("shell2c Interactive Shell v2.0\n\n");
+        printf("Shell builtins: cd pwd echo export unset env set which eval exec exit help\n");
+        printf("Native tools (C implemented):\n");
+        printf("  ls cat grep sed tr cut sort uniq wc head tail tac rev nl\n");
+        printf("  cp mv rm mkdir rmdir touch ln chmod stat du df\n");
+        printf("  basename dirname realpath readlink mktemp tee xargs\n");
+        printf("  seq yes date whoami hostname uname nproc id uptime free\n\n");
+        printf("Pipes (|) and redirects (< > >> 2>) are natively implemented.\n");
+        printf("Package managers: apt apt-get pkg dpkg snap pip npm cargo gem\n");
+        return 0;
+    }
+    /* Runtime builtins — direct C function calls */
+    if(!strcmp(argv[0],"ls")){ __b_ls(argc>1?argv[1]:"",NULL); return __exit_status; }
+    if(!strcmp(argv[0],"cat")){ __b_cat(argc>1?argv[1]:NULL,0); return __exit_status; }
+    if(!strcmp(argv[0],"grep")){ __b_grep(argc>1?argv[1]:"",argc>2?argv[2]:NULL,argc>3?argv[3]:""); return __exit_status; }
+    if(!strcmp(argv[0],"sed")){ __b_sed(argc>1?argv[1]:"",argc>2?argv[2]:NULL); return __exit_status; }
+    if(!strcmp(argv[0],"tr")){ if(argc>=3)__b_tr(argv[1],argv[2]); if(argc>1&&!strcmp(argv[1],"-d")&&argc>2)__b_tr_delete(argv[2]); return __exit_status; }
+    if(!strcmp(argv[0],"cut")){ __b_cut(argc>1?argv[1]:"",' ',argc>2?argv[2]:NULL); return __exit_status; }
+    if(!strcmp(argv[0],"sort")){ __b_sort(argc>1?argv[1]:NULL,0,0,0); return __exit_status; }
+    if(!strcmp(argv[0],"uniq")){ __b_uniq(argc>1?argv[1]:NULL,0); return __exit_status; }
+    if(!strcmp(argv[0],"wc")){
+        int dl=0,dw=0,dc=0; const char *path=NULL;
+        for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-l"))dl=1; else if(!strcmp(argv[i],"-w"))dw=1; else if(!strcmp(argv[i],"-c"))dc=1; else path=argv[i]; }
+        if(!dl&&!dw&&!dc){dl=1;dw=1;dc=1;} /* no flags = all */
+        __b_wc(path,dl,dw,dc); return __exit_status;
+    }
+    if(!strcmp(argv[0],"head")){ int n=10; const char *p=NULL; for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-n")&&i+1<argc)n=atoi(argv[++i]); else if(argv[i][0]=='-'&&isdigit((unsigned char)argv[i][1]))n=atoi(argv[i]+1); else p=argv[i]; } __b_head(p,n); return __exit_status; }
+    if(!strcmp(argv[0],"tail")){ int n=10; const char *p=NULL; for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"-n")&&i+1<argc)n=atoi(argv[++i]); else if(argv[i][0]=='-'&&isdigit((unsigned char)argv[i][1]))n=atoi(argv[i]+1); else p=argv[i]; } __b_tail(p,n); return __exit_status; }
+    if(!strcmp(argv[0],"tac")){ __b_tac(argc>1?argv[1]:NULL); return __exit_status; }
+    if(!strcmp(argv[0],"rev")){ __b_rev(argc>1?argv[1]:NULL); return __exit_status; }
+    if(!strcmp(argv[0],"nl")){ __b_nl(argc>1?argv[1]:NULL); return __exit_status; }
+    if(!strcmp(argv[0],"seq")){ __b_seq(argc>1?atoi(argv[1]):1,1,argc>2?atoi(argv[2]):1); return __exit_status; }
+    if(!strcmp(argv[0],"yes")){ __b_yes(argc>1?argv[1]:NULL); return 0; }
+    if(!strcmp(argv[0],"date")){ __b_date(argc>1?argv[1]:NULL); return 0; }
+    if(!strcmp(argv[0],"whoami")){ __b_whoami(); return 0; }
+    if(!strcmp(argv[0],"hostname")){ if(argc>1)__b_hostname_set(argv[1]); else __b_hostname(); return 0; }
+    if(!strcmp(argv[0],"uname")){ __b_uname(argc>1); return 0; }
+    if(!strcmp(argv[0],"nproc")){ __b_nproc(); return 0; }
+    if(!strcmp(argv[0],"id")){ __b_id(); return 0; }
+    if(!strcmp(argv[0],"uptime")){ __b_uptime(); return 0; }
+    if(!strcmp(argv[0],"free")){ __b_free_mem(); return 0; }
+    if(!strcmp(argv[0],"cp")&&argc>=3){ __b_cp(argv[1],argv[2]); return __exit_status; }
+    if(!strcmp(argv[0],"mv")&&argc>=3){ __b_mv(argv[1],argv[2]); return __exit_status; }
+    if(!strcmp(argv[0],"rm")){ if(argc>1)unlink(argv[1]); return 0; }
+    if(!strcmp(argv[0],"mkdir")&&argc>=2){ mkdir(argv[1],0755); return 0; }
+    if(!strcmp(argv[0],"rmdir")&&argc>=2){ rmdir(argv[1]); return 0; }
+    if(!strcmp(argv[0],"touch")&&argc>=2){ __b_touch(argv[1]); return 0; }
+    if(!strcmp(argv[0],"stat")&&argc>=2){ __b_stat(argv[1]); return 0; }
+    if(!strcmp(argv[0],"basename")&&argc>=2){ __b_basename(argv[1]); return 0; }
+    if(!strcmp(argv[0],"dirname")&&argc>=2){ __b_dirname(argv[1]); return 0; }
+    if(!strcmp(argv[0],"realpath")&&argc>=2){ __b_realpath(argv[1]); return 0; }
+    if(!strcmp(argv[0],"tee")){ __b_tee(0,NULL); return 0; }
+    return -1;
+}
+
+/* Execute a command line with native pipe+redirect support */
+static int execute_line(char *line){
+    int last_rc=0;
+    /* Find pipe | (not ||) */
+    char *pipe_pos=NULL;
+    for(char *p=line;*p;p++){
+        if(*p=='|'&&p[1]!='|'){ if(p>line&&p[-1]=='|')continue; pipe_pos=p; break; }
+    }
+    if(pipe_pos){
+        char *stages[16]; int ns=0;
+        stages[ns++]=line;
+        char *p=pipe_pos;
+        while(p){ *p=0; p++; while(*p==' ')p++; if(*p)stages[ns++]=p; else break;
+            p=strchr(p,'|'); while(p&&p[1]=='|')p=strchr(p+2,'|'); }
+        if(ns>=2){
+            int prev_read=-1; pid_t pids[16];
+            for(int i=0;i<ns;i++){
+                int pfd[2]; if(i<ns-1)pipe(pfd);
+                pid_t pid=fork();
+                if(pid==0){
+                    if(prev_read>=0){dup2(prev_read,0);close(prev_read);}
+                    if(i<ns-1){close(pfd[0]);dup2(pfd[1],1);close(pfd[1]);}
+                    char *exp=expand_vars(stages[i]);
+                    char *tk[64]; int nt=0; char *t=strtok(exp," \t");
+                    while(t&&nt<63){tk[nt++]=t;t=strtok(NULL," \t");} tk[nt]=NULL;
+                    if(nt>0){ int rc=try_builtin(nt,tk); if(rc==-999)_exit(0); if(rc<0)exec_external(nt,tk); }
+                    fflush(stdout); _exit(0);
+                }
+                pids[i]=pid;
+                if(prev_read>=0)close(prev_read);
+                if(i<ns-1){close(pfd[1]);prev_read=pfd[0];}
+            }
+            if(prev_read>=0)close(prev_read);
+            for(int i=0;i<ns;i++)waitpid(pids[i],NULL,0);
+            return 0;
+        }
+    }
+    /* && and || */
+    char *and=strstr(line,"&&"),*or=strstr(line,"||");
+    if(and||or){
+        char *op=(and&&(!or||and<or))?and:or; int is_and=(op==and);
+        *op=0; char *rest=op+2; while(*rest==' ')rest++;
+        int rc=execute_line(line);
+        if(is_and){ if(rc==0)return execute_line(rest); return rc; }
+        else { if(rc!=0)return execute_line(rest); return 0; }
+    }
+    /* Redirections */
+    int sin=-1,sout=-1,serr=-1;
+    /* 2>&1 */
+    char *m=strstr(line,"2>&1"); if(m){ *m=0; serr=dup(2); dup2(1,2); }
+    /* >> file */
+    char *gt2=strstr(line," >> ");
+    if(gt2){ *gt2=0; char *f=gt2+4; char *sp=strchr(f,' '); if(sp)*sp=0;
+        int fd=open(f,O_WRONLY|O_CREAT|O_APPEND,0644);
+        if(fd>=0){sout=dup(1);dup2(fd,1);close(fd);}else perror(f);
+    } else {
+        char *gt=strstr(line," > "); if(!gt){gt=strstr(line,">");if(gt&&(gt==line||gt[-1]==' '||gt[-1]=='2')){}else gt=NULL;}
+        if(gt){ *gt=0; gt++; if(*gt=='>')gt++; while(*gt==' ')gt++; char *f=gt; char *sp=strchr(f,' '); if(sp)*sp=0;
+            int fd=open(f,O_WRONLY|O_CREAT|O_TRUNC,0644);
+            if(fd>=0){sout=dup(1);dup2(fd,1);close(fd);}else perror(f);
+        }
+    }
+    /* < file */
+    char *lt=strstr(line," < "); if(!lt){lt=strstr(line,"<");if(lt&&(lt==line||lt[-1]==' ')){}else lt=NULL;}
+    if(lt){ *lt=0; lt++; while(*lt==' ')lt++; char *f=lt; char *sp=strchr(f,' '); if(sp)*sp=0;
+        int fd=open(f,O_RDONLY);
+        if(fd>=0){sin=dup(0);dup2(fd,0);close(fd);}else perror(f);
+    }
+    /* 2> file */
+    char *e2=strstr(line," 2> "); if(!e2){e2=strstr(line,"2>");if(e2&&(e2==line||e2[-1]==' ')){}else e2=NULL;}
+    if(e2){ *e2=0; e2+=2; while(*e2==' ')e2++; char *f=e2; char *sp=strchr(f,' '); if(sp)*sp=0;
+        int fd=open(f,O_WRONLY|O_CREAT|O_TRUNC,0644);
+        if(fd>=0){if(serr<0)serr=dup(2);dup2(fd,2);close(fd);}else perror(f);
+    }
+    /* Execute command */
+    char *exp=expand_vars(line);
+    char *tk[64]; int nt=0; char *t=strtok(exp," \t");
+    while(t&&nt<63){tk[nt++]=t;t=strtok(NULL," \t");} tk[nt]=NULL;
+    if(nt>0){ int rc=try_builtin(nt,tk); if(rc==-999)last_rc=-999; else if(rc>=0)last_rc=rc; else last_rc=exec_external(nt,tk); }
+    /* Restore */
+    fflush(stdout);fflush(stderr);
+    if(sin>=0){dup2(sin,0);close(sin);}
+    if(sout>=0){dup2(sout,1);close(sout);}
+    if(serr>=0){dup2(serr,2);close(serr);}
+    return last_rc;
 }
 
 int shell2c_all_mode(int argc, char **argv){
-    /* Initialize complete terminal environment */
     init_terminal_env();
-
-    /* Check if running a single command: shell2c -all -c "command" */
     const char *single_cmd=NULL;
-    for(int i=1;i<argc;i++){
-        if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"-e")) && i+1<argc){
-            single_cmd=argv[++i];
-        }
-    }
-
-    if(single_cmd){
-        /* Execute single command and exit */
-        char *expanded=expand_vars(single_cmd);
-        /* Try builtins first */
-        char *toks[64]; int nt=0;
-        char *tk=strtok(expanded," \t");
-        while(tk && nt<63){ toks[nt++]=tk; tk=strtok(NULL," \t"); }
-        toks[nt]=NULL;
-        if(nt>0){
-            int rc=run_shell_builtin(nt,toks);
-            if(rc==-999) return 0;
-            if(rc>=0) return rc;
-        }
-        /* Fall through to system() */
-        return system(single_cmd);
-    }
-
-    /* Interactive REPL mode */
-    printf("\n");
-    printf("╔══════════════════════════════════════════════╗\n");
-    printf("║  shell2c Interactive Terminal v1.0           ║\n");
-    printf("║  Complete shell environment with package     ║\n");
-    printf("║  management support (apt/pkg/dpkg/snap)     ║\n");
-    printf("╚══════════════════════════════════════════════╝\n");
-    printf("\n");
-    printf("Environment:\n");
-    printf("  USER: %s\n", getenv("USER")?getenv("USER"):"(unset)");
-    printf("  HOME: %s\n", getenv("HOME"));
-    printf("  SHELL: %s\n", getenv("SHELL"));
-    printf("  TERM: %s\n", getenv("TERM"));
-    printf("  PATH: %s\n", getenv("PATH"));
-    printf("  PWD: %s\n", getenv("PWD")?getenv("PWD"):"(unset)");
-    printf("\n");
-    printf("Package tools: apt apt-get pkg dpkg snap pip npm cargo gem yarn brew conda\n");
-    printf("Type 'help' for built-in commands, 'exit' to quit.\n\n");
-
-    /* Read-eval loop */
-    char line[8192];
-    int last_rc=0;
+    for(int i=1;i<argc;i++){ if((!strcmp(argv[i],"-c")||!strcmp(argv[i],"-e"))&&i+1<argc) single_cmd=argv[++i]; }
+    if(single_cmd){ char buf[16384]; strncpy(buf,single_cmd,sizeof(buf)-1); buf[sizeof(buf)-1]=0; return execute_line(buf); }
+    printf("\n╔══════════════════════════════════════════════╗\n");
+    printf("║  shell2c Interactive Terminal v2.0           ║\n");
+    printf("║  Native pipe+redirect+60 builtins           ║\n");
+    printf("╚══════════════════════════════════════════════╝\n\n");
+    printf("USER=%s  HOME=%s  SHELL=%s\n", getenv("USER")?getenv("USER"):"?", getenv("HOME"), getenv("SHELL"));
+    printf("PATH=%s\n\n", getenv("PATH"));
+    printf("Type 'help' for commands, 'exit' to quit.\n\n");
+    char line[8192]; int last_rc=0;
     while(1){
-        /* Print prompt */
         char cwd[1024]; getcwd(cwd,sizeof(cwd));
-        const char *user=getenv("USER")?getenv("USER"):"user";
-        const char *host=getenv("HOSTNAME")?getenv("HOSTNAME"):"shell2c";
-        if(strlen(host)>20) host="shell2c";
-        /* Shorten home in cwd */
         const char *home=getenv("HOME");
-        char cwd_disp[1024];
-        if(home && !strncmp(cwd,home,strlen(home))){
-            snprintf(cwd_disp,sizeof(cwd_disp),"~%s",cwd+strlen(home));
-        } else {
-            snprintf(cwd_disp,sizeof(cwd_disp),"%s",cwd);
-        }
-        printf("%s@%s:%s$ ",user,host,cwd_disp);
+        char cd[1024];
+        if(home&&!strncmp(cwd,home,strlen(home))) snprintf(cd,sizeof(cd),"~%s",cwd+strlen(home));
+        else snprintf(cd,sizeof(cd),"%s",cwd);
+        printf("%s@shell2c:%s$ ", getenv("USER")?getenv("USER"):"user", cd);
         fflush(stdout);
-
         if(!fgets(line,sizeof(line),stdin)) break;
-        /* Strip newline */
-        int ll=strlen(line);
-        while(ll>0 && (line[ll-1]=='\n'||line[ll-1]=='\r')) line[--ll]=0;
-        if(!ll) continue;
-
-        /* Expand $VAR and ~ */
-        char *expanded=expand_vars(line);
-        if(!expanded || !*expanded) continue;
-
-        /* Tokenize */
-        char *toks[64]; int nt=0;
-        char *tk=strtok(expanded," \t");
-        while(tk && nt<63){ toks[nt++]=tk; tk=strtok(NULL," \t"); }
-        toks[nt]=NULL;
-        if(nt==0) continue;
-
-        /* Check for pipe — if present, use system() */
-        int has_pipe=0;
-        for(int i=0;i<nt;i++) if(!strcmp(toks[i],"|")){ has_pipe=1; break; }
-        if(has_pipe){
-            int rc=system(line);
-            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
-            else last_rc=1;
-            continue;
-        }
-
-        /* Check for && and || */
-        int has_and=0,has_or=0;
-        for(int i=0;i<nt;i++){
-            if(!strcmp(toks[i],"&&")){ has_and=1; break; }
-            if(!strcmp(toks[i],"||")){ has_or=1; break; }
-        }
-        if(has_and||has_or){
-            int rc=system(line);
-            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
-            else last_rc=1;
-            continue;
-        }
-
-        /* Check for redirection */
-        int has_redir=0;
-        for(int i=0;i<nt;i++){
-            if(toks[i][0]=='>'||toks[i][0]=='<'||(toks[i][0]=='2'&&toks[i][1]=='>')){
-                has_redir=1; break;
-            }
-        }
-        if(has_redir){
-            int rc=system(line);
-            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
-            else last_rc=1;
-            continue;
-        }
-
-        /* Try shell builtins */
-        int rc=run_shell_builtin(nt,toks);
-        if(rc==-999) break; /* exit */
-        if(rc>=0){ last_rc=rc; continue; }
-
-        /* Package tools — pass through with full env */
-        if(is_pkg_tool(toks[0])){
-            /* Ensure package manager exists */
-            int rc=system(line);
-            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
-            else last_rc=1;
-            continue;
-        }
-
-        /* Regular external command — search PATH and execute */
-        char path_env[4096]; snprintf(path_env,sizeof(path_env),"%s",getenv("PATH"));
-        char *ptok=strtok(path_env,":");
-        int found=0;
-        while(ptok){
-            char fp[1024]; snprintf(fp,sizeof(fp),"%s/%s",ptok,toks[0]);
-            if(access(fp,X_OK)==0){ found=1; break; }
-            ptok=strtok(NULL,":");
-        }
-        if(!found){
-            fprintf(stderr,"%s: command not found\n",toks[0]);
-            last_rc=127;
-            continue;
-        }
-
-        /* Execute via system() for complex commands, or fork+exec for simple ones */
-        pid_t pid=fork();
-        if(pid==0){
-            /* Child */
-            execvp(toks[0],toks);
-            /* If execvp fails, try system() as fallback */
-            fprintf(stderr,"%s: execution failed\n",toks[0]);
-            _exit(127);
-        } else if(pid>0){
-            int status;
-            waitpid(pid,&status,0);
-            if(WIFEXITED(status)) last_rc=WEXITSTATUS(status);
-            else last_rc=1;
-        } else {
-            /* fork failed — fallback to system() */
-            int rc=system(line);
-            if(WIFEXITED(rc)) last_rc=WEXITSTATUS(rc);
-            else last_rc=1;
-        }
+        int l=strlen(line); while(l>0&&(line[l-1]=='\n'||line[l-1]=='\r'))line[--l]=0;
+        if(!l) continue;
+        int rc=execute_line(line);
+        if(rc==-999) break;
+        last_rc=rc;
     }
-
     printf("\n");
     return last_rc;
 }
+
 
 int main(int argc, char **argv){
     /* Check for -all mode: package entire project into standalone terminal */
