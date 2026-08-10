@@ -449,6 +449,15 @@ char *translate_arith(const char *expr){
                 int el=(int)strlen(e);
                 if(q+el<(int)sizeof(buf)-2){ memcpy(buf+q,e,el); q+=el; }
                 free(e);
+            } else if(isdigit((unsigned char)*s)){
+                /* $1..$9 → atoi(__sh_argN) */
+                int n_arg=*s-'0'; s++;
+                if(n_arg>=1&&n_arg<=9){
+                    const char *prefix="atoi(__sh_arg";
+                    while(*prefix) buf[q++]=*prefix++;
+                    buf[q++]='0'+n_arg; buf[q++]=')';
+                }
+                continue;
             } else if(isalpha((unsigned char)*s)||*s=='_'){
                 char nm[128]; int j=0;
                 while(isalnum((unsigned char)*s)||*s=='_') nm[j++]=*s++;

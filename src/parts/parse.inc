@@ -161,10 +161,15 @@ Node *make_cmd(char **toks,int n,int ln){
     nd->argv[n]=NULL;
     /* If this is a 'read' command, register its target variables as strings */
     if(n>=2 && !strcmp(toks[0],"read")){
+        int has_a=0; /* -a flag: read into array */
         for(int i=1;i<n;i++){
-            if(toks[i][0]=='-') continue;  /* skip flags like -r, -p */
+            if(toks[i][0]=='-'){
+                for(const char *fc=toks[i];*fc;fc++) if(*fc=='a') has_a=1;
+                continue;  /* skip flags like -r, -p */
+            }
             if(!strcmp(toks[i],"<<<")||!strcmp(toks[i],"<<")) break;  /* stop at here-string/heredoc */
-            add_var(toks[i],V_STR);
+            if(!strcmp(toks[i],"<")) break;  /* stop at redirect */
+            add_var(toks[i], has_a ? V_ARRAY : V_STR);
         }
     }
     /* If this is an 'unset' command, register variables so they're declared */

@@ -39,6 +39,26 @@ static void prescan_register_vars(Node *n){
                     }
                 }
             }
+            /* read -ra var — register var as array before emit */
+            if(n->argv[0] && !strcmp(n->argv[0],"read")){
+                int ra=0;
+                for(int i=1;i<n->argc;i++){
+                    if(!n->argv[i]) continue;
+                    /* Stop at redirect operators */
+                    if(!strcmp(n->argv[i],"<<<")||!strcmp(n->argv[i],"<<")||
+                       !strcmp(n->argv[i],"<")||!strcmp(n->argv[i],">")||
+                       !strcmp(n->argv[i],">>")||!strcmp(n->argv[i],"2>")) break;
+                    if(n->argv[i][0]=='-'){
+                        for(const char *fc=n->argv[i];*fc;fc++) if(*fc=='a') ra=1;
+                        continue;
+                    }
+                    if(ra){
+                        if(!is_known_var(n->argv[i]))
+                            add_var(n->argv[i],V_ARRAY);
+                        ra=0; /* only first var after -a */
+                    }
+                }
+            }
             /* BUG-16 fix: printf -v var — register variable before emit */
             if(n->argv[0] && !strcmp(n->argv[0],"printf") && n->argc>=3 && !strcmp(n->argv[1],"-v")){
                 if(!is_known_var(n->argv[2]))

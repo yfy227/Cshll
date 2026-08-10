@@ -85,30 +85,72 @@ void expand_string(const char *s, ExpandResult *er){
                                 while(*pre && k<(int)sizeof(expr)-32) expr[k++]=*pre++;
                                 const char *cn=safe_cname(fname);
                                 while(*cn && k<(int)sizeof(expr)-32) expr[k++]=*cn++;
-                                /* Count args */
+                                /* Collect args into a temp buffer, then emit with proper format */
+                                char argbuf[2048]; int abi=0;
                                 const char *ap=cmd+fi2;
                                 while(*ap==' '||*ap=='\t') ap++;
                                 int nargs=0;
-                                expr[k++]='0';
+                                argbuf[abi]=0;
                                 while(*ap && nargs<9){
                                     while(*ap==' '||*ap=='\t') ap++;
                                     if(!*ap) break;
                                     char arg[256]; int al=0;
-                                    if(*ap=='"'){ ap++; while(*ap&&*ap!='"'&&al<255) arg[al++]=*ap++; if(*ap=='"')ap++; }
+                                    if(*ap=='$' && *(ap+1)=='('){
+                                        /* $(...) or $((...)) — extract as one unit */
+                                        ap+=2; int paren=1; int is_arith=0;
+                                        if(*ap=='('){ is_arith=1; paren=2; ap++; }
+                                        while(*ap && paren>0 && al<255){
+                                            if(*ap=='(') { paren++; arg[al++]=*ap++; }
+                                            else if(*ap==')'){ paren--; if(paren<=is_arith){ ap++; break; } arg[al++]=*ap++; }
+                                            else arg[al++]=*ap++;
+                                        }
+                                        arg[al]=0;
+                                        /* Translate $((expr)) to C expression */
+                                        if(is_arith && al>0){
+                                            char *t=translate_arith(arg);
+                                            if(t){
+                                                if(nargs>0) argbuf[abi++]=',';
+                                                const char *pre="__sh_fmt(\"%d\",";
+                                                while(*pre && abi<(int)sizeof(argbuf)-32) argbuf[abi++]=*pre++;
+                                                for(int ai=0;t[ai]&&abi<(int)sizeof(argbuf)-8;ai++){
+                                                    if(t[ai]=='"') argbuf[abi++]='\\';
+                                                    argbuf[abi++]=t[ai];
+                                                }
+                                                argbuf[abi++]=')'; nargs++;
+                                                free(t);
+                                            }
+                                            while(*ap==')') ap++;
+                                            continue;
+                                        } else {
+                                            /* $(cmd) - pass as string */
+                                            char *t=translate_expr(arg);
+                                            if(nargs>0) argbuf[abi++]=',';
+                                            argbuf[abi++]='"';
+                                            for(int ai=0;arg[ai]&&abi<(int)sizeof(argbuf)-8;ai++){
+                                                if(arg[ai]=='"') argbuf[abi++]='\\';
+                                                argbuf[abi++]=arg[ai];
+                                            }
+                                            argbuf[abi++]='"'; nargs++;
+                                            if(t) free(t);
+                                        }
+                                        continue;
+                                    } else if(*ap=='"'){ ap++; while(*ap&&*ap!='"'&&al<255) arg[al++]=*ap++; if(*ap=='"')ap++; }
                                     else { while(*ap&&*ap!=' '&&*ap!='\t'&&al<255) arg[al++]=*ap++; }
                                     arg[al]=0;
                                     if(al>0){
-                                        expr[k++]=','; expr[k++]='"';
-                                        for(int ai=0;ai<al&&k<(int)sizeof(expr)-8;ai++) expr[k++]=arg[ai];
-                                        expr[k++]='"'; nargs++;
+                                        if(nargs>0) argbuf[abi++]=',';
+                                        argbuf[abi++]='"';
+                                        for(int ai=0;ai<al&&abi<(int)sizeof(argbuf)-8;ai++) argbuf[abi++]=arg[ai];
+                                        argbuf[abi++]='"'; nargs++;
                                     }
                                 }
-                                expr[k++]=','; expr[k++]='N'; expr[k++]='U'; expr[k++]='L'; expr[k++]='L';
-                                expr[k++]=')'; expr[k++]=')';
+                                argbuf[abi]=0;
+                                /* Emit: ,N,(char*[]){argbuf,NULL}) ) */
+                                k+=snprintf(expr+k,sizeof(expr)-k,",%d,(char*[]){%s,NULL}))",nargs,argbuf);
                             } else {
                                 /* External command → atoi(__sh_cmd_output("cmd")) */
-                                const char *pre="atoi(__sh_cmd_output(\"";
-                                while(*pre && k<(int)sizeof(expr)-32) expr[k++]=*pre++;
+                                const char *pre2="atoi(__sh_cmd_output(\"";
+                                while(*pre2 && k<(int)sizeof(expr)-32) expr[k++]=*pre2++;
                                 for(int ei=0;cmd[ei]&&k<(int)sizeof(expr)-8;ei++){
                                     if(cmd[ei]=='"'||cmd[ei]=='\\') expr[k++]='\\';
                                     expr[k++]=cmd[ei];
