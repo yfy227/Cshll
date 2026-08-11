@@ -489,7 +489,7 @@ gcc -O2 -Wall -o script script.c -ldl
 | ptrace 反调试 | 完成 | PTRACE_TRACEME 检测 |
 | 不透明谓词 | 完成 | dispatch loop 中 __vm_opq() 恒真检查 |
 | 运行时完整性检查 | 完成 | 0x1337 XOR 篡改检测 |
-| 反调试时间陷阱 | 完成 | clock() 周期性检查 |
+| 反调试时间陷阱 | 移除 | clock() 检查过于激进，已移除 |
 | 完整 JIT 触发 | 完成 | OP_JIT_COMPILE(0xF1) + OP_JIT_CALL(0xF2) + OP_TRACE_START(0xF3) |
 | 字节码控制流平坦化 | 完成 | __vm_state 状态机 + switch dispatch + 不透明谓词 |
 
