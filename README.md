@@ -490,8 +490,8 @@ gcc -O2 -Wall -o script script.c -ldl
 | 不透明谓词 | 完成 | dispatch loop 中 __vm_opq() 恒真检查 |
 | 运行时完整性检查 | 完成 | 0x1337 XOR 篡改检测 |
 | 反调试时间陷阱 | 完成 | clock() 周期性检查 |
-| 完整 JIT 触发 | 待做 | 热路径自动 native 编译 |
-| 字节码控制流平坦化 | 待做 | switch-dispatch 展平 |
+| 完整 JIT 触发 | 完成 | OP_JIT_COMPILE(0xF1) + OP_JIT_CALL(0xF2) + OP_TRACE_START(0xF3) |
+| 字节码控制流平坦化 | 完成 | __vm_state 状态机 + switch dispatch + 不透明谓词 |
 
 
 ## 许可证
