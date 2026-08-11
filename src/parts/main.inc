@@ -691,13 +691,6 @@ int shell2c_all_mode(int argc, char **argv){
 "#include <sys/wait.h>\n"
 "#include <sys/types.h>\n"
 "\n"
-"static int __sh_needs_shell(const char *cmd){\n"
-"  /* Check if command has shell operators that require sh */\n"
-"  return strstr(cmd,\"&&\")||strstr(cmd,\"||\")||strchr(cmd,'|')||\n"
-"         strchr(cmd,'>')||strchr(cmd,'<')||strchr(cmd,';')||\n"
-"         strchr(cmd,'`')||strstr(cmd,\"$(\");\n"
-"}\n"
-"\n"
 "static int __sh_exec_simple(const char *cmd){\n"
 "  /* Parse command into argv, fork+execvp (no sh needed) */\n"
 "  char buf[8192]; strncpy(buf,cmd,sizeof(buf)-1); buf[sizeof(buf)-1]=0;\n"
@@ -733,13 +726,7 @@ int shell2c_all_mode(int argc, char **argv){
 "\n"
 "static int __sh_exec_cmd(const char *cmd){\n"
 "  if(!cmd||!*cmd) return 0;\n"
-"  if(__sh_needs_shell(cmd)){\n"
-"    /* Complex command — use sh -c as last resort */\n"
-"    pid_t pid=fork();\n"
-"    if(pid==0){ execlp(\"sh\",\"sh\",\"-c\",cmd,(char*)NULL); _exit(127); }\n"
-"    if(pid>0){ int st; waitpid(pid,&st,0); return WIFEXITED(st)?WEXITSTATUS(st):1; }\n"
-"    return 1;\n"
-"  }\n"
+"  /* All commands go through __sh_exec_simple (fork+execvp, no sh) */\n"
 "  return __sh_exec_simple(cmd);\n"
 "}\n"
 "\n"
@@ -748,7 +735,30 @@ int shell2c_all_mode(int argc, char **argv){
 "\n"
 );
 
-    /* Write the full runtime library — all system() calls now use __sh_exec_cmd */
+    /* Write popen/pclose replacements (fork+pipe+execvp, no sh) */
+    fprintf(f,
+"/* ---- popen replacement: fork+pipe+execvp, no sh ---- */\n"
+"static FILE *__sh_popen_native(const char *cmd, const char *mode){\n"
+"  int pfd[2]; if(pipe(pfd)<0) return NULL;\n"
+"  pid_t pid=fork();\n"
+"  if(pid<0){ close(pfd[0]); close(pfd[1]); return NULL; }\n"
+"  if(pid==0){\n"
+"    close(pfd[0]); dup2(pfd[1],1); close(pfd[1]);\n"
+"    __sh_exec_simple(cmd);\n"
+"    _exit(127);\n"
+"  }\n"
+"  close(pfd[1]);\n"
+"  return fdopen(pfd[0],mode);\n"
+"}\n"
+"static int __sh_pclose_native(FILE *p){\n"
+"  int st; fclose(p); wait(&st); return WIFEXITED(st)?WEXITSTATUS(st):-1;\n"
+"}\n"
+"#define popen __sh_popen_native\n"
+"#define pclose __sh_pclose_native\n"
+"\n"
+);
+
+    /* Write the full runtime library — system() and popen() both replaced */
     fputs(RT_HEADER, f);
 
     /* Write the terminal bootstrap + interactive shell code */
