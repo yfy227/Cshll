@@ -486,7 +486,7 @@ gcc -O2 -Wall -o script script.c -ldl
 | case 语句 | 完成 | 模式匹配 + STRCMP + JZ |
 | 函数调用 | 完成 | 预扫描 + 内联编译 |
 | echo + 赋值 | 完成 | 变量展开 + SETENV |
-| ptrace 反调试 | 完成 | PTRACE_TRACEME 检测 |
+| ptrace 反调试 | 移除 | 误伤高，已移除 |
 | 不透明谓词 | 完成 | dispatch loop 中 __vm_opq() 恒真检查 |
 | 运行时完整性检查 | 完成 | 0x1337 XOR 篡改检测 |
 | 反调试时间陷阱 | 移除 | clock() 检查过于激进，已移除 |
