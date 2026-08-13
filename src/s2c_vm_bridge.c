@@ -328,28 +328,23 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "      __vm_check ^= 0xDEAD; __vm_check ^= 0xDEAD;\n");
     fprintf(out, "      if(__vm_check != 0x1337) return 0xBAD; }\n");
     fprintf(out, "    __vm_skip:\n");
-    /* Decode constant pool */
-    fprintf(out, "    /* Decode constant pool at runtime (double-XOR) */\n");
-    fprintf(out, "    static char __vm_cp_buf[65536]; int __vm_cp_off = 0;\n");
-    fprintf(out, "    const unsigned char *__vm_cp_p = __vm_cp_enc;\n");
-    fprintf(out, "    static const char *__vm_cp_strs[1024];\n");
-    fprintf(out, "    int __vm_cp_n = 0;\n");
-    fprintf(out, "    uint32_t __vm_rt = __vm_rt_key();\n");
-    fprintf(out, "    while(*__vm_cp_p != 0xFF && __vm_cp_n < 1024){\n");
-    fprintf(out, "        int si = __vm_cp_n;\n");
-    fprintf(out, "        uint8_t key = (uint8_t)((__vm_rt >> ((si %% 4) * 8)) ^ (si * 0x3D + 0x17));\n");
-    fprintf(out, "        int slen = *__vm_cp_p++ ^ key;\n");
-    fprintf(out, "        if(slen > 255) break;\n");
-    fprintf(out, "        for(int j = 0; j < slen; j++){\n");
-    fprintf(out, "            uint8_t k1 = (uint8_t)((__vm_rt >> (((si + j) %% 4) * 8)) ^ (j * 0x5B));\n");
-    fprintf(out, "            uint8_t k2 = (uint8_t)((__vm_rt ^ (si * 0x1F + j * 0x2D)) >> ((j %% 4) * 8));\n");
-    fprintf(out, "            __vm_cp_buf[__vm_cp_off++] = *__vm_cp_p++ ^ k1 ^ k2;\n");
-    fprintf(out, "        }\n");
-    fprintf(out, "        __vm_cp_buf[__vm_cp_off++] = 0;\n");
-    fprintf(out, "        __vm_cp_strs[__vm_cp_n++] = &__vm_cp_buf[__vm_cp_off - slen - 1];\n");
+    /* Decode constant pool: DON'T decode all at once — store encoded pointers for on-demand access */
+    fprintf(out, "    /* Set up encoded constant pointers (on-demand decryption) */\n");
+    fprintf(out, "    static const unsigned char *__vm_cp_enc_ptrs_arr[1024];\n");
+    fprintf(out, "    const unsigned char *__vm_cp_p2 = __vm_cp_enc;\n");
+    fprintf(out, "    int __vm_cp_n2 = 0;\n");
+    fprintf(out, "    while(*__vm_cp_p2 != 0xFF && __vm_cp_n2 < 1024){\n");
+    fprintf(out, "        __vm_cp_enc_ptrs_arr[__vm_cp_n2++] = __vm_cp_p2;\n");
+    fprintf(out, "        /* Skip length byte + string bytes */\n");
+    fprintf(out, "        uint32_t __rt = __vm_rt_key();\n");
+    fprintf(out, "        int si = __vm_cp_n2 - 1;\n");
+    fprintf(out, "        uint8_t key = (uint8_t)((__rt >> ((si %% 4) * 8)) ^ (si * 0x3D + 0x17));\n");
+    fprintf(out, "        int slen = *__vm_cp_p2 ^ key;\n");
+    fprintf(out, "        __vm_cp_p2 += 1 + slen;\n");
     fprintf(out, "    }\n");
-    fprintf(out, "    __vm_consts = __vm_cp_strs;\n");
-    fprintf(out, "    __vm_nconsts = __vm_cp_n;\n");
+    fprintf(out, "    __vm_cp_enc_ptrs = __vm_cp_enc_ptrs_arr;\n");
+    fprintf(out, "    __vm_nconsts = __vm_cp_n2;\n");
+    fprintf(out, "    __vm_rt_key_val = __vm_rt_key();\n");
     /* Decode bytecode with RC4 — key derived from runtime hash, not direct #define */
     fprintf(out, "    /* Decode bytecode (RC4 with hardened key) */\n");
     fprintf(out, "    int __vm_cs=(int)sizeof(__vm_code_enc);\n");
@@ -402,7 +397,8 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     /* Anti-dump: wipe decoded bytecode after execution */
     fprintf(out, "    /* Anti-dump: wipe decoded bytecode after execution */\n");
     fprintf(out, "    memset(__vm_code_decoded, 0, sizeof(__vm_code_decoded));\n");
-    fprintf(out, "    memset(__vm_cp_buf, 0, sizeof(__vm_cp_buf));\n");
+    fprintf(out, "    memset(__vm_const_scratch, 0, sizeof(__vm_const_scratch));\n");
+    fprintf(out, "    __vm_const_used = -1;\n");
     fprintf(out, "    /* Anti-dump: wipe JIT .so files */\n");
     fprintf(out, "    for(int _ci=0; _ci<256; _ci++){\n");
     fprintf(out, "        if(_Qa95466bf[_ci]){\n");
