@@ -4,6 +4,133 @@
 
 int tmp_id=0;
 void emit_node(FILE *out, Node *n);
+
+/* ── Scatter-Gather string protection ──────────────────────────────
+ * Splits a string into N fragments, interleaves with M decoy buffers,
+ * allocates all on heap in shuffled order. Real fragments tagged with
+ * magic identifier. Plaintext assembled on-demand into stack buffer,
+ * used, then ALL buffers wiped and freed.
+ * Attacker sees ~15 small heap buffers, most are decoys. Without the
+ * magic tag (stored on stack, not heap), reconstruction is infeasible.
+ * ────────────────────────────────────────────────────────────────── */
+static int _sg_counter = 0;
+
+static void emit_scatter_string(FILE *out, const char *target, const char *src, int target_size) {
+    int plen = (int)strlen(src);
+    if(plen < 6) {
+        /* Too short — fall back to simple */
+        char *esc = c_escape_literal(src);
+        fprintf(out, "    strncpy(%s,\"%s\",%d);\n", target, esc, target_size - 1);
+        free(esc);
+        return;
+    }
+
+    /* Determine fragment count: 3-5 real fragments */
+    int nreal = plen / 8 + 2;
+    if(nreal > 5) nreal = 5;
+    if(nreal < 3) nreal = 3;
+    int ndecoy = nreal * 2;  /* 2x decoys */
+    int total = nreal + ndecoy;
+    if(total > 20) total = 20;
+
+    /* Split string into real fragments */
+    int frag_base = plen / nreal;
+    int frag_rem = plen % nreal;
+    int frag_starts[6], frag_lens[6];
+    int pos = 0;
+    for(int i = 0; i < nreal; i++) {
+        frag_lens[i] = frag_base + (i < frag_rem ? 1 : 0);
+        frag_starts[i] = pos;
+        pos += frag_lens[i];
+    }
+
+    /* Generate magic tag from string content */
+    unsigned int magic = 0;
+    for(int i = 0; i < plen; i++) magic = magic * 31 + (unsigned char)src[i];
+    magic = ((magic ^ 0xCAFEBABE) & 0xFFFF0000);
+    if((magic & 0xFFFF0000) == 0) magic = 0xCAF00000;
+
+    /* Deterministic shuffle of real/decoy positions */
+    int order[20];
+    for(int i = 0; i < total; i++) order[i] = i;
+    unsigned int rng = magic;
+    for(int i = total - 1; i > 0; i--) {
+        rng = rng * 1103515245 + 12345;
+        int j = (rng >> 16) % (i + 1);
+        int t = order[i]; order[i] = order[j]; order[j] = t;
+    }
+
+    int sg_id = _sg_counter++;
+
+    fprintf(out, "    {/*scatter-%d*/\n", sg_id);
+    fprintf(out, "    char*_sb[%d];int _sl[%d];unsigned _st[%d];\n", total, total, total);
+
+    /* Emit all buffers in shuffled order */
+    int real_idx = 0;
+    for(int si = 0; si < total; si++) {
+        int is_real = (si < nreal);
+        int flen;
+        const char *fdata;
+
+        if(is_real) {
+            flen = frag_lens[real_idx];
+            fdata = src + frag_starts[real_idx];
+        } else {
+            /* Decoy: plausible-looking random bytes */
+            flen = 4 + ((magic ^ (si * 37)) % 10);
+            /* Generate decoy data at compile time */
+            char decoy[16];
+            for(int d = 0; d < flen && d < 15; d++)
+                decoy[d] = (char)(0x20 + ((magic ^ (si * 31) ^ (d * 17)) % 95));
+            decoy[flen < 16 ? flen : 15] = 0;
+            fdata = decoy;
+        }
+
+        /* Per-buffer XOR key — different for each buffer */
+        unsigned int key_base = magic ^ (si * 0x1234567);
+
+        fprintf(out, "    _sb[%d]=malloc(%d);{const char _d[]={", si, flen);
+        for(int b = 0; b < flen; b++) {
+            uint8_t key = (uint8_t)((key_base >> ((b % 4) * 8)) ^ (b * 7));
+            fprintf(out, "0x%02x,", (uint8_t)fdata[b] ^ key);
+        }
+        fprintf(out, "0};memcpy(_sb[%d],_d,%d);}", si, flen);
+        fprintf(out, "_sl[%d]=%d;", si, flen);
+
+        if(is_real) {
+            /* Real: tag = magic | fragment_order */
+            fprintf(out, "_st[%d]=0x%08x;\n", si, magic | real_idx);
+            real_idx++;
+        } else {
+            /* Decoy: fake tag that won't match magic */
+            unsigned int fake_tag = 0xDEAD0000 ^ (si * 0x1111);
+            if((fake_tag & 0xFFFF0000) == (magic & 0xFFFF0000)) fake_tag ^= 0x10000000;
+            fprintf(out, "_st[%d]=0x%08x;\n", si, fake_tag);
+        }
+    }
+
+    /* Gather: walk all buffers, collect real fragments by magic+order */
+    fprintf(out, "    char _sg[512];int _sp=0;\n");
+    fprintf(out, "    for(int _o=0;_o<%d;_o++){\n", nreal);
+    fprintf(out, "      for(int _i=0;_i<%d;_i++){\n", total);
+    fprintf(out, "        if((_st[_i]&0xFFFF0000)==0x%08x && (_st[_i]&0xFFFF)==(unsigned)_o){\n", magic);
+    fprintf(out, "          unsigned _kb=0x%08x^(_i*0x1234567);\n", magic);
+    fprintf(out, "          for(int _j=0;_j<_sl[_i];_j++){uint8_t _k=(uint8_t)((_kb>>((_j%%4)*8))^(_j*7));_sg[_sp++]=_sb[_i][_j]^_k;}\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "      }\n");
+    fprintf(out, "    }\n");
+    fprintf(out, "    _sg[_sp]=0;\n");
+
+    /* Use */
+    fprintf(out, "    strncpy(%s,_sg,%d);\n", target, target_size - 1);
+
+    /* Destroy: wipe and free ALL buffers + result */
+    fprintf(out, "    for(int _i=0;_i<%d;_i++){memset(_sb[_i],0,_sl[_i]);free(_sb[_i]);}\n", total);
+    fprintf(out, "    memset(_sg,0,sizeof(_sg));\n");
+    fprintf(out, "    }\n");
+}
+
+
 static void emit_block(FILE *out, Node *n);
 Node *pending_pipe_cmd=NULL;
 int pipe_restore_needed=0;
@@ -1731,19 +1858,10 @@ void emit_node(FILE *out, Node *n){
                         tmp[ti++]=*vp++;
                     }
                     tmp[ti]=0;
-                    /* Encode string literal if obfuscate mode */
+                    /* Scatter-gather protection if obfuscate mode */
                     extern int g_obfuscate;
-                    if(g_obfuscate && strlen(tmp) >= 4){
-                        int slen = strlen(tmp);
-                        static int _assign_enc_idx = 0;
-                        char vname[32]; snprintf(vname,sizeof(vname),"_ae%d",_assign_enc_idx++);
-                        fprintf(out,"    {static const unsigned char %s[]={", vname);
-                        for(int ei=0; ei<slen; ei++){
-                            uint8_t key=(uint8_t)(0x5A^(ei*7)^((ei>>2)*0x3D));
-                            fprintf(out,"0x%02x,",(uint8_t)tmp[ei]^key);
-                        }
-                        fprintf(out,"0};char _ad%d[256];for(int _i=0;_i<%d;_i++)_ad%d[_i]=%s[_i]^(uint8_t)(0x5A^(_i*7)^((_i>>2)*0x3D));_ad%d[%d]=0;", _assign_enc_idx-1, slen, _assign_enc_idx-1, vname, _assign_enc_idx-1, slen);
-                        fprintf(out,"strncpy(%s,_ad%d,sizeof(%s)-1);}\n", safe_cname(n->lhs), _assign_enc_idx-1, safe_cname(n->lhs));
+                    if(g_obfuscate && strlen(tmp) >= 6){
+                        emit_scatter_string(out, safe_cname(n->lhs), tmp, 65536);
                     } else {
                     char *esc=c_escape_literal(tmp);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
@@ -1758,17 +1876,8 @@ void emit_node(FILE *out, Node *n){
                     }
                 } else {
                     extern int g_obfuscate;
-                    if(g_obfuscate && strlen(val) >= 4){
-                        int slen = strlen(val);
-                        static int _assign_enc_idx2 = 0;
-                        char vname[32]; snprintf(vname,sizeof(vname),"_ae%d",_assign_enc_idx2++);
-                        fprintf(out,"    {static const unsigned char %s[]={", vname);
-                        for(int ei=0; ei<slen; ei++){
-                            uint8_t key=(uint8_t)(0x5A^(ei*7)^((ei>>2)*0x3D));
-                            fprintf(out,"0x%02x,",(uint8_t)val[ei]^key);
-                        }
-                        fprintf(out,"0};char _ad%d[256];for(int _i=0;_i<%d;_i++)_ad%d[_i]=%s[_i]^(uint8_t)(0x5A^(_i*7)^((_i>>2)*0x3D));_ad%d[%d]=0;", _assign_enc_idx2-1, slen, _assign_enc_idx2-1, vname, _assign_enc_idx2-1, slen);
-                        fprintf(out,"strncpy(%s,_ad%d,sizeof(%s)-1);}\n", safe_cname(n->lhs), _assign_enc_idx2-1, safe_cname(n->lhs));
+                    if(g_obfuscate && strlen(val) >= 6){
+                        emit_scatter_string(out, safe_cname(n->lhs), val, 65536);
                     } else {
                     char *esc=c_escape_literal(val);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
