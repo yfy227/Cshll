@@ -363,24 +363,18 @@ static void *transpile_thread(void *arg){
     if(do_obfuscate){
         /* Anti-dump: flush and wipe everything before exit */
         fprintf(fout,"    fflush(stdout); fflush(stderr);\n");
-        /* Wipe all global string variables */
-        extern VarInfo var_table[]; extern int var_count;
-        for(int vi = 0; vi < var_count; vi++) {
-            if(var_table[vi].kind == V_STR) {
-                fprintf(fout,"    memset(%s, 0, 65536);\n", safe_cname(var_table[vi].name));
-            }
-        }
-        /* Wipe all pool buffers (capture_fn, cmd_output, etc.) */
-        fprintf(fout,"    memset(__sh_fn_out_p0,0,65536);memset(__sh_fn_out_p1,0,65536);"
-                     "memset(__sh_fn_out_p2,0,65536);memset(__sh_fn_out_p3,0,65536);\n");
-        fprintf(fout,"    memset(__sh_cmd_out_p0,0,65536);memset(__sh_cmd_out_p1,0,65536);"
-                     "memset(__sh_cmd_out_p2,0,65536);memset(__sh_cmd_out_p3,0,65536);\n");
-        /* Wipe heap */
-        fprintf(fout,"    malloc_trim(0);\n");
-        /* Wipe environ */
-        fprintf(fout,"    {extern char **environ; char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}\n");
-        /* Use _exit to bypass atexit — kernel reclaims memory on process exit */
-        fprintf(fout,"    _exit(__exit_status);\n");
+        /* Save exit status before wiping */
+        fprintf(fout,"    int _saved_rc=__exit_status;\n");
+        /* 1. Wipe environ */
+        fprintf(fout,"    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}}\n");
+        /* 2. Wipe ALL BSS — volatile to prevent compiler optimization */
+        fprintf(fout,"    {extern volatile char __bss_start[]; extern volatile char _end[]; "
+                     "size_t _bss_size=(size_t)((char*)_end-(char*)__bss_start); "
+                     "volatile char *_p=(volatile char*)__bss_start; "
+                     "while(_p<(volatile char*)_end){*_p=0; _p++;}}\n");
+        /* 3. _exit immediately — no malloc_trim to avoid glibc reentry */
+        /* 4. _exit — kernel reclaims memory */
+        fprintf(fout,"    _exit(_saved_rc);\n");
     }
     fprintf(fout,"    return __exit_status;\n}\n");
 
