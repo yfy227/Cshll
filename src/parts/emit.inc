@@ -5,31 +5,91 @@
 int tmp_id=0;
 void emit_node(FILE *out, Node *n);
 
-/* ── Scatter-Gather string protection ──────────────────────────────
- * Splits a string into N fragments, interleaves with M decoy buffers,
- * allocates all on heap in shuffled order. Real fragments tagged with
- * magic identifier. Plaintext assembled on-demand into stack buffer,
- * used, then ALL buffers wiped and freed.
- * Attacker sees ~15 small heap buffers, most are decoys. Without the
- * magic tag (stored on stack, not heap), reconstruction is infeasible.
+/* ── Multi-Cipher Scatter-Gather string protection ─────────────────
+ * Each fragment uses a DIFFERENT cipher:
+ *   cipher 0: RC4 stream cipher
+ *   cipher 1: S-box substitution (mini-AES)
+ *   cipher 2: Byte permutation + additive cipher
+ *   cipher 3: Multi-round rotate-XOR with key schedule
+ *   cipher 4: Bit-flip + position-dependent delta
+ * Attacker must break ALL 5 different ciphers to reconstruct.
+ * Decoy buffers use random ciphers too — indistinguishable from real.
  * ────────────────────────────────────────────────────────────────── */
 static int _sg_counter = 0;
+
+/* S-box for cipher 1 (bijective substitution) */
+static const char _SBOX_INIT[] =
+    "static const unsigned char _sbx[256]={"
+    "0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,"
+    "0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,"
+    "0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,"
+    "0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,"
+    "0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,"
+    "0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,"
+    "0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,"
+    "0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,"
+    "0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,"
+    "0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,"
+    "0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,"
+    "0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,"
+    "0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,"
+    "0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,"
+    "0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,"
+    "0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16"
+    "};\n";
+
+static int _sbox_emitted = 0;
 
 static void emit_scatter_string(FILE *out, const char *target, const char *src, int target_size) {
     int plen = (int)strlen(src);
     if(plen < 6) {
-        /* Too short — fall back to simple */
         char *esc = c_escape_literal(src);
         fprintf(out, "    strncpy(%s,\"%s\",%d);\n", target, esc, target_size - 1);
         free(esc);
         return;
     }
 
+    /* Emit S-box once */
+    if(!_sbox_emitted) {
+        fprintf(out, "%s", _SBOX_INIT);
+        /* Inverse S-box */
+        fprintf(out, "static const unsigned char _isb[256]={");
+        int _isb_tmp[256];
+        for(int i=0;i<256;i++) _isb_tmp[i]=0;
+        for(int i=0;i<256;i++){
+            /* parse sbox value */
+            static const unsigned char sbox_vals[256]={
+                0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+                0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+                0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+                0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+                0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+                0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+                0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+                0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+                0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+                0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+                0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+                0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+                0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+                0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+                0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+                0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+            };
+            for(int j=0;j<256;j++){
+                if(sbox_vals[j]==i){ _isb_tmp[i]=j; break; }
+            }
+        }
+        for(int i=0;i<256;i++) fprintf(out,"0x%02x,",_isb_tmp[i]);
+        fprintf(out, "};\n");
+        _sbox_emitted = 1;
+    }
+
     /* Determine fragment count: 3-5 real fragments */
     int nreal = plen / 8 + 2;
     if(nreal > 5) nreal = 5;
     if(nreal < 3) nreal = 3;
-    int ndecoy = nreal * 2;  /* 2x decoys */
+    int ndecoy = nreal * 2;
     int total = nreal + ndecoy;
     if(total > 20) total = 20;
 
@@ -50,7 +110,11 @@ static void emit_scatter_string(FILE *out, const char *target, const char *src, 
     magic = ((magic ^ 0xCAFEBABE) & 0xFFFF0000);
     if((magic & 0xFFFF0000) == 0) magic = 0xCAF00000;
 
-    /* Deterministic shuffle of real/decoy positions */
+    /* Per-fragment cipher selection: each real fragment gets a different cipher (0-4) */
+    /* Cipher IDs are stored in the tag low bits alongside fragment order */
+    /* Tag format: [magic 16 bits][cipher 4 bits][order 4 bits][reserved 8 bits] */
+
+    /* Shuffle positions */
     int order[20];
     for(int i = 0; i < total; i++) order[i] = i;
     unsigned int rng = magic;
@@ -62,60 +126,169 @@ static void emit_scatter_string(FILE *out, const char *target, const char *src, 
 
     int sg_id = _sg_counter++;
 
-    fprintf(out, "    {/*scatter-%d*/\n", sg_id);
-    fprintf(out, "    char*_sb[%d];int _sl[%d];unsigned _st[%d];\n", total, total, total);
+    fprintf(out, "    {/*sg-%d*/\n", sg_id);
+    fprintf(out, "    char*_gb[%d];int _gl[%d];unsigned _gt[%d];\n", total, total, total);
 
-    /* Emit all buffers in shuffled order */
+    /* Emit all buffers — each uses a different cipher */
     int real_idx = 0;
     for(int si = 0; si < total; si++) {
         int is_real = (si < nreal);
         int flen;
         const char *fdata;
+        int cipher_id;
 
         if(is_real) {
             flen = frag_lens[real_idx];
             fdata = src + frag_starts[real_idx];
+            cipher_id = real_idx % 5;  /* Each real fragment uses a different cipher */
         } else {
-            /* Decoy: plausible-looking random bytes */
             flen = 4 + ((magic ^ (si * 37)) % 10);
-            /* Generate decoy data at compile time */
             char decoy[16];
             for(int d = 0; d < flen && d < 15; d++)
                 decoy[d] = (char)(0x20 + ((magic ^ (si * 31) ^ (d * 17)) % 95));
             decoy[flen < 16 ? flen : 15] = 0;
             fdata = decoy;
+            cipher_id = si % 5;  /* Decoys also use various ciphers */
         }
 
-        /* Per-buffer XOR key — different for each buffer */
-        unsigned int key_base = magic ^ (si * 0x1234567);
+        /* Per-buffer key derived from magic + position */
+        unsigned int key_seed = magic ^ (si * 0x1234567) ^ (flen * 0x9E3779B9);
 
-        fprintf(out, "    _sb[%d]=malloc(%d);{const char _d[]={", si, flen);
-        for(int b = 0; b < flen; b++) {
-            uint8_t key = (uint8_t)((key_base >> ((b % 4) * 8)) ^ (b * 7));
-            fprintf(out, "0x%02x,", (uint8_t)fdata[b] ^ key);
+        fprintf(out, "    _gb[%d]=malloc(%d);{const unsigned char _d[]={", si, flen);
+
+        /* Apply the appropriate cipher */
+        if(cipher_id == 0) {
+            /* Cipher 0: RC4 stream cipher */
+            uint8_t rc4_s[256];
+            for(int i = 0; i < 256; i++) rc4_s[i] = (uint8_t)i;
+            uint8_t rc4_k[8];
+            for(int i = 0; i < 8; i++) rc4_k[i] = (uint8_t)(key_seed >> (i * 4));
+            int j = 0;
+            for(int i = 0; i < 256; i++) {
+                j = (j + rc4_s[i] + rc4_k[i % 8]) & 0xFF;
+                uint8_t t = rc4_s[i]; rc4_s[i] = rc4_s[j]; rc4_s[j] = t;
+            }
+            int ii = 0, jj = 0;
+            for(int b = 0; b < flen; b++) {
+                ii = (ii + 1) & 0xFF;
+                jj = (jj + rc4_s[ii]) & 0xFF;
+                uint8_t t = rc4_s[ii]; rc4_s[ii] = rc4_s[jj]; rc4_s[jj] = t;
+                uint8_t ks = rc4_s[(rc4_s[ii] + rc4_s[jj]) & 0xFF];
+                fprintf(out, "0x%02x,", (uint8_t)fdata[b] ^ ks);
+            }
+        } else if(cipher_id == 1) {
+            /* Cipher 1: S-box substitution + XOR */
+            static const unsigned char sbox_vals[256] = {
+                0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+                0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+                0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+                0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+                0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+                0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+                0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+                0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+                0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+                0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+                0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+                0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+                0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+                0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+                0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+                0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+            };
+            for(int b = 0; b < flen; b++) {
+                uint8_t xored = (uint8_t)fdata[b] ^ (uint8_t)(key_seed >> ((b % 4) * 8));
+                fprintf(out, "0x%02x,", sbox_vals[xored]);
+            }
+        } else if(cipher_id == 2) {
+            /* Cipher 2: Byte permutation + additive cipher */
+            /* Permutation: reverse + rotate by key-dependent amount */
+            int rot = key_seed % 8;
+            for(int b = 0; b < flen; b++) {
+                int src_idx = ((flen - 1 - b) + rot) % flen;
+                uint8_t delta = (uint8_t)((key_seed >> (b % 4 * 8)) + b * 13);
+                fprintf(out, "0x%02x,", (uint8_t)((uint8_t)fdata[src_idx] + delta));
+            }
+        } else if(cipher_id == 3) {
+            /* Cipher 3: Multi-round rotate-XOR with key schedule (3 rounds) */
+            uint8_t buf[256];
+            for(int b = 0; b < flen; b++) buf[b] = (uint8_t)fdata[b];
+            for(int round = 0; round < 3; round++) {
+                uint8_t round_key = (uint8_t)(key_seed >> (round * 8));
+                uint8_t prev = (uint8_t)(key_seed >> 24);
+                for(int b = 0; b < flen; b++) {
+                    uint8_t cur = buf[b];
+                    buf[b] = (uint8_t)((cur >> 3) | (cur << 5)) ^ round_key ^ prev;
+                    prev = cur;
+                }
+            }
+            for(int b = 0; b < flen; b++) fprintf(out, "0x%02x,", buf[b]);
+        } else {
+            /* Cipher 4: Bit-flip + position-dependent delta + XOR */
+            for(int b = 0; b < flen; b++) {
+                uint8_t v = (uint8_t)fdata[b];
+                v = ~v;  /* Bit flip */
+                uint8_t delta = (uint8_t)((key_seed * (b + 1) + 0x5A) & 0xFF);
+                v = (uint8_t)(v + delta);  /* Additive */
+                v ^= (uint8_t)(key_seed >> ((b % 4) * 8));  /* XOR */
+                fprintf(out, "0x%02x,", v);
+            }
         }
-        fprintf(out, "0};memcpy(_sb[%d],_d,%d);}", si, flen);
-        fprintf(out, "_sl[%d]=%d;", si, flen);
+
+        fprintf(out, "0};memcpy(_gb[%d],_d,%d);}", si, flen);
+        fprintf(out, "_gl[%d]=%d;", si, flen);
 
         if(is_real) {
-            /* Real: tag = magic | fragment_order */
-            fprintf(out, "_st[%d]=0x%08x;\n", si, magic | real_idx);
+            /* Tag: magic(16) | cipher(4) | order(4) | reserved(8) */
+            unsigned int tag = magic | (cipher_id << 8) | (real_idx & 0xF);
+            fprintf(out, "_gt[%d]=0x%08x;\n", si, tag);
             real_idx++;
         } else {
-            /* Decoy: fake tag that won't match magic */
             unsigned int fake_tag = 0xDEAD0000 ^ (si * 0x1111);
             if((fake_tag & 0xFFFF0000) == (magic & 0xFFFF0000)) fake_tag ^= 0x10000000;
-            fprintf(out, "_st[%d]=0x%08x;\n", si, fake_tag);
+            /* Decoys also carry a fake cipher_id to look real */
+            fake_tag |= (si % 5) << 8;
+            fake_tag |= (si & 0xF);
+            fprintf(out, "_gt[%d]=0x%08x;\n", si, fake_tag);
         }
     }
 
-    /* Gather: walk all buffers, collect real fragments by magic+order */
+    /* Gather: for each real fragment, decode with the correct cipher */
     fprintf(out, "    char _sg[512];int _sp=0;\n");
     fprintf(out, "    for(int _o=0;_o<%d;_o++){\n", nreal);
     fprintf(out, "      for(int _i=0;_i<%d;_i++){\n", total);
-    fprintf(out, "        if((_st[_i]&0xFFFF0000)==0x%08x && (_st[_i]&0xFFFF)==(unsigned)_o){\n", magic);
-    fprintf(out, "          unsigned _kb=0x%08x^(_i*0x1234567);\n", magic);
-    fprintf(out, "          for(int _j=0;_j<_sl[_i];_j++){uint8_t _k=(uint8_t)((_kb>>((_j%%4)*8))^(_j*7));_sg[_sp++]=_sb[_i][_j]^_k;}\n");
+    fprintf(out, "        unsigned _t=_gt[_i];\n");
+    fprintf(out, "        if((_t&0xFFFF0000)==0x%08x && (_t&0xF)==(unsigned)_o){\n", magic);
+    fprintf(out, "          int _ci=(_t>>8)&0xF;\n");
+    fprintf(out, "          unsigned _ks=0x%08x^(_i*0x1234567)^(_gl[_i]*0x9E3779B9u);\n", magic);
+    fprintf(out, "          int _fl=_gl[_i];\n");
+    /* Cipher 0: RC4 */
+    fprintf(out, "          if(_ci==0){uint8_t _rs[256];for(int _j=0;_j<256;_j++)_rs[_j]=(uint8_t)_j;"
+            "uint8_t _rk[8];for(int _j=0;_j<8;_j++)_rk[_j]=(uint8_t)(_ks>>(_j*4));"
+            "int _jj=0;for(int _j=0;_j<256;_j++){_jj=(_jj+_rs[_j]+_rk[_j%%8])&0xFF;uint8_t _x=_rs[_j];_rs[_j]=_rs[_jj];_rs[_jj]=_x;}"
+            "int _a=0,_b=0;for(int _j=0;_j<_fl;_j++){_a=(_a+1)&0xFF;_b=(_b+_rs[_a])&0xFF;uint8_t _x=_rs[_a];_rs[_a]=_rs[_b];_rs[_b]=_x;"
+            "_sg[_sp++]=_gb[_i][_j]^_rs[(_rs[_a]+_rs[_b])&0xFF];}}\n");
+    /* Cipher 1: S-box inverse + XOR */
+    fprintf(out, "          else if(_ci==1){for(int _j=0;_j<_fl;_j++){uint8_t _v=_isb[_gb[_i][_j]];"
+            "_sg[_sp++]=_v^(uint8_t)(_ks>>((_j%%4)*8));}}\n");
+    /* Cipher 2: Inverse permutation + subtract delta */
+    fprintf(out, "          else if(_ci==2){int _rot=_ks%%8;"
+            "for(int _j=0;_j<_fl;_j++){int _si2=((_fl-1-_j)+_rot)%%_fl;"
+            "uint8_t _delta=(uint8_t)((_ks>>(_j%%4*8))+_j*13);"
+            "/* unpermute: _j is output pos, find input pos */"
+            "int _src=((_j-_rot+_fl)%%_fl);_src=(_fl-1-_src);"
+            "_sg[_sp+ _src]=_gb[_i][_j]-(uint8_t)_delta;}_sp+=_fl;}\n");
+    /* Cipher 3: Multi-round inverse rotate-XOR */
+    fprintf(out, "          else if(_ci==3){uint8_t _buf[256];for(int _j=0;_j<_fl;_j++)_buf[_j]=_gb[_i][_j];"
+            "for(int _r=2;_r>=0;_r--){uint8_t _rk=(uint8_t)(_ks>>(_r*8));uint8_t _next=(uint8_t)(_ks>>24);"
+            "uint8_t _prev[256];for(int _j=0;_j<_fl;_j++)_prev[_j]=_buf[_j];"
+            "for(int _j=_fl-1;_j>=0;_j--){uint8_t _p=(_j>0)?_prev[_j-1]:_next;"
+            "uint8_t _cur=_buf[_j];_buf[_j]=(((_cur^_rk^_p)<<3)|((_cur^_rk^_p)>>5));}}\n"
+            "          for(int _j=0;_j<_fl;_j++)_sg[_sp++]=_buf[_j];}\n");
+    /* Cipher 4: Inverse bit-flip + subtract delta + XOR */
+    fprintf(out, "          else{for(int _j=0;_j<_fl;_j++){uint8_t _v=_gb[_i][_j];"
+            "_v^=(uint8_t)(_ks>>((_j%%4)*8));uint8_t _delta=(uint8_t)((_ks*(_j+1)+0x5A)&0xFF);"
+            "_v=_v-_delta;_sg[_sp++]=~_v;}}\n");
     fprintf(out, "        }\n");
     fprintf(out, "      }\n");
     fprintf(out, "    }\n");
@@ -124,8 +297,8 @@ static void emit_scatter_string(FILE *out, const char *target, const char *src, 
     /* Use */
     fprintf(out, "    strncpy(%s,_sg,%d);\n", target, target_size - 1);
 
-    /* Destroy: wipe and free ALL buffers + result */
-    fprintf(out, "    for(int _i=0;_i<%d;_i++){memset(_sb[_i],0,_sl[_i]);free(_sb[_i]);}\n", total);
+    /* Destroy */
+    fprintf(out, "    for(int _i=0;_i<%d;_i++){memset(_gb[_i],0,_gl[_i]);free(_gb[_i]);}\n", total);
     fprintf(out, "    memset(_sg,0,sizeof(_sg));\n");
     fprintf(out, "    }\n");
 }
