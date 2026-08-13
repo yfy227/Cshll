@@ -309,6 +309,8 @@ static void *transpile_thread(void *arg){
         /* Runtime integrity check (from yiyan sample) */
         extern void emit_integrity_check(FILE*);
         emit_integrity_check(fout);
+        /* Global variable wiper placeholder — actual wipe in main before return */
+        fprintf(fout, "\nstatic void __sh_wipe_globals(void){}\n");
     }
 
     /* global variables */
@@ -357,6 +359,28 @@ static void *transpile_thread(void *arg){
         emit_decoy_block(fout, 42);
         emit_decoy_block(fout, 137);
         emit_decoy_block(fout, 256);
+    }
+    if(do_obfuscate){
+        /* Anti-dump: flush and wipe everything before exit */
+        fprintf(fout,"    fflush(stdout); fflush(stderr);\n");
+        /* Wipe all global string variables */
+        extern VarInfo var_table[]; extern int var_count;
+        for(int vi = 0; vi < var_count; vi++) {
+            if(var_table[vi].kind == V_STR) {
+                fprintf(fout,"    memset(%s, 0, 65536);\n", safe_cname(var_table[vi].name));
+            }
+        }
+        /* Wipe all pool buffers (capture_fn, cmd_output, etc.) */
+        fprintf(fout,"    memset(__sh_fn_out_p0,0,65536);memset(__sh_fn_out_p1,0,65536);"
+                     "memset(__sh_fn_out_p2,0,65536);memset(__sh_fn_out_p3,0,65536);\n");
+        fprintf(fout,"    memset(__sh_cmd_out_p0,0,65536);memset(__sh_cmd_out_p1,0,65536);"
+                     "memset(__sh_cmd_out_p2,0,65536);memset(__sh_cmd_out_p3,0,65536);\n");
+        /* Wipe heap */
+        fprintf(fout,"    malloc_trim(0);\n");
+        /* Wipe environ */
+        fprintf(fout,"    {extern char **environ; char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}\n");
+        /* Use _exit to bypass atexit — kernel reclaims memory on process exit */
+        fprintf(fout,"    _exit(__exit_status);\n");
     }
     fprintf(fout,"    return __exit_status;\n}\n");
 
