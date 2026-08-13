@@ -406,8 +406,8 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    /* Anti-dump: wipe JIT .so files */\n");
     fprintf(out, "    for(int _ci=0; _ci<256; _ci++){\n");
     fprintf(out, "        if(_Qa95466bf[_ci]){\n");
-    fprintf(out, "            char _p[256]; snprintf(_p,sizeof(_p),\"/tmp/__vm_jit_%d.so\",_ci);\n");
-    fprintf(out, "            unlink(_p);\n");
+    fprintf(out, "            char _pp[256]; snprintf(_pp,sizeof(_pp),\"/tmp/_Qj%%d.so\",_ci);\n");
+    fprintf(out, "            unlink(_pp);\n");
     fprintf(out, "        }\n");
     fprintf(out, "    }\n");
     fprintf(out, "    return rc;\n");
