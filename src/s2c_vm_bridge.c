@@ -205,7 +205,13 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
         if((i + 1) % 16 == 0) fprintf(out, "\n    ");
     }
     fprintf(out, "\n};\n");
-    fprintf(out, "#define __VM_PERM_SEED 0x%08xu\n\n", perm_seed);
+    /* PERM_SEED stored as XOR of two halves — not as a single #define */
+    {
+        fprintf(out, "/* Permutation seed (XOR-split) — assembled at runtime */\n");
+        fprintf(out, "static unsigned int __vm_perm_seed(void){\n");
+        fprintf(out, "  return 0x%08xu ^ 0x%08xu;\n", perm_seed ^ 0xAAAAAAAA, 0xAAAAAAAA);
+        fprintf(out, "}\n");
+    }
     /* RT_KEY: computed at runtime from scattered fragments — not stored as a single constant */
     {
         uint32_t k1 = (perm_seed ^ 0xDEADBEEF) & 0xFFFF;
@@ -352,8 +358,8 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    uint8_t rc4_s[256];\n");
     fprintf(out, "    for(int i=0;i<256;i++) rc4_s[i]=(uint8_t)i;\n");
     fprintf(out, "    uint8_t rc4_key[8];\n");
-    /* Key derivation: mix rt_key with PERM_SEED through non-trivial ops */
-    fprintf(out, "    unsigned int __vm_ps2=__vm_rt_key() ^ (__VM_PERM_SEED * 0x9E3779B9u);\n");
+    /* Key derivation: mix rt_key with perm_seed through non-trivial ops */
+    fprintf(out, "    unsigned int __vm_ps2=__vm_rt_key() ^ (__vm_perm_seed() * 0x9E3779B9u);\n");
     fprintf(out, "    __vm_ps2 ^= (__vm_ps2 >> 16); __vm_ps2 *= 0x85EBCA6Bu; __vm_ps2 ^= (__vm_ps2 >> 13);\n");
     fprintf(out, "    for(int i=0;i<8;i++) rc4_key[i]=(uint8_t)(__vm_ps2>>(i*4));\n");
     fprintf(out, "    int j2=0;\n");
@@ -370,7 +376,7 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     /* Un-permute opcodes */
     fprintf(out, "    /* Un-permute opcodes (per-build randomized) */\n");
     fprintf(out, "    uint8_t __vm_inv[256];\n");
-    fprintf(out, "    unsigned int __vm_ps = __VM_PERM_SEED;\n");
+    fprintf(out, "    unsigned int __vm_ps = __vm_perm_seed();\n");
     fprintf(out, "    for(int i = 0; i < 256; i++){\n");
     fprintf(out, "        __vm_inv[i] = __vm_perm[i] ^ (uint8_t)(__vm_ps >> (i %% 4 * 8));\n");
     fprintf(out, "    }\n");
@@ -394,8 +400,16 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     }
     fprintf(out, "    int rc = vm_run(0);\n");
     /* Anti-dump: wipe decoded bytecode after execution */
-    fprintf(out, "    /* Anti-dump: wipe sensitive data */\n");
+    fprintf(out, "    /* Anti-dump: wipe decoded bytecode after execution */\n");
     fprintf(out, "    memset(__vm_code_decoded, 0, sizeof(__vm_code_decoded));\n");
+    fprintf(out, "    memset(__vm_cp_buf, 0, sizeof(__vm_cp_buf));\n");
+    fprintf(out, "    /* Anti-dump: wipe JIT .so files */\n");
+    fprintf(out, "    for(int _ci=0; _ci<256; _ci++){\n");
+    fprintf(out, "        if(_Qa95466bf[_ci]){\n");
+    fprintf(out, "            char _p[256]; snprintf(_p,sizeof(_p),\"/tmp/__vm_jit_%d.so\",_ci);\n");
+    fprintf(out, "            unlink(_p);\n");
+    fprintf(out, "        }\n");
+    fprintf(out, "    }\n");
     fprintf(out, "    return rc;\n");
     fprintf(out, "}\n");
 
