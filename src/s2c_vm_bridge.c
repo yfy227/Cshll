@@ -206,9 +206,34 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     }
     fprintf(out, "\n};\n");
     fprintf(out, "#define __VM_PERM_SEED 0x%08xu\n\n", perm_seed);
+    /* RT_KEY: computed at runtime from scattered fragments — not stored as a single constant */
+    {
+        uint32_t k1 = (perm_seed ^ 0xDEADBEEF) & 0xFFFF;
+        uint32_t k2 = ((perm_seed << 7) ^ 0xCAFEBABE) & 0xFFFF;
+        uint32_t k3 = (perm_seed >> 3) & 0xFFFF;
+        uint32_t k4 = (perm_seed ^ 0xFEEDFACE) & 0xFFFF;
+        /* Emit 4 fragment functions + assembler */
+        fprintf(out, "/* Key fragments — scattered, assembled at runtime */\n");
+        fprintf(out, "static uint32_t _kf1(void){ return 0x%04xu; }\n", k1);
+        fprintf(out, "static uint32_t _kf2(void){ return 0x%04xu; }\n", k2);
+        fprintf(out, "static uint32_t _kf3(void){ return 0x%04xu; }\n", k3);
+        fprintf(out, "static uint32_t _kf4(void){ return 0x%04xu; }\n", k4);
+        fprintf(out, "static uint32_t __vm_rt_key(void){\n");
+        fprintf(out, "  uint32_t a=_kf1(), b=_kf2(), c=_kf3(), d=_kf4();\n");
+        fprintf(out, "  uint32_t lo=(a<<16)|b, hi=(c<<16)|d;\n");
+        fprintf(out, "  return lo ^ hi;\n");
+        fprintf(out, "}\n");
+    }
+    /* Compute rt_key_val in compiler — must match __vm_rt_key() logic */
+    uint32_t k1 = (perm_seed ^ 0xDEADBEEF) & 0xFFFF;
+    uint32_t k2 = ((perm_seed << 7) ^ 0xCAFEBABE) & 0xFFFF;
+    uint32_t k3 = (perm_seed >> 3) & 0xFFFF;
+    uint32_t k4 = (perm_seed ^ 0xFEEDFACE) & 0xFFFF;
+    uint32_t rt_key_val = ((k1 << 16) | k2) ^ ((k3 << 16) | k4);
 
-    /* Anti-analysis: encode constant pool with XOR + rotating key */
-    fprintf(out, "\n/* ---- VM constant pool (XOR-encoded) ---- */\n");
+    /* Anti-analysis: encode constant pool with double-XOR + position-dependent key
+     * Uses two rotating keys derived from runtime key instead of fixed 0xA3 formula */
+    fprintf(out, "\n/* ---- VM constant pool (double-XOR encoded) ---- */\n");
     fprintf(out, "static const unsigned char __vm_cp_enc[] = {\n");
     fprintf(out, "    ");
     /* Encode constant pool: for each string, store [len_u8] [xor bytes] */
@@ -217,15 +242,16 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
         const char *s = cp->strs[i];
         int slen = (int)strlen(s);
         if(slen > 255) slen = 255;
-        /* length byte (XOR with key) */
-        uint8_t key = 0xA3 + (i * 17);
+        /* length byte: XOR with runtime key + string index */
+        uint8_t key = (uint8_t)((rt_key_val >> ((i % 4) * 8)) ^ (i * 0x3D + 0x17));
         fprintf(out, "0x%02x,", (uint8_t)(slen ^ key));
         cp_total++;
         if(cp_total % 16 == 0) fprintf(out, "\n    ");
-        /* XOR-encoded string bytes */
+        /* Double-XOR encoded string bytes: key1 = rt_key rotation, key2 = position hash */
         for(int j = 0; j < slen; j++){
-            uint8_t k = 0xA3 + (i * 17) + (j * 37);
-            fprintf(out, "0x%02x,", (uint8_t)(s[j] ^ k));
+            uint8_t k1 = (uint8_t)((rt_key_val >> (((i + j) % 4) * 8)) ^ (j * 0x5B));
+            uint8_t k2 = (uint8_t)((rt_key_val ^ (i * 0x1F + j * 0x2D)) >> ((j % 4) * 8));
+            fprintf(out, "0x%02x,", (uint8_t)(s[j] ^ k1 ^ k2));
             cp_total++;
             if(cp_total % 16 == 0) fprintf(out, "\n    ");
         }
@@ -238,12 +264,16 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "/* ---- VM bytecode (RC4 encrypted) ---- */\n");
     fprintf(out, "static const unsigned char __vm_code_enc[] = {\n");
     fprintf(out, "    ");
-    /* RC4: generate keystream from perm_seed, XOR with bytecode */
+    /* RC4: generate keystream from hardened key derivation, XOR with bytecode */
     {
         uint8_t rc4_s[256];
         for(int i = 0; i < 256; i++) rc4_s[i] = (uint8_t)i;
         uint8_t rc4_key[8];
-        for(int i = 0; i < 8; i++) rc4_key[i] = (uint8_t)(perm_seed >> (i * 4));
+        /* Hardened key: mix perm_seed with rt_key through non-trivial ops */
+        uint32_t rt_key = rt_key_val; /* use same value as encoded in _kf1-_kf4 */
+        unsigned int ps2 = rt_key ^ (perm_seed * 0x9E3779B9u);
+        ps2 ^= (ps2 >> 16); ps2 *= 0x85EBCA6Bu; ps2 ^= (ps2 >> 13);
+        for(int i = 0; i < 8; i++) rc4_key[i] = (uint8_t)(ps2 >> (i * 4));
         int j = 0;
         for(int i = 0; i < 256; i++){
             j = (j + rc4_s[i] + rc4_key[i % 8]) & 0xFF;
@@ -293,34 +323,38 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "      if(__vm_check != 0x1337) return 0xBAD; }\n");
     fprintf(out, "    __vm_skip:\n");
     /* Decode constant pool */
-    fprintf(out, "    /* Decode constant pool at runtime */\n");
+    fprintf(out, "    /* Decode constant pool at runtime (double-XOR) */\n");
     fprintf(out, "    static char __vm_cp_buf[65536]; int __vm_cp_off = 0;\n");
     fprintf(out, "    const unsigned char *__vm_cp_p = __vm_cp_enc;\n");
     fprintf(out, "    static const char *__vm_cp_strs[1024];\n");
     fprintf(out, "    int __vm_cp_n = 0;\n");
+    fprintf(out, "    uint32_t __vm_rt = __vm_rt_key();\n");
     fprintf(out, "    while(*__vm_cp_p != 0xFF && __vm_cp_n < 1024){\n");
     fprintf(out, "        int si = __vm_cp_n;\n");
-    fprintf(out, "        uint8_t key = 0xA3 + (si * 17);\n");
+    fprintf(out, "        uint8_t key = (uint8_t)((__vm_rt >> ((si %% 4) * 8)) ^ (si * 0x3D + 0x17));\n");
     fprintf(out, "        int slen = *__vm_cp_p++ ^ key;\n");
     fprintf(out, "        if(slen > 255) break;\n");
     fprintf(out, "        for(int j = 0; j < slen; j++){\n");
-    fprintf(out, "            uint8_t k = 0xA3 + (si * 17) + (j * 37);\n");
-    fprintf(out, "            __vm_cp_buf[__vm_cp_off++] = *__vm_cp_p++ ^ k;\n");
+    fprintf(out, "            uint8_t k1 = (uint8_t)((__vm_rt >> (((si + j) %% 4) * 8)) ^ (j * 0x5B));\n");
+    fprintf(out, "            uint8_t k2 = (uint8_t)((__vm_rt ^ (si * 0x1F + j * 0x2D)) >> ((j %% 4) * 8));\n");
+    fprintf(out, "            __vm_cp_buf[__vm_cp_off++] = *__vm_cp_p++ ^ k1 ^ k2;\n");
     fprintf(out, "        }\n");
     fprintf(out, "        __vm_cp_buf[__vm_cp_off++] = 0;\n");
     fprintf(out, "        __vm_cp_strs[__vm_cp_n++] = &__vm_cp_buf[__vm_cp_off - slen - 1];\n");
     fprintf(out, "    }\n");
     fprintf(out, "    __vm_consts = __vm_cp_strs;\n");
     fprintf(out, "    __vm_nconsts = __vm_cp_n;\n");
-    /* Decode bytecode with RC4 */
-    fprintf(out, "    /* Decode bytecode (RC4) */\n");
+    /* Decode bytecode with RC4 — key derived from runtime hash, not direct #define */
+    fprintf(out, "    /* Decode bytecode (RC4 with hardened key) */\n");
     fprintf(out, "    int __vm_cs=(int)sizeof(__vm_code_enc);\n");
     fprintf(out, "    if(__vm_cs>(int)sizeof(__vm_code_decoded)) __vm_cs=(int)sizeof(__vm_code_decoded);\n");
     fprintf(out, "    {\n");
     fprintf(out, "    uint8_t rc4_s[256];\n");
     fprintf(out, "    for(int i=0;i<256;i++) rc4_s[i]=(uint8_t)i;\n");
     fprintf(out, "    uint8_t rc4_key[8];\n");
-    fprintf(out, "    unsigned int __vm_ps2=__VM_PERM_SEED;\n");
+    /* Key derivation: mix rt_key with PERM_SEED through non-trivial ops */
+    fprintf(out, "    unsigned int __vm_ps2=__vm_rt_key() ^ (__VM_PERM_SEED * 0x9E3779B9u);\n");
+    fprintf(out, "    __vm_ps2 ^= (__vm_ps2 >> 16); __vm_ps2 *= 0x85EBCA6Bu; __vm_ps2 ^= (__vm_ps2 >> 13);\n");
     fprintf(out, "    for(int i=0;i<8;i++) rc4_key[i]=(uint8_t)(__vm_ps2>>(i*4));\n");
     fprintf(out, "    int j2=0;\n");
     fprintf(out, "    for(int i=0;i<256;i++){ j2=(j2+rc4_s[i]+rc4_key[i%%8])&0xFF; uint8_t t=rc4_s[i];rc4_s[i]=rc4_s[j2];rc4_s[j2]=t; }\n");
