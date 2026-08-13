@@ -87,7 +87,18 @@ const char *safe_cname(const char *name){
         buf[j]=0;
         return buf;
     }
-    /* name is clean — can return directly without copying */
+    /* name is clean — mangle if obfuscate mode */
+    extern int g_obfuscate;
+    if(g_obfuscate){
+        extern const char *mangle(const char*);
+        const char *mangled = mangle(name);
+        if(mangled != name) return mangled;
+        /* If mangle didn't change it (shouldn't happen for clean names), apply FNV hash */
+        unsigned int h = 2166136261u;
+        for(const char *p=name; *p; p++){ h ^= (unsigned char)*p; h *= 16777619u; }
+        snprintf(buf, 256, "_Q%08x", h);
+        return buf;
+    }
     return name;
 }
 

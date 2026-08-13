@@ -5,7 +5,7 @@
 const char *RT_HEADER =
 "/* ---- shell2c runtime (deep optimization) ---- */\n"
 "#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
-"#include <ctype.h>\n#include <unistd.h>\n#include <dirent.h>\n"
+"#include <stdint.h>\n#include <ctype.h>\n#include <unistd.h>\n#include <dirent.h>\n"
 "#include <fcntl.h>\n#include <sys/stat.h>\n#include <sys/wait.h>\n"
 "#include <sys/types.h>\n#include <errno.h>\n#include <time.h>\n"
 "#include <pwd.h>\n#include <grp.h>\n#include <signal.h>\n#include <regex.h>\n"

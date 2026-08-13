@@ -113,7 +113,32 @@ char *emit_word(FILE *out, const char *word){
 
     /* Now emit the unescaped string */
     if(!has_dollar && !strchr(unescaped,'\\')){
-        /* Pure literal — escape for C string and return */
+        /* Pure literal — encode if obfuscate mode, else plain */
+        extern int g_obfuscate;
+        if(g_obfuscate && strlen(unescaped) >= 4){
+            /* XOR-encode the string, emit as decode expression */
+            int slen = strlen(unescaped);
+            /* Generate unique var name */
+            static int enc_idx = 0;
+            char varname[32]; snprintf(varname, sizeof(varname), "_enc_%d", enc_idx++);
+            /* Build encoded byte array + decode call */
+            char *r = malloc(slen * 6 + 256);
+            char *p = r;
+            p += sprintf(p, "({static const unsigned char %s[]=", varname);
+            p += sprintf(p, "{");
+            /* XOR key: position-dependent */
+            for(int i = 0; i < slen; i++){
+                uint8_t key = (uint8_t)(0x5A ^ (i * 7) ^ ((i >> 2) * 0x3D));
+                p += sprintf(p, "0x%02x,", (uint8_t)unescaped[i] ^ key);
+            }
+            p += sprintf(p, "0};static char _dec_%d[256];", enc_idx - 1);
+            p += sprintf(p, "for(int _i=0;_i<%d;_i++) _dec_%d[_i]=%s[_i]^(uint8_t)(0x5A^(_i*7)^((_i>>2)*0x3D));",
+                         slen, enc_idx - 1, varname);
+            p += sprintf(p, "_dec_%d[%d]=0;", enc_idx - 1, slen);
+            p += sprintf(p, "_dec_%d;})", enc_idx - 1);
+            return r;
+        }
+        /* No obfuscation — plain literal */
         char *esc = c_escape_literal(unescaped);
         char *r = malloc(strlen(esc) + 3);
         sprintf(r, "\"%s\"", esc);
@@ -1706,14 +1731,45 @@ void emit_node(FILE *out, Node *n){
                         tmp[ti++]=*vp++;
                     }
                     tmp[ti]=0;
+                    /* Encode string literal if obfuscate mode */
+                    extern int g_obfuscate;
+                    if(g_obfuscate && strlen(tmp) >= 4){
+                        int slen = strlen(tmp);
+                        static int _assign_enc_idx = 0;
+                        char vname[32]; snprintf(vname,sizeof(vname),"_ae%d",_assign_enc_idx++);
+                        fprintf(out,"    {static const unsigned char %s[]={", vname);
+                        for(int ei=0; ei<slen; ei++){
+                            uint8_t key=(uint8_t)(0x5A^(ei*7)^((ei>>2)*0x3D));
+                            fprintf(out,"0x%02x,",(uint8_t)tmp[ei]^key);
+                        }
+                        fprintf(out,"0};char _ad%d[256];for(int _i=0;_i<%d;_i++)_ad%d[_i]=%s[_i]^(uint8_t)(0x5A^(_i*7)^((_i>>2)*0x3D));_ad%d[%d]=0;", _assign_enc_idx-1, slen, _assign_enc_idx-1, vname, _assign_enc_idx-1, slen);
+                        fprintf(out,"strncpy(%s,_ad%d,sizeof(%s)-1);}\n", safe_cname(n->lhs), _assign_enc_idx-1, safe_cname(n->lhs));
+                    } else {
                     char *esc=c_escape_literal(tmp);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
                             safe_cname(n->lhs),esc,safe_cname(n->lhs));
-                    /* BUG-12 fix: sync IFS and other special vars to environment */
-                    if(!strcmp(n->lhs,"IFS"))
-                        fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
                     free(esc);
+                    }
+                    /* BUG-12 fix: sync IFS and other special vars to environment */
+                    if(!strcmp(n->lhs,"IFS")){
+                        char *esc=c_escape_literal(tmp);
+                        fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
+                        free(esc);
+                    }
                 } else {
+                    extern int g_obfuscate;
+                    if(g_obfuscate && strlen(val) >= 4){
+                        int slen = strlen(val);
+                        static int _assign_enc_idx2 = 0;
+                        char vname[32]; snprintf(vname,sizeof(vname),"_ae%d",_assign_enc_idx2++);
+                        fprintf(out,"    {static const unsigned char %s[]={", vname);
+                        for(int ei=0; ei<slen; ei++){
+                            uint8_t key=(uint8_t)(0x5A^(ei*7)^((ei>>2)*0x3D));
+                            fprintf(out,"0x%02x,",(uint8_t)val[ei]^key);
+                        }
+                        fprintf(out,"0};char _ad%d[256];for(int _i=0;_i<%d;_i++)_ad%d[_i]=%s[_i]^(uint8_t)(0x5A^(_i*7)^((_i>>2)*0x3D));_ad%d[%d]=0;", _assign_enc_idx2-1, slen, _assign_enc_idx2-1, vname, _assign_enc_idx2-1, slen);
+                        fprintf(out,"strncpy(%s,_ad%d,sizeof(%s)-1);}\n", safe_cname(n->lhs), _assign_enc_idx2-1, safe_cname(n->lhs));
+                    } else {
                     char *esc=c_escape_literal(val);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
                             safe_cname(n->lhs),esc,safe_cname(n->lhs));
@@ -1721,6 +1777,7 @@ void emit_node(FILE *out, Node *n){
                     if(!strcmp(n->lhs,"IFS"))
                         fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
                     free(esc);
+                    }
                 }
             }
         }

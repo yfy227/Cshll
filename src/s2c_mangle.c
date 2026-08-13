@@ -29,8 +29,14 @@ const char *mangle(const char *name){
     if(!g_obfuscate) return name;
     if(!name || !*name) return name;
 
-    /* Don't mangle C standard library names */
-    if(name[0] != '_') return name;
+    /* Don't mangle C standard library names and runtime functions */
+    if(strncmp(name,"__sh_",5)==0) return name;
+    if(strncmp(name,"__vm",4)==0) return name;
+    if(strncmp(name,"__rb",4)==0) return name;
+    if(strncmp(name,"__tw",4)==0) return name;
+    if(strncmp(name,"__arr_",6)==0) return name;
+    if(strncmp(name,"__save_",7)==0) return name;
+    if(strncmp(name,"__sh_",5)==0) return name;
 
     /* Don't mangle _Q* (already mangled) */
     if(name[0]=='_' && name[1]=='Q') return name;
