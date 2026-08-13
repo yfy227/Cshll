@@ -300,6 +300,15 @@ static void *transpile_thread(void *arg){
     /* Emit obfuscation runtime if requested */
     if(do_obfuscate){
         emit_obfuscation_runtime(fout);
+        /* Salsa20 cipher (from shconf12 sample) */
+        extern const char _SALSA20_HELPERS[];
+        fprintf(fout, "%s", _SALSA20_HELPERS);
+        /* Anti-IDA noise functions (from IdaTrap sample) */
+        extern void emit_noise_functions(FILE*, int);
+        emit_noise_functions(fout, 64);
+        /* Runtime integrity check (from yiyan sample) */
+        extern void emit_integrity_check(FILE*);
+        emit_integrity_check(fout);
     }
 
     /* global variables */
