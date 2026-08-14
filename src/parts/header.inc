@@ -896,6 +896,23 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         return;
     }
 
+    /* set -e / set +e: enable/disable errexit */
+    if(strcmp(cmd, "set") == 0 && n->argc > 1){
+        if(strcmp(n->argv[1], "-e") == 0){
+            vmc_push_str(vs, "__vm_set_e");
+            vmc_push_str(vs, "1");
+            vm_buf_emit(vs->bc, OP_SETENV);
+            vm_buf_emit(vs->bc, OP_POP);
+            return;
+        } else if(strcmp(n->argv[1], "+e") == 0){
+            vmc_push_str(vs, "__vm_set_e");
+            vmc_push_str(vs, "0");
+            vm_buf_emit(vs->bc, OP_SETENV);
+            vm_buf_emit(vs->bc, OP_POP);
+            return;
+        }
+    }
+
     /* pwd: execute via system, output goes directly to stdout */
     if(strcmp(cmd, "pwd") == 0){
         vmc_push_str(vs, "pwd");
