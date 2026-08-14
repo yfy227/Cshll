@@ -65,7 +65,7 @@ typedef enum {
     OP_MOD       = 0x14,
     OP_INC       = 0x15,  /* increment top (integer) */
     OP_DEC       = 0x16,  /* decrement top (integer) */
-    OP_NEG       = 0x17,  /* negate top (arithmetic) */
+    OP_POW         = 0x18,  /* power: pop exp, pop base, push base^exp */
 
     /* 0x20-0x2F: Comparison and logic */
     OP_EQ        = 0x20,
@@ -155,6 +155,7 @@ typedef enum {
     OP_COALESCE    = 0xFB,  /* pop b, pop a: push a if non-empty, else push b */
     OP_STRIP_PREFIX= 0xFC,  /* pop pat, pop str: strip prefix matching pat */
     OP_STRIP_SUFFIX= 0xFD,  /* pop pat, pop str: strip suffix matching pat */
+    OP_ALL_ARGS    = 0xFE,  /* push all positional params (space-joined) */
 
     OP_INVALID   = 0xFF
 } VmOpcode;

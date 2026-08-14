@@ -216,7 +216,7 @@ static void arith_primary(ArithCtx *a){
     }
 }
 
-/* mul: unary (('*'|'/'|'%') unary)* */
+/* mul: unary (('*'|'/'|'%'|'**') unary)* */
 static void arith_mul(ArithCtx *a){
     arith_primary(a);
     for(;;){
@@ -224,11 +224,20 @@ static void arith_mul(ArithCtx *a){
         char op = *a->p;
         if(op != '*' && op != '/' && op != '%') break;
         a->p++;
-        arith_primary(a);
-        switch(op){
-            case '*': vm_buf_emit(a->vs->bc, OP_MUL); break;
-            case '/': vm_buf_emit(a->vs->bc, OP_DIV); break;
-            case '%': vm_buf_emit(a->vs->bc, OP_MOD); break;
+        /* Check for ** (power) */
+        if(op == '*' && *a->p == '*'){
+            a->p++; /* skip second * */
+            arith_primary(a);
+            /* Compute power: result = base^exp using loop */
+            /* For simplicity, use OP_POW opcode */
+            vm_buf_emit(a->vs->bc, OP_POW);
+        } else {
+            arith_primary(a);
+            switch(op){
+                case '*': vm_buf_emit(a->vs->bc, OP_MUL); break;
+                case '/': vm_buf_emit(a->vs->bc, OP_DIV); break;
+                case '%': vm_buf_emit(a->vs->bc, OP_MOD); break;
+            }
         }
     }
 }
@@ -420,6 +429,26 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vm_buf_emit(vs->bc, OP_GETENV);
                         vmc_push_str(vs, def);
                         vm_buf_emit(vs->bc, OP_COALESCE);
+                    }
+                    /* ${var:=default} — assign default if var empty, push result */
+                    else if(*p == ':' && p[1] == '='){
+                        p += 2; /* skip := */
+                        char def[256]; int di = 0;
+                        while(*p && *p != '}' && di < (int)sizeof(def) - 1)
+                            def[di++] = *p++;
+                        def[di] = 0;
+                        if(*p == '}') p++;
+                        /* getenv(var) coalesce def → result; setenv(var, result); push result */
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_str(vs, def);
+                        vm_buf_emit(vs->bc, OP_COALESCE);
+                        /* dup result, setenv(var, result), leave result on stack */
+                        vm_buf_emit(vs->bc, OP_DUP);
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_SWAP);
+                        vm_buf_emit(vs->bc, OP_SETENV);
+                        /* SETENV pops name+val, DUP'd result remains on stack */
                     }
                     /* ${var^^} — uppercase */
                     else if(*p == '^' && p[1] == '^'){
@@ -613,23 +642,7 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
             /* $@ — all positional params (space-joined) */
             else if(*p == '@'){
                 p++;
-                /* Build "1" "2" ... "9" joined by space using STRCAT chain */
-                int first = 1;
-                for(int pi = 1; pi <= 9; pi++){
-                    char pn[4]; snprintf(pn,sizeof(pn),"%d",pi);
-                    vmc_push_str(vs, pn);
-                    vm_buf_emit(vs->bc, OP_GETENV);
-                    if(!first){
-                        /* stack: ... prev_str new_val → need prev_str " " new_val */
-                        /* Swap, push space, strcat, swap, strcat */
-                        vm_buf_emit(vs->bc, OP_SWAP);
-                        vmc_push_str(vs, " ");
-                        vm_buf_emit(vs->bc, OP_STRCAT); /* prev + " " */
-                        vm_buf_emit(vs->bc, OP_SWAP);
-                        vm_buf_emit(vs->bc, OP_STRCAT); /* (prev+" ") + new */
-                    }
-                    first = 0;
-                }
+                vm_buf_emit(vs->bc, OP_ALL_ARGS);
                 if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                 segment_count++;
             }
@@ -1007,7 +1020,7 @@ static void vmc_compile_while(VmCompilerState *vs, Node *n){
         vmc_push_int(vs, 1);
     }
 
-    int jz_end = vm_buf_emit_jump(vs->bc, OP_JZ);
+    int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
 
     vs->loop_depth++;
     if(n->while_body) vmc_compile_block(vs, n->while_body);
