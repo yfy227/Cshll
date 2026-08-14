@@ -1168,8 +1168,9 @@ static void vmc_compile_func(VmCompilerState *vs, Node *n){
 /* Compile a case statement (NODE_CASE) */
 static void vmc_compile_case(VmCompilerState *vs, Node *n){
     /* Evaluate the case variable and push its value */
-    if(n->case_var){
-        vmc_compile_word(vs, n->case_var);
+    if(n->case_var_raw){
+        /* Use raw (pre-translation) case var for VM */
+        vmc_compile_word(vs, n->case_var_raw);
     } else {
         vmc_push_str(vs, "");
     }
@@ -1192,18 +1193,12 @@ static void vmc_compile_case(VmCompilerState *vs, Node *n){
         const char *pat = n->case_pats[i];
         vmc_compile_word(vs, pat);
 
-        /* String compare: 0 = match (true in shell) */
+        /* String compare: 0 = match */
         vm_buf_emit(vs->bc, OP_STRCMP);
-        /* 0 = match, so JZ (zero = match = true) */
-        int jz_match = vm_buf_emit_jump(vs->bc, OP_JZ);
+        /* If non-zero (no match), skip to next pattern */
+        int jnz_skip = vm_buf_emit_jump(vs->bc, OP_JNZ);
 
-        /* No match: pop the duplicate, continue to next pattern */
-        vm_buf_emit(vs->bc, OP_POP);
-
-        /* Match: jump to body */
-        vm_buf_patch(vs->bc, jz_match, vm_buf_pc(vs->bc));
-
-        /* Pop the original value (we consumed the DUP) */
+        /* Match: pop the duplicate value */
         vm_buf_emit(vs->bc, OP_POP);
 
         /* Compile the body */
@@ -1211,6 +1206,9 @@ static void vmc_compile_case(VmCompilerState *vs, Node *n){
 
         /* Jump to end of case */
         jmp_to_ends[n_ends++] = vm_buf_emit_jump(vs->bc, OP_JMP);
+
+        /* Patch: no-match jumps here (next pattern) */
+        vm_buf_patch(vs->bc, jnz_skip, vm_buf_pc(vs->bc));
     }
 
     /* Default case */

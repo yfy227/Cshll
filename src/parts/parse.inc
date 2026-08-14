@@ -571,6 +571,7 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
         if(!strcmp(kw,"case")){
             Node *nd=new_node(NODE_CASE,lineno);
             nd->case_var=(ntoks>1)?xstrdup(translate_expr(toks[1])):xstrdup("\"\"");
+            nd->case_var_raw=(ntoks>1)?xstrdup(toks[1]):xstrdup("\"\"");
             /* BUG-34 fix: if case_var is an int variable, convert to string */
             if(ntoks>1 && toks[1][0]=='$'){
                 const char *vname=toks[1]+1;

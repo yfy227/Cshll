@@ -62,6 +62,7 @@ typedef struct NodeExt {
     char *heredoc_text;
     /* case */
     char *case_var;
+    char *case_var_raw; /* pre-translation, for VM */
     char *case_pats[128]; struct NodeExt *case_bodies[128]; int case_count;
     struct NodeExt *case_default;
     /* trap */
