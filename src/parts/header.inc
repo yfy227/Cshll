@@ -966,7 +966,6 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
     /* Evaluate condition — for now, use a simplified approach:
      * push a 1 (true) or 0 (false) based on a command execution result */
     if(n->cond){
-        /* Execute condition as a command, result is on stack */
         vmc_push_str(vs, n->cond);
         vm_buf_emit(vs->bc, OP_EXEC_CMD);
         /* Convert to int (0 = false, non-zero = true) */
@@ -1359,14 +1358,14 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
             }
             break;
         case NODE_AND:
-            /* Short-circuit AND — JZ pops condition */
+            /* Short-circuit AND — shell: 0=true, so JNZ (non-zero=false) skips right */
             if(n->left) vmc_compile_node(vs, n->left);
-            int jz_and = vm_buf_emit_jump(vs->bc, OP_JZ);
+            int jz_and = vm_buf_emit_jump(vs->bc, OP_JNZ);
             if(n->right) vmc_compile_node(vs, n->right);
             vm_buf_patch(vs->bc, jz_and, vm_buf_pc(vs->bc));
             break;
         case NODE_OR:
-            /* Short-circuit OR — JNZ pops condition */
+            /* Short-circuit OR — shell: 0=true, so JZ (zero=true) skips right */
             if(n->left) vmc_compile_node(vs, n->left);
             int jnz_or = vm_buf_emit_jump(vs->bc, OP_JZ);
             if(n->right) vmc_compile_node(vs, n->right);
