@@ -440,8 +440,9 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         char argname[8];
                         snprintf(argname, sizeof(argname), "%d", argi);
                         vmc_push_str(vs, argname);
-                        vmc_push_str(vs, argbuf);
+                        vmc_compile_word(vs, argbuf); /* expand $var, $(()) */
                         vm_buf_emit(vs->bc, OP_SETENV);
+                        vm_buf_emit(vs->bc, OP_POP);
                         argi++;
                     }
                     /* Compile function body inline */
@@ -464,6 +465,39 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 vn[vi] = 0;
                 vmc_push_str(vs, vn);
                 vm_buf_emit(vs->bc, OP_GETENV);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $# — number of positional params */
+            else if(*p == '#'){
+                p++;
+                /* Count how many "1".."9" env vars are set */
+                vmc_push_str(vs, "__sh_argc");
+                vm_buf_emit(vs->bc, OP_GETENV);
+                vm_buf_emit(vs->bc, OP_TO_STR);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $@ — all positional params (space-joined) */
+            else if(*p == '@'){
+                p++;
+                /* Build "1" "2" ... "9" joined by space using STRCAT chain */
+                int first = 1;
+                for(int pi = 1; pi <= 9; pi++){
+                    char pn[4]; snprintf(pn,sizeof(pn),"%d",pi);
+                    vmc_push_str(vs, pn);
+                    vm_buf_emit(vs->bc, OP_GETENV);
+                    if(!first){
+                        /* stack: ... prev_str new_val → need prev_str " " new_val */
+                        /* Swap, push space, strcat, swap, strcat */
+                        vm_buf_emit(vs->bc, OP_SWAP);
+                        vmc_push_str(vs, " ");
+                        vm_buf_emit(vs->bc, OP_STRCAT); /* prev + " " */
+                        vm_buf_emit(vs->bc, OP_SWAP);
+                        vm_buf_emit(vs->bc, OP_STRCAT); /* (prev+" ") + new */
+                    }
+                    first = 0;
+                }
                 if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                 segment_count++;
             }
@@ -599,14 +633,20 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     int fi = vm_find_func(cmd);
     if(fi >= 0 && vm_func_bodies[fi]){
         /* Set positional parameters $1, $2, ... via setenv */
+        int nargs = n->argc - 1;
         for(int i = 1; i < n->argc; i++){
-            /* SETENV pops: val(top), name(below). Push name first, then value. */
             char pname[4]; snprintf(pname, sizeof(pname), "%d", i);
             vmc_push_str(vs, pname);
-            vmc_compile_word(vs, n->argv[i]); /* pushes expanded value */
+            vmc_compile_word(vs, n->argv[i]);
             vm_buf_emit(vs->bc, OP_SETENV);
-            vm_buf_emit(vs->bc, OP_POP); /* discard setenv return */
+            vm_buf_emit(vs->bc, OP_POP);
         }
+        /* Set $# = number of args */
+        vmc_push_str(vs, "__sh_argc");
+        vmc_push_int(vs, nargs);
+        vm_buf_emit(vs->bc, OP_TO_STR);
+        vm_buf_emit(vs->bc, OP_SETENV);
+        vm_buf_emit(vs->bc, OP_POP);
         /* Compile function body inline */
         vmc_compile_block(vs, vm_func_bodies[fi]);
         return;
@@ -1173,15 +1213,16 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
             break;
         case NODE_LOCAL:
         case NODE_EXPORT:
-            /* Treat as assignment */
+            /* Treat as assignment: VAR=value */
             if(n->argv){
                 for(int i = 0; i < n->argc; i++){
                     char *eq = strchr(n->argv[i], '=');
                     if(eq){
                         *eq = 0;
                         vmc_push_str(vs, n->argv[i]);
-                        vmc_push_str(vs, eq + 1);
+                        vmc_compile_word(vs, eq + 1); /* expand $var */
                         vm_buf_emit(vs->bc, OP_SETENV);
+                        vm_buf_emit(vs->bc, OP_POP);
                         *eq = '=';
                     }
                 }
