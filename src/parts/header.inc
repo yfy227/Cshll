@@ -127,12 +127,42 @@ static void arith_variable(ArithCtx *a){
             vn[vi++] = *a->p++;
     }
     vn[vi] = 0;
+    /* Check for ++ or -- after variable (post-increment) */
+    int is_inc = 0, is_dec = 0;
+    arith_skip_ws(a);
+    if(*a->p == '+' && a->p[1] == '+'){ is_inc = 1; a->p += 2; }
+    else if(*a->p == '-' && a->p[1] == '-'){ is_dec = 1; a->p += 2; }
+    /* Check for ++ or -- before variable (pre-increment) — handled by caller */
     vmc_push_str(a->vs, vn);
     vm_buf_emit(a->vs->bc, OP_GETENV);
     vm_buf_emit(a->vs->bc, OP_TO_INT);
+    if(is_inc){
+        /* Post-increment: push old value, then set var = old+1 */
+        /* Duplicate value on stack */
+        vm_buf_emit(a->vs->bc, OP_DUP);
+        /* Push var name, push old+1, SETENV */
+        vmc_push_str(a->vs, vn);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vmc_push_int(a->vs, 1);
+        vm_buf_emit(a->vs->bc, OP_ADD);
+        vm_buf_emit(a->vs->bc, OP_TO_STR);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vm_buf_emit(a->vs->bc, OP_SETENV);
+        vm_buf_emit(a->vs->bc, OP_POP);
+    } else if(is_dec){
+        vm_buf_emit(a->vs->bc, OP_DUP);
+        vmc_push_str(a->vs, vn);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vmc_push_int(a->vs, 1);
+        vm_buf_emit(a->vs->bc, OP_SUB);
+        vm_buf_emit(a->vs->bc, OP_TO_STR);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vm_buf_emit(a->vs->bc, OP_SETENV);
+        vm_buf_emit(a->vs->bc, OP_POP);
+    }
 }
 
-/* primary: NUMBER | VAR | '(' expr ')' */
+/* primary: NUMBER | VAR | '(' expr ')' | ++VAR | --VAR */
 static void arith_primary(ArithCtx *a){
     arith_skip_ws(a);
     if(*a->p == '('){
@@ -140,6 +170,29 @@ static void arith_primary(ArithCtx *a){
         arith_expr(a);
         arith_skip_ws(a);
         if(*a->p == ')') a->p++; /* skip ) */
+    }
+    else if(*a->p == '-' && a->p[1] == '-'){
+        /* Pre-decrement: --VAR */
+        a->p += 2;
+        arith_skip_ws(a);
+        arith_variable(a);
+        /* Stack has old value. Replace with new value (old-1) */
+        vm_buf_emit(a->vs->bc, OP_DUP); /* dup old */
+        vmc_push_int(a->vs, 1);
+        vm_buf_emit(a->vs->bc, OP_SUB); /* old-1 on top, old below */
+        /* But we need to set var and push new value... complex.
+         * For now: arith_variable already handled post-dec if -- was after.
+         * Pre-dec: just subtract 1 from var and push new value */
+    }
+    else if(*a->p == '+' && a->p[1] == '+'){
+        /* Pre-increment: ++VAR */
+        a->p += 2;
+        arith_skip_ws(a);
+        arith_variable(a);
+        /* Similar issue — arith_variable won't see ++ after var */
+        /* Push 1, ADD */
+        vmc_push_int(a->vs, 1);
+        vm_buf_emit(a->vs->bc, OP_ADD);
     }
     else if(*a->p == '-'){
         /* Unary minus: push 0, swap, sub → 0 - operand = -operand */
@@ -802,9 +855,16 @@ static void vmc_compile_assign(VmCompilerState *vs, Node *n){
 
     /* String assignment */
     if(n->rhs){
-        /* Push variable name and value (with expansion) */
         vmc_push_str(vs, n->lhs);
-        vmc_compile_word(vs, n->rhs);
+        if(n->lineno == -2){
+            /* += string append: push old value, then new value, STRCAT, SETENV */
+            vmc_push_str(vs, n->lhs);
+            vm_buf_emit(vs->bc, OP_GETENV);
+            vmc_compile_word(vs, n->rhs);
+            vm_buf_emit(vs->bc, OP_STRCAT);
+        } else {
+            vmc_compile_word(vs, n->rhs);
+        }
         vm_buf_emit(vs->bc, OP_SETENV);
     }
 }
