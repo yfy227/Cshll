@@ -598,6 +598,15 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     /* Check if this is a user-defined function call */
     int fi = vm_find_func(cmd);
     if(fi >= 0 && vm_func_bodies[fi]){
+        /* Set positional parameters $1, $2, ... via setenv */
+        for(int i = 1; i < n->argc; i++){
+            /* SETENV pops: val(top), name(below). Push name first, then value. */
+            char pname[4]; snprintf(pname, sizeof(pname), "%d", i);
+            vmc_push_str(vs, pname);
+            vmc_compile_word(vs, n->argv[i]); /* pushes expanded value */
+            vm_buf_emit(vs->bc, OP_SETENV);
+            vm_buf_emit(vs->bc, OP_POP); /* discard setenv return */
+        }
         /* Compile function body inline */
         vmc_compile_block(vs, vm_func_bodies[fi]);
         return;
@@ -759,8 +768,12 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
     }
 
     /* In shell, exit code 0 = true. In VM, 0 = false.
-     * So we use JNZ to jump to else when the condition is false (non-zero). */
-    int jz_to_else = vm_buf_emit_jump(vs->bc, OP_JZ);
+     * Shell 0=true → VM needs 1 for true. So invert: push 1 if rc==0. */
+    /* We use JNZ: jump if non-zero. Shell true(rc=0) → don't jump → execute then.
+     * Shell false(rc!=0) → jump to else.
+     * But VM JZ jumps when zero. We want: jump when rc!=0 (false).
+     * So use JNZ to jump to else when rc is non-zero (shell false). */
+    int jz_to_else = vm_buf_emit_jump(vs->bc, OP_JNZ);
 
     /* Then block */
     if(n->then_blk) vmc_compile_block(vs, n->then_blk);
