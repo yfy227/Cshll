@@ -277,6 +277,17 @@ static void arith_add(ArithCtx *a){
     }
 }
 
+/* shift: add (('<<'|'>>') add)* */
+static void arith_shift(ArithCtx *a){
+    arith_add(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '<' && a->p[1] == '<'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHL); }
+        else if(*a->p == '>' && a->p[1] == '>'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHR); }
+        else break;
+    }
+}
+
 /* compare: shift (('<'|'>'|'<='|'>='|'=='|'!=') shift)* */
 static void arith_compare(ArithCtx *a){
     arith_shift(a);
@@ -292,17 +303,6 @@ static void arith_compare(ArithCtx *a){
     }
 }
 
-/* shift: add (('<<'|'>>') add)* */
-static void arith_shift(ArithCtx *a){
-    arith_add(a);
-    for(;;){
-        arith_skip_ws(a);
-        if(*a->p == '<' && a->p[1] == '<'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHL); }
-        else if(*a->p == '>' && a->p[1] == '>'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHR); }
-        else break;
-    }
-}
-
 /* bitand: compare ('&' compare)* (single &, not &&) */
 static void arith_bitand(ArithCtx *a){
     arith_compare(a);
@@ -311,7 +311,7 @@ static void arith_bitand(ArithCtx *a){
         if(*a->p == '&' && a->p[1] != '&'){
             a->p++;
             arith_compare(a);
-            vm_buf_emit(a->vs->bc, OP_AND);
+            vm_buf_emit(a->vs->bc, OP_BITAND);
         } else break;
     }
 }
@@ -324,7 +324,7 @@ static void arith_bitor(ArithCtx *a){
         if(*a->p == '|' && a->p[1] != '|'){
             a->p++;
             arith_bitand(a);
-            vm_buf_emit(a->vs->bc, OP_OR);
+            vm_buf_emit(a->vs->bc, OP_BITOR);
         } else break;
     }
 }

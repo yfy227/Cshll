@@ -68,6 +68,8 @@ typedef enum {
     OP_POW         = 0x18,  /* power: pop exp, pop base, push base^exp */
     OP_SHL         = 0x19,  /* shift left: pop b, pop a, push a<<b */
     OP_SHR         = 0x1A,  /* shift right: pop b, pop a, push a>>b */
+    OP_BITAND      = 0x1B,  /* bitwise and: pop b, pop a, push a&b */
+    OP_BITOR       = 0x1C,  /* bitwise or: pop b, pop a, push a|b */
 
     /* 0x20-0x2F: Comparison and logic */
     OP_EQ        = 0x20,
