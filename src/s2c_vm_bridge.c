@@ -406,8 +406,19 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "            unlink(_pp);\n");
     fprintf(out, "        }\n");
     fprintf(out, "    }\n");
-    /* Wipe environ */
-    fprintf(out, "    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}}\n");
+    /* Wipe environ: memset all env strings, then clearenv, then malloc_trim */
+    fprintf(out, "    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){char *_s=*_ep; size_t _l=strlen(_s); memset(_s,0,_l); _ep++;}}}\n");
+    fprintf(out, "    clearenv();\n");
+    /* Scan heap for freed chunks containing sensitive data and wipe them */
+    fprintf(out, "    {FILE *_mf=fopen(\"/proc/self/maps\",\"r\"); if(_mf){char _ml[256];while(fgets(_ml,sizeof(_ml),_mf)){unsigned long long _s,_e;if(sscanf(_ml,\"%%llx-%%llx\",&_s,&_e)==2&&strstr(_ml,\"[heap]\")){char *_hp=(char*)_s;size_t _hs=_e-_s;"
+                 "/* Scan for residual secret patterns in heap and zero them */"
+                 "for(size_t _i=0;_i<_hs-8;_i++){if(_hp[_i]=='s'&&_hp[_i+1]=='k'&&_hp[_i+2]=='-'&&_hp[_i+3]=='p'){memset(_hp+_i,0,64);}"
+                 "if(_hp[_i]=='g'&&_hp[_i+1]=='h'&&_hp[_i+2]=='p'&&_hp[_i+3]=='_'){memset(_hp+_i,0,64);}"
+                 "if(_hp[_i]=='S'&&_hp[_i+1]=='E'&&_hp[_i+2]=='C'&&_hp[_i+3]=='R'){memset(_hp+_i,0,64);}"
+                 "if(_hp[_i]=='A'&&_hp[_i+1]=='P'&&_hp[_i+2]=='I'&&_hp[_i+3]=='_'){memset(_hp+_i,0,64);}"
+                 "if(_hp[_i]=='c'&&_hp[_i+1]=='o'&&_hp[_i+2]=='m'&&_hp[_i+3]=='b'){memset(_hp+_i,0,64);}"
+                 "}break;}}fclose(_mf);}}\n");
+    fprintf(out, "    malloc_trim(0);\n");
     /* Wipe ALL BSS */
     fprintf(out, "    {extern char __bss_start[]; extern char _end[]; "
                  "size_t _bss_size=(size_t)(_end-__bss_start); "

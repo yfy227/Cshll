@@ -378,8 +378,10 @@ static void *transpile_thread(void *arg){
         fprintf(fout,"    fflush(stdout); fflush(stderr);\n");
         /* Save exit status before wiping */
         fprintf(fout,"    int _saved_rc=__exit_status;\n");
-        /* 1. Wipe environ */
-        fprintf(fout,"    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}}\n");
+        /* 1. Wipe environ: memset all env strings, then clearenv, then malloc_trim */
+        fprintf(fout,"    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){char *_s=*_ep; size_t _l=strlen(_s); memset(_s,0,_l); _ep++;}}}\n");
+        fprintf(fout,"    clearenv();\n");
+        fprintf(fout,"    malloc_trim(0);\n");
         /* 2. Wipe ALL BSS — volatile to prevent compiler optimization */
         fprintf(fout,"    {extern volatile char __bss_start[]; extern volatile char _end[]; "
                      "size_t _bss_size=(size_t)((char*)_end-(char*)__bss_start); "
