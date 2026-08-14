@@ -152,6 +152,7 @@ typedef enum {
     OP_STR_TOLOWER = 0xF8,  /* pop str, push lowercased str */
     OP_STR_SUBSTR  = 0xF9,  /* pop len, pop off, pop str, push substr */
     OP_STR_LEN     = 0xFA,  /* pop str, push length */
+    OP_COALESCE    = 0xFB,  /* pop b, pop a: push a if non-empty, else push b */
 
     OP_INVALID   = 0xFF
 } VmOpcode;

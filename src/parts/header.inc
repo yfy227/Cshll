@@ -348,15 +348,31 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                     segment_count++;
                 }
-                /* ${var} */
+                /* ${var:-default} or ${var} — read var name first */
                 else {
                     char vn[128]; int vi = 0;
-                    while(*p && *p != '}' && vi < (int)sizeof(vn) - 1)
+                    while(*p && *p != ':' && *p != '}' && vi < (int)sizeof(vn) - 1)
                         vn[vi++] = *p++;
                     vn[vi] = 0;
-                    if(*p == '}') p++;
-                    vmc_push_str(vs, vn);
-                    vm_buf_emit(vs->bc, OP_GETENV);
+                    /* Check for :- (default value) */
+                    if(*p == ':' && p[1] == '-'){
+                        p += 2; /* skip :- */
+                        char def[256]; int di = 0;
+                        while(*p && *p != '}' && di < (int)sizeof(def) - 1)
+                            def[di++] = *p++;
+                        def[di] = 0;
+                        if(*p == '}') p++;
+                        /* Push var value, push default, COALESCE picks non-empty */
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_str(vs, def);
+                        vm_buf_emit(vs->bc, OP_COALESCE);
+                    } else {
+                        /* Plain ${var} */
+                        if(*p == '}') p++;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                    }
                     if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                     segment_count++;
                 }
