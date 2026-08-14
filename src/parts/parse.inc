@@ -466,6 +466,9 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 nd->for_init=translate_arith(init_str);
                 nd->for_cond=translate_arith(cond_str);
                 nd->for_update=translate_arith(upd_str);
+                nd->for_init_raw=xstrdup(init_str);
+                nd->for_cond_raw=xstrdup(cond_str);
+                nd->for_update_raw=xstrdup(upd_str);
                 Node **_pi=parse_insert;
                 parser_append(nd);
                 BlkFrame fr={BLK_FOR,nd,&nd->body,_pi};

@@ -49,6 +49,7 @@ typedef struct NodeExt {
     char *for_var; char **for_list; int for_len; struct NodeExt *body;
     int for_c_style;
     char *for_init, *for_cond, *for_update;
+    char *for_init_raw, *for_cond_raw, *for_update_raw; /* pre-translation, for VM */
     /* while */
     char *while_cond; int while_negate; struct NodeExt *while_body;
     /* func */

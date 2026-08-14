@@ -146,6 +146,12 @@ typedef enum {
     OP_NATIVE_CALL= 0xF2,  /* call native function pointer */
     OP_TRACE_START= 0xF3,  /* start tracing for JIT */
     OP_TRACE_STOP = 0xF4,  /* stop tracing */
+    OP_EVAL_ARITH  = 0xF5,  /* evaluate arithmetic expression string → int */
+    OP_EXEC_PRINTF = 0xF6,  /* pop fmt, pop args, printf to stdout */
+    OP_STR_TOUPPER = 0xF7,  /* pop str, push uppercased str */
+    OP_STR_TOLOWER = 0xF8,  /* pop str, push lowercased str */
+    OP_STR_SUBSTR  = 0xF9,  /* pop len, pop off, pop str, push substr */
+    OP_STR_LEN     = 0xFA,  /* pop str, push length */
 
     OP_INVALID   = 0xFF
 } VmOpcode;

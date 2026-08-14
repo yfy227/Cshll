@@ -760,7 +760,7 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
 
     /* In shell, exit code 0 = true. In VM, 0 = false.
      * So we use JNZ to jump to else when the condition is false (non-zero). */
-    int jz_to_else = vm_buf_emit_jump(vs->bc, OP_JNZ);
+    int jz_to_else = vm_buf_emit_jump(vs->bc, OP_JZ);
 
     /* Then block */
     if(n->then_blk) vmc_compile_block(vs, n->then_blk);
@@ -780,7 +780,7 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
         } else {
             vmc_push_int(vs, 1);
         }
-        int jz_skip = vm_buf_emit_jump(vs->bc, OP_JNZ);
+        int jz_skip = vm_buf_emit_jump(vs->bc, OP_JZ);
         if(n->elif_blks[i]) vmc_compile_block(vs, n->elif_blks[i]);
         int jmp_end2 = vm_buf_emit_jump(vs->bc, OP_JMP);
         vm_buf_patch(vs->bc, jz_skip, vm_buf_pc(vs->bc));
@@ -815,7 +815,7 @@ static void vmc_compile_while(VmCompilerState *vs, Node *n){
         vmc_push_int(vs, 1);
     }
 
-    int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
+    int jz_end = vm_buf_emit_jump(vs->bc, OP_JZ);
 
     vs->loop_depth++;
     if(n->while_body) vmc_compile_block(vs, n->while_body);
@@ -876,10 +876,10 @@ static void vmc_compile_for(VmCompilerState *vs, Node *n){
         vs->cont_count = saved_cont;
     }
     /* C-style for: for ((init; cond; update)); do ... done */
-    else if(n->for_c_style && n->for_init){
-        /* Execute init */
-        vmc_push_str(vs, n->for_init);
-        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+    else if(n->for_c_style && n->for_init_raw){
+        /* Execute init as arithmetic assignment (use raw shell expr, not translated) */
+        vmc_push_str(vs, n->for_init_raw);
+        vm_buf_emit(vs->bc, OP_EVAL_ARITH);
         vm_buf_emit(vs->bc, OP_POP);
 
         int loop_start = vm_buf_pc(vs->bc);
@@ -887,20 +887,20 @@ static void vmc_compile_for(VmCompilerState *vs, Node *n){
         int saved_break_count = vs->break_count;
         vs->break_count = 0;
 
-        /* Evaluate condition */
-        vmc_push_str(vs, n->for_cond);
-        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        /* Evaluate condition as arithmetic */
+        vmc_push_str(vs, n->for_cond_raw);
+        vm_buf_emit(vs->bc, OP_EVAL_ARITH);
         vm_buf_emit(vs->bc, OP_TO_INT);
-        int jz_end = vm_buf_emit_jump(vs->bc, OP_JNZ);
+        int jz_end = vm_buf_emit_jump(vs->bc, OP_JZ);
 
         /* Body */
         vs->loop_depth++;
         if(n->body) vmc_compile_block(vs, n->body);
         vs->loop_depth--;
 
-        /* Execute update */
-        vmc_push_str(vs, n->for_update);
-        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        /* Execute update as arithmetic */
+        vmc_push_str(vs, n->for_update_raw);
+        vm_buf_emit(vs->bc, OP_EVAL_ARITH);
         vm_buf_emit(vs->bc, OP_POP);
 
         /* Jump back to condition */
@@ -1149,7 +1149,7 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
         case NODE_OR:
             /* Short-circuit OR — JNZ pops condition */
             if(n->left) vmc_compile_node(vs, n->left);
-            int jnz_or = vm_buf_emit_jump(vs->bc, OP_JNZ);
+            int jnz_or = vm_buf_emit_jump(vs->bc, OP_JZ);
             if(n->right) vmc_compile_node(vs, n->right);
             vm_buf_patch(vs->bc, jnz_or, vm_buf_pc(vs->bc));
             break;
