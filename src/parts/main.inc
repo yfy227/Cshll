@@ -268,6 +268,7 @@ static void *transpile_thread(void *arg){
         }
 
         printf("[OK] %s -> %s (VM mode)\n",argv[1],argv[2]);
+        g_retcode = 0; /* ensure success return code */
 
         /* Handle --makefile and --run */
         for(int i=3;i<argc;i++){

@@ -1184,7 +1184,29 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
             }
             break;
         default:
-            /* Other node types: skip for now */
+            /* Unsupported node — convert to shell command string and exec */
+            {
+                /* Build a shell representation of the node */
+                char cmd[4096] = "";
+                if(n->type == NODE_ARITH && n->rhs){
+                    /* ((expr)) — evaluate as arithmetic */
+                    snprintf(cmd, sizeof(cmd), ": $((%s))", n->rhs);
+                } else if(n->type == NODE_HEREDOC && n->argv){
+                    /* heredoc — skip for now */
+                } else if(n->type == NODE_SOURCE && n->argv){
+                    snprintf(cmd, sizeof(cmd), "source %s", n->argv[0]);
+                } else if(n->type == NODE_EVAL && n->argv){
+                    snprintf(cmd, sizeof(cmd), "eval %s", n->argv[0]);
+                } else if(n->type == NODE_TRAP){
+                    /* trap — skip */
+                } else if(n->type == NODE_NOT && n->left){
+                    /* ! command — skip for now */
+                }
+                if(cmd[0]){
+                    vmc_push_str(vs, cmd);
+                    vm_buf_emit(vs->bc, OP_EXEC_CMD);
+                }
+            }
             break;
     }
 }
