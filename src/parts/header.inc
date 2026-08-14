@@ -132,33 +132,35 @@ static void arith_variable(ArithCtx *a){
     arith_skip_ws(a);
     if(*a->p == '+' && a->p[1] == '+'){ is_inc = 1; a->p += 2; }
     else if(*a->p == '-' && a->p[1] == '-'){ is_dec = 1; a->p += 2; }
-    /* Check for ++ or -- before variable (pre-increment) — handled by caller */
+
+    /* Push current value (this is the result for post-inc/dec) */
     vmc_push_str(a->vs, vn);
     vm_buf_emit(a->vs->bc, OP_GETENV);
     vm_buf_emit(a->vs->bc, OP_TO_INT);
-    if(is_inc){
-        /* Post-increment: push old value, then set var = old+1 */
-        /* Duplicate value on stack */
-        vm_buf_emit(a->vs->bc, OP_DUP);
-        /* Push var name, push old+1, SETENV */
-        vmc_push_str(a->vs, vn);
-        vm_buf_emit(a->vs->bc, OP_SWAP);
+
+    if(is_inc || is_dec){
+        /* Post-inc/dec: old value is already on stack as result.
+         * Now compute new value and setenv.
+         * Stack: old_value
+         * We need to: push old+1, setenv(vn, old+1), but leave old on stack.
+         * Use DUP to copy old, push 1, ADD, TO_STR, push name, SWAP, SETENV */
+        vm_buf_emit(a->vs->bc, OP_DUP); /* stack: old old */
         vmc_push_int(a->vs, 1);
-        vm_buf_emit(a->vs->bc, OP_ADD);
+        if(is_inc) vm_buf_emit(a->vs->bc, OP_ADD);
+        else vm_buf_emit(a->vs->bc, OP_SUB);
+        /* stack: old new_val */
         vm_buf_emit(a->vs->bc, OP_TO_STR);
-        vm_buf_emit(a->vs->bc, OP_SWAP);
-        vm_buf_emit(a->vs->bc, OP_SETENV);
-        vm_buf_emit(a->vs->bc, OP_POP);
-    } else if(is_dec){
-        vm_buf_emit(a->vs->bc, OP_DUP);
         vmc_push_str(a->vs, vn);
-        vm_buf_emit(a->vs->bc, OP_SWAP);
-        vmc_push_int(a->vs, 1);
-        vm_buf_emit(a->vs->bc, OP_SUB);
-        vm_buf_emit(a->vs->bc, OP_TO_STR);
-        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vm_buf_emit(a->vs->bc, OP_SWAP); /* stack: old name val → old... wait */
+        /* After SWAP: stack: old val name — wrong order.
+         * SETENV pops: val(top), name(below). Need: name first, then val.
+         * Current: old new_val_str → after push name: old val name
+         * SWAP: old name val → SETENV pops val, name → correct!
+         * Wait: SWAP swaps top two. Stack: old val name → SWAP → old name val.
+         * SETENV pops val(top), name(below). But stack is old name val.
+         * SETENV pops val(top)=val, name(below)=name. Correct! old stays. */
         vm_buf_emit(a->vs->bc, OP_SETENV);
-        vm_buf_emit(a->vs->bc, OP_POP);
+        /* Stack: old_value (result) */
     }
 }
 
@@ -185,14 +187,28 @@ static void arith_primary(ArithCtx *a){
          * Pre-dec: just subtract 1 from var and push new value */
     }
     else if(*a->p == '+' && a->p[1] == '+'){
-        /* Pre-increment: ++VAR */
+        /* Pre-increment: ++VAR → compute new value, setenv, push new value */
         a->p += 2;
         arith_skip_ws(a);
-        arith_variable(a);
-        /* Similar issue — arith_variable won't see ++ after var */
-        /* Push 1, ADD */
+        /* Read variable name */
+        char vn[128]; int vi = 0;
+        if(*a->p == '$') a->p++;
+        while(*a->p && (isalnum((unsigned char)*a->p) || *a->p == '_') && vi < (int)sizeof(vn)-1)
+            vn[vi++] = *a->p++;
+        vn[vi] = 0;
+        /* Get old value, add 1, setenv, push new value */
+        vmc_push_str(a->vs, vn);
+        vm_buf_emit(a->vs->bc, OP_GETENV);
+        vm_buf_emit(a->vs->bc, OP_TO_INT);
         vmc_push_int(a->vs, 1);
         vm_buf_emit(a->vs->bc, OP_ADD);
+        /* Stack: new_val. DUP, TO_STR, push name, SWAP, SETENV */
+        vm_buf_emit(a->vs->bc, OP_DUP);
+        vm_buf_emit(a->vs->bc, OP_TO_STR);
+        vmc_push_str(a->vs, vn);
+        vm_buf_emit(a->vs->bc, OP_SWAP);
+        vm_buf_emit(a->vs->bc, OP_SETENV);
+        /* Stack: new_val (result) */
     }
     else if(*a->p == '-'){
         /* Unary minus: push 0, swap, sub → 0 - operand = -operand */
