@@ -401,10 +401,10 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                     segment_count++;
                 }
-                /* ${var:-default} or ${var} — read var name first */
+                /* ${var:-default} or ${var...} — read var name first */
                 else {
                     char vn[128]; int vi = 0;
-                    while(*p && *p != ':' && *p != '}' && vi < (int)sizeof(vn) - 1)
+                    while(*p && *p != ':' && *p != '}' && *p != '^' && *p != ',' && *p != '/' && *p != '#' && *p != '%' && vi < (int)sizeof(vn) - 1)
                         vn[vi++] = *p++;
                     vn[vi] = 0;
                     /* Check for :- (default value) */
@@ -420,8 +420,71 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vm_buf_emit(vs->bc, OP_GETENV);
                         vmc_push_str(vs, def);
                         vm_buf_emit(vs->bc, OP_COALESCE);
-                    } else {
-                        /* Plain ${var} */
+                    }
+                    /* ${var^^} — uppercase */
+                    else if(*p == '^' && p[1] == '^'){
+                        p += 2; if(*p == '}') p++;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vm_buf_emit(vs->bc, OP_STR_TOUPPER);
+                    }
+                    /* ${var,,} — lowercase */
+                    else if(*p == ',' && p[1] == ','){
+                        p += 2; if(*p == '}') p++;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vm_buf_emit(vs->bc, OP_STR_TOLOWER);
+                    }
+                    /* ${var:offset:length} — substring */
+                    else if(*p == ':'){
+                        p++; /* skip : */
+                        char off_s[32]; int oi = 0;
+                        while(*p && *p != ':' && *p != '}' && oi < 31) off_s[oi++] = *p++;
+                        off_s[oi] = 0;
+                        int offset = atoi(off_s);
+                        int length = -1;
+                        if(*p == ':'){
+                            p++; /* skip : */
+                            char len_s[32]; int li = 0;
+                            while(*p && *p != '}' && li < 31) len_s[li++] = *p++;
+                            len_s[li] = 0;
+                            length = atoi(len_s);
+                        }
+                        if(*p == '}') p++;
+                        /* Push var, then offset, then length, OP_STR_SUBSTR */
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_int(vs, offset);
+                        vmc_push_int(vs, length);
+                        vm_buf_emit(vs->bc, OP_STR_SUBSTR);
+                    }
+                    /* ${var#pattern} — strip prefix */
+                    else if(*p == '#'){
+                        p++; /* skip # */
+                        char pat[128]; int pi2 = 0;
+                        while(*p && *p != '}' && pi2 < 127) pat[pi2++] = *p++;
+                        pat[pi2] = 0;
+                        if(*p == '}') p++;
+                        /* Get var, strip prefix matching pat */
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_str(vs, pat);
+                        vm_buf_emit(vs->bc, OP_STRIP_PREFIX);
+                    }
+                    /* ${var%pattern} — strip suffix */
+                    else if(*p == '%'){
+                        p++; /* skip % */
+                        char pat[128]; int pi2 = 0;
+                        while(*p && *p != '}' && pi2 < 127) pat[pi2++] = *p++;
+                        pat[pi2] = 0;
+                        if(*p == '}') p++;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_str(vs, pat);
+                        vm_buf_emit(vs->bc, OP_STRIP_SUFFIX);
+                    }
+                    /* Plain ${var} */
+                    else {
                         if(*p == '}') p++;
                         vmc_push_str(vs, vn);
                         vm_buf_emit(vs->bc, OP_GETENV);
