@@ -180,6 +180,8 @@ static void *transpile_thread(void *arg){
         if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
         if(!strcmp(argv[i],"--vm")) do_vm=1;
     }
+    /* VM mode implies obfuscate — full protection stack */
+    if(do_vm) do_obfuscate = 1;
 
     /* Initialize name mangler */
     mangle_init(do_obfuscate);
@@ -221,7 +223,18 @@ static void *transpile_thread(void *arg){
 
         /* Emit VM runtime + compile AST to bytecode */
         extern void vmc_compile_and_emit(FILE *out, Node *script_ast, int obfuscate);
-        vmc_compile_and_emit(fout, script, do_obfuscate);
+        vmc_compile_and_emit(fout, script, 1 /* obfuscate always on for VM */);
+
+        /* Emit obfuscation protections AFTER VM runtime (needs includes) */
+        /* Salsa20 cipher (from shconf12 sample) */
+        extern const char _SALSA20_HELPERS[];
+        fprintf(fout, "%s", _SALSA20_HELPERS);
+        /* Anti-IDA noise functions (from IdaTrap sample) */
+        extern void emit_noise_functions(FILE*, int);
+        emit_noise_functions(fout, 64);
+        /* Runtime integrity check (from yiyan sample) */
+        extern void emit_integrity_check(FILE*);
+        emit_integrity_check(fout);
 
         fclose(fout);
 

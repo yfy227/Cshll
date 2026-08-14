@@ -44,6 +44,8 @@ const char *VM_RUNTIME =
 "#include <stdint.h>\n"
 "#include <time.h>\n"
 "#include <dlfcn.h>\n"
+"#include <malloc.h>\n"
+"#include <sys/mman.h>\n"
 "\n"
 "/* Anti-analysis: resolve libc functions via dlsym to hide PLT entries */\n"
 "typedef int (*_sys_fn)(const char*);\n"

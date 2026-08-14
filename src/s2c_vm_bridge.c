@@ -394,19 +394,27 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
         fprintf(out, "    if(argc > %d) _setenv(\"%d\", argv[%d], 1);\n", i, i, i);
     }
     fprintf(out, "    int rc = vm_run(0);\n");
-    /* Anti-dump: wipe decoded bytecode after execution */
-    fprintf(out, "    /* Anti-dump: wipe decoded bytecode after execution */\n");
+    /* Anti-dump: full cleanup before exit */
+    fprintf(out, "    /* Wipe VM secrets */\n");
     fprintf(out, "    memset(__vm_code_decoded, 0, sizeof(__vm_code_decoded));\n");
     fprintf(out, "    memset(__vm_const_scratch, 0, sizeof(__vm_const_scratch));\n");
     fprintf(out, "    __vm_const_used = -1;\n");
-    fprintf(out, "    /* Anti-dump: wipe JIT .so files */\n");
+    fprintf(out, "    /* Wipe JIT .so files */\n");
     fprintf(out, "    for(int _ci=0; _ci<256; _ci++){\n");
-    fprintf(out, "        if(_Qa95466bf[_ci]){\n");
+    fprintf(out, "        if(__vm_jit_done[_ci]){\n");
     fprintf(out, "            char _pp[256]; snprintf(_pp,sizeof(_pp),\"/tmp/_Qj%%d.so\",_ci);\n");
     fprintf(out, "            unlink(_pp);\n");
     fprintf(out, "        }\n");
     fprintf(out, "    }\n");
-    fprintf(out, "    return rc;\n");
+    /* Wipe environ */
+    fprintf(out, "    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){ size_t _l=strlen(*_ep); memset(*_ep,0,_l); _ep++; }}}\n");
+    /* Wipe ALL BSS */
+    fprintf(out, "    {extern char __bss_start[]; extern char _end[]; "
+                 "size_t _bss_size=(size_t)(_end-__bss_start); "
+                 "volatile char *_p=(volatile char*)__bss_start; "
+                 "while(_p<(volatile char*)_end){*_p=0; _p++;}}\n");
+    /* _exit */
+    fprintf(out, "    _exit(rc);\n");
     fprintf(out, "}\n");
 
     (void)obfuscate;
