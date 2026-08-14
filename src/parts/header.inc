@@ -683,9 +683,93 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     lit[li++] = next;
                     p += 2;
                 } else {
+                    /* Check for {a..b} brace expansion (only unquoted) */
+                    if(*p == '{' && !quote){
+                        const char *close = strchr(p, '}');
+                        if(close && close > p+3){
+                            /* Check for .. pattern: {N..M} */
+                            char inner[128];
+                            int ilen = (int)(close - p - 1);
+                            if(ilen < (int)sizeof(inner)){
+                                memcpy(inner, p+1, ilen);
+                                inner[ilen] = 0;
+                                char *dot = strstr(inner, "..");
+                                if(dot){
+                                    *dot = 0;
+                                    const char *start_str = inner;
+                                    const char *end_str = dot + 2;
+                                    /* Check if both are integers */
+                                    int is_num = 1;
+                                    for(const char *c = start_str; *c; c++) if(!isdigit((unsigned char)*c) && *c!='-') is_num = 0;
+                                    for(const char *c = end_str; *c; c++) if(!isdigit((unsigned char)*c) && *c!='-') is_num = 0;
+                                    if(is_num){
+                                        int start_v = atoi(start_str);
+                                        int end_v = atoi(end_str);
+                                        /* Flush literal first */
+                                        if(li > 0){
+                                            lit[li] = 0;
+                                            vmc_push_str(vs, lit);
+                                            if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                                            segment_count++;
+                                            li = 0;
+                                        }
+                                        /* Build expanded string "a b c ... z" */
+                                        char expanded[1024]; int ei = 0;
+                                        int step = (start_v <= end_v) ? 1 : -1;
+                                        for(int v = start_v; v != end_v + step; v += step){
+                                            if(ei > 0) expanded[ei++] = ' ';
+                                            ei += snprintf(expanded+ei, sizeof(expanded)-ei, "%d", v);
+                                        }
+                                        expanded[ei] = 0;
+                                        vmc_push_str(vs, expanded);
+                                        if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                                        segment_count++;
+                                        p = close + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
                     lit[li++] = *p++;
                 }
             } else {
+                /* Check for {a..b} brace expansion (only unquoted) */
+                if(*p == '{' && !quote){
+                    const char *close = strchr(p, '}');
+                    if(close && close > p+3){
+                        char inner[128];
+                        int ilen = (int)(close - p - 1);
+                        if(ilen < (int)sizeof(inner)){
+                            memcpy(inner, p+1, ilen);
+                            inner[ilen] = 0;
+                            char *dot = strstr(inner, "..");
+                            if(dot){
+                                *dot = 0;
+                                const char *s_str = inner, *e_str = dot + 2;
+                                int is_num = 1;
+                                for(const char *c = s_str; *c; c++) if(!isdigit((unsigned char)*c) && *c!='-') is_num = 0;
+                                for(const char *c = e_str; *c; c++) if(!isdigit((unsigned char)*c) && *c!='-') is_num = 0;
+                                if(is_num){
+                                    int sv = atoi(s_str), ev = atoi(e_str);
+                                    if(li > 0){ lit[li] = 0; vmc_push_str(vs, lit); if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT); segment_count++; li = 0; }
+                                    char exp[1024]; int ei = 0;
+                                    int step = (sv <= ev) ? 1 : -1;
+                                    for(int v = sv; v != ev + step; v += step){
+                                        if(ei > 0) exp[ei++] = ' ';
+                                        ei += snprintf(exp+ei, sizeof(exp)-ei, "%d", v);
+                                    }
+                                    exp[ei] = 0;
+                                    vmc_push_str(vs, exp);
+                                    if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                                    segment_count++;
+                                    p = close + 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
                 lit[li++] = *p++;
             }
         }
