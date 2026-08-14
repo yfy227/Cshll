@@ -66,6 +66,8 @@ typedef enum {
     OP_INC       = 0x15,  /* increment top (integer) */
     OP_DEC       = 0x16,  /* decrement top (integer) */
     OP_POW         = 0x18,  /* power: pop exp, pop base, push base^exp */
+    OP_SHL         = 0x19,  /* shift left: pop b, pop a, push a<<b */
+    OP_SHR         = 0x1A,  /* shift right: pop b, pop a, push a>>b */
 
     /* 0x20-0x2F: Comparison and logic */
     OP_EQ        = 0x20,

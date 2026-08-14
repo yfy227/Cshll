@@ -277,38 +277,73 @@ static void arith_add(ArithCtx *a){
     }
 }
 
-/* compare: add (('<'|'>'|'<='|'>='|'=='|'!=') add)* */
+/* compare: shift (('<'|'>'|'<='|'>='|'=='|'!=') shift)* */
 static void arith_compare(ArithCtx *a){
-    arith_add(a);
+    arith_shift(a);
     for(;;){
         arith_skip_ws(a);
-        if(*a->p == '<' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_LE); }
-        else if(*a->p == '>' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_GE); }
-        else if(*a->p == '=' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_EQ); }
-        else if(*a->p == '!' && a->p[1] == '='){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_NE); }
-        else if(*a->p == '<'){ a->p++; arith_add(a); vm_buf_emit(a->vs->bc, OP_LT); }
-        else if(*a->p == '>'){ a->p++; arith_add(a); vm_buf_emit(a->vs->bc, OP_GT); }
+        if(*a->p == '<' && a->p[1] == '='){ a->p+=2; arith_shift(a); vm_buf_emit(a->vs->bc, OP_LE); }
+        else if(*a->p == '>' && a->p[1] == '='){ a->p+=2; arith_shift(a); vm_buf_emit(a->vs->bc, OP_GE); }
+        else if(*a->p == '=' && a->p[1] == '='){ a->p+=2; arith_shift(a); vm_buf_emit(a->vs->bc, OP_EQ); }
+        else if(*a->p == '!' && a->p[1] == '='){ a->p+=2; arith_shift(a); vm_buf_emit(a->vs->bc, OP_NE); }
+        else if(*a->p == '<' && a->p[1] != '<'){ a->p++; arith_shift(a); vm_buf_emit(a->vs->bc, OP_LT); }
+        else if(*a->p == '>' && a->p[1] != '>'){ a->p++; arith_shift(a); vm_buf_emit(a->vs->bc, OP_GT); }
         else break;
     }
 }
 
-/* logic: compare (('&&'|'||') compare)* */
-static void arith_logic(ArithCtx *a){
+/* shift: add (('<<'|'>>') add)* */
+static void arith_shift(ArithCtx *a){
+    arith_add(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '<' && a->p[1] == '<'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHL); }
+        else if(*a->p == '>' && a->p[1] == '>'){ a->p+=2; arith_add(a); vm_buf_emit(a->vs->bc, OP_SHR); }
+        else break;
+    }
+}
+
+/* bitand: compare ('&' compare)* (single &, not &&) */
+static void arith_bitand(ArithCtx *a){
     arith_compare(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '&' && a->p[1] != '&'){
+            a->p++;
+            arith_compare(a);
+            vm_buf_emit(a->vs->bc, OP_AND);
+        } else break;
+    }
+}
+
+/* bitor: bitand ('|' bitand)* (single |, not ||) */
+static void arith_bitor(ArithCtx *a){
+    arith_bitand(a);
+    for(;;){
+        arith_skip_ws(a);
+        if(*a->p == '|' && a->p[1] != '|'){
+            a->p++;
+            arith_bitand(a);
+            vm_buf_emit(a->vs->bc, OP_OR);
+        } else break;
+    }
+}
+
+/* logic: bitor (('&&'|'||') bitor)* */
+static void arith_logic(ArithCtx *a){
+    arith_bitor(a);
     for(;;){
         arith_skip_ws(a);
         if(*a->p == '&' && a->p[1] == '&'){
             a->p += 2;
-            /* Short-circuit AND: JZ pops condition, if false skip right */
             int jz_skip = vm_buf_emit_jump(a->vs->bc, OP_JZ);
-            arith_compare(a);
+            arith_bitor(a);
             vm_buf_patch(a->vs->bc, jz_skip, vm_buf_pc(a->vs->bc));
         }
         else if(*a->p == '|' && a->p[1] == '|'){
             a->p += 2;
-            /* Short-circuit OR: JNZ pops condition, if true skip right */
             int jnz_skip = vm_buf_emit_jump(a->vs->bc, OP_JNZ);
-            arith_compare(a);
+            arith_bitor(a);
             vm_buf_patch(a->vs->bc, jnz_skip, vm_buf_pc(a->vs->bc));
         }
         else break;
