@@ -1037,6 +1037,34 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         return;
     }
 
+    /* printf: handle -v var format args */
+    if(strcmp(cmd, "printf") == 0 && n->argc >= 2){
+        /* Check for -v var */
+        if(strcmp(n->argv[1], "-v") == 0 && n->argc >= 4){
+            /* printf -v var format args... → build format string, setenv var */
+            const char *var = n->argv[2];
+            const char *fmt = n->argv[3];
+            /* Collect args after format */
+            /* Use OP_EXEC_PRINTF which pops fmt and args, pushes result string */
+            vmc_push_str(vs, var); /* name for SETENV */
+            /* Push format string (expanded) */
+            vmc_compile_word(vs, fmt);
+            /* Count args */
+            int nargs = n->argc - 4;
+            for(int i = 0; i < nargs; i++){
+                vmc_compile_word(vs, n->argv[4+i]);
+            }
+            /* Emit OP_EXEC_PRINTF with nargs */
+            vmc_push_int(vs, nargs);
+            vm_buf_emit(vs->bc, OP_EXEC_PRINTF);
+            vm_buf_emit(vs->bc, OP_SETENV);
+            vm_buf_emit(vs->bc, OP_POP);
+            return;
+        }
+        /* Regular printf: build command, exec via system */
+        /* Fall through to generic handler */
+    }
+
     /* set -e / set +e: enable/disable errexit */
     if(strcmp(cmd, "set") == 0 && n->argc > 1){
         if(strcmp(n->argv[1], "-e") == 0){
