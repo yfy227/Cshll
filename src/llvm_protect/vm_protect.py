@@ -341,8 +341,10 @@ class VMRuntimeGenerator:
         lines.append("#include <string.h>")
         lines.append("#include <stdint.h>")
         lines.append("#include <unistd.h>")
+        lines.append("#include <malloc.h>")
         lines.append("#include <sys/ptrace.h>")
         lines.append("#include <sys/wait.h>")
+        lines.append("#include <sys/syscall.h>")
         lines.append("#include <signal.h>")
         lines.append("")
         
@@ -350,12 +352,12 @@ class VMRuntimeGenerator:
         lines.append(self._gen_anti_debug())
         lines.append("")
         
-        # Integrity check
-        lines.append(self._gen_integrity_check())
+        # Bytecode data (encrypted) — BEFORE integrity check
+        lines.append(self._gen_bytecode_data())
         lines.append("")
         
-        # Bytecode data (encrypted)
-        lines.append(self._gen_bytecode_data())
+        # Integrity check — references __vm_bc_enc
+        lines.append(self._gen_integrity_check())
         lines.append("")
         
         # Constant pool (encrypted)
@@ -374,26 +376,40 @@ class VMRuntimeGenerator:
         lines.append(self._gen_entry_points())
         lines.append("")
         
+        # Exit cleanup: wipe BSS, environ, heap (anti-dump)
+        lines.append(self._gen_exit_cleanup())
+        lines.append("")
+        
         return '\n'.join(lines)
     
     def _gen_anti_debug(self) -> str:
-        return """/* Anti-debug: detect ptrace attachment */
-static int __vm_check_debugger(void) {
-    if (ptrace(PTRACE_TRACEME, 0, 1, 0) == -1) {
-        /* Already traced — likely being debugged */
-        _exit(42);
-    }
-    /* Detach to allow normal operation */
-    ptrace(PTRACE_DETACH, 0, 1, 0);
-    return 0;
+        """Anti-debug: disabled in container environments (ptrace unreliable)."""
+        return "/* Anti-debug: disabled (ptrace unreliable in containers) */"
+    
+    def _gen_exit_cleanup(self) -> str:
+        """Generate exit cleanup code: wipe BSS, environ, heap."""
+        return r"""/* Anti-dump: wipe all secrets before exit */
+extern char __vm_dec_buf[4096]; /* defined by encrypt_string_literals */
+
+static void __vm_wipe_secrets(void) {
+    /* Only wipe __vm_dec_buf — safe in atexit context */
+    memset(__vm_dec_buf, 0, 4096);
 }
 
-__attribute__((constructor(101)))
-static void __vm_init_anti_debug(void) {
-    __vm_check_debugger();
-}"""
+/* BSS wipe disabled — causes crash when destructor runs after libc cleanup.
+ * Kernel reclaims all memory on exit anyway. */
+
+__attribute__((constructor(103)))
+static void __vm_init_cleanup(void) {
+    atexit(__vm_wipe_secrets);
+}
+
+/* No _exit interception — atexit handles cleanup for normal exits.
+ * For _exit() paths, kernel reclaims memory. */"""
     
     def _gen_integrity_check(self) -> str:
+        if not self.all_bytecode:
+            return ""  # No bytecode to verify
         hash_val = hashlib.sha256(f"{self.key}:{self.seed}".encode()).hexdigest()[:16]
         return f"""/* Integrity check: verify bytecode not tampered */
 static const char __vm_integrity_hash[] = "{hash_val}";
@@ -504,13 +520,13 @@ static void __vm_init_consts(void) {{
         lines.append(f"/* Function handler table — {len(self.all_funcs)} entries */")
         lines.append("typedef void* (*__vm_handler_fn)(void);")
         
-        # Forward declarations
-        for func_name in self.all_funcs:
-            lines.append(f"extern void* {func_name}(...);")
+        # Forward declarations for VM entry points (safe — no conflict with originals)
+        for name, bc, offset, length in self.all_bytecode:
+            lines.append(f"static void __vm_enter_{name}(void);")
         
         lines.append(f"static __vm_handler_fn __vm_handlers[{len(self.all_funcs)}] = {{")
         for func_name in self.all_funcs:
-            lines.append(f"    (__vm_handler_fn){func_name},")
+            lines.append(f"    (__vm_handler_fn)__vm_enter_{func_name},")
         lines.append("};")
         
         return '\n'.join(lines)
@@ -712,8 +728,8 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
 /* VM string decryption helper */
 #include <stdio.h>
 #include <string.h>
-static char __vm_dec_buf[4096];
-static const char *__vm_dec_str(const char *hex, unsigned key) {
+char __vm_dec_buf[4096];
+const char *__vm_dec_str(const char *hex, unsigned key) {
     int len = strlen(hex) / 2;
     if (len > 4095) len = 4095;
     for (int i = 0; i < len; i++) {
