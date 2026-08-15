@@ -70,6 +70,8 @@ typedef enum {
     OP_SHR         = 0x1A,  /* shift right: pop b, pop a, push a>>b */
     OP_BITAND      = 0x1B,  /* bitwise and: pop b, pop a, push a&b */
     OP_BITOR       = 0x1C,  /* bitwise or: pop b, pop a, push a|b */
+    OP_STR_REPLACE = 0x1D,  /* pop repl, pop pat, pop str: replace first pat with repl */
+    OP_STR_REPLACE_ALL = 0x1E,  /* pop repl, pop pat, pop str: replace all */
 
     /* 0x20-0x2F: Comparison and logic */
     OP_EQ        = 0x20,

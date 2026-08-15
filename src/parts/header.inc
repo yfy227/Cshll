@@ -538,22 +538,23 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vmc_push_int(vs, length);
                         vm_buf_emit(vs->bc, OP_STR_SUBSTR);
                     }
-                    /* ${var#pattern} — strip prefix */
+                    /* ${var#pattern} or ${var##pattern} — strip prefix */
                     else if(*p == '#'){
-                        p++; /* skip # */
+                        int longest = (p[1] == '#');
+                        p += 1 + longest; /* skip # or ## */
                         char pat[128]; int pi2 = 0;
                         while(*p && *p != '}' && pi2 < 127) pat[pi2++] = *p++;
                         pat[pi2] = 0;
                         if(*p == '}') p++;
-                        /* Get var, strip prefix matching pat */
                         vmc_push_str(vs, vn);
                         vm_buf_emit(vs->bc, OP_GETENV);
                         vmc_push_str(vs, pat);
                         vm_buf_emit(vs->bc, OP_STRIP_PREFIX);
                     }
-                    /* ${var%pattern} — strip suffix */
+                    /* ${var%pattern} or ${var%%pattern} — strip suffix */
                     else if(*p == '%'){
-                        p++; /* skip % */
+                        int longest = (p[1] == '%');
+                        p += 1 + longest;
                         char pat[128]; int pi2 = 0;
                         while(*p && *p != '}' && pi2 < 127) pat[pi2++] = *p++;
                         pat[pi2] = 0;
@@ -562,6 +563,27 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vm_buf_emit(vs->bc, OP_GETENV);
                         vmc_push_str(vs, pat);
                         vm_buf_emit(vs->bc, OP_STRIP_SUFFIX);
+                    }
+                    /* ${var/pat/repl} or ${var//pat/repl} — replace */
+                    else if(*p == '/'){
+                        int all = (p[1] == '/');
+                        p += 1 + all;
+                        char pat[128]; int pi2 = 0;
+                        while(*p && *p != '/' && *p != '}' && pi2 < 127) pat[pi2++] = *p++;
+                        pat[pi2] = 0;
+                        char repl[128]; int ri2 = 0;
+                        if(*p == '/'){
+                            p++;
+                            while(*p && *p != '}' && ri2 < 127) repl[ri2++] = *p++;
+                        }
+                        repl[ri2] = 0;
+                        if(*p == '}') p++;
+                        /* Stack: str, pat, repl → OP_STR_REPLACE[_ALL] */
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_str(vs, pat);
+                        vmc_push_str(vs, repl);
+                        vm_buf_emit(vs->bc, all ? OP_STR_REPLACE_ALL : OP_STR_REPLACE);
                     }
                     /* Plain ${var} */
                     else {
