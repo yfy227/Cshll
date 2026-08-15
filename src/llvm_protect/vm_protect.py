@@ -94,6 +94,11 @@ def extract_functions(c_source: str) -> List[CFunction]:
         if name in capture_funcs:
             continue
         
+        # Skip shell2c-generated functions — they use __sh_argc/__sh_args
+        # These functions receive parameters via shell2c runtime, not C calling convention
+        if '__sh_argc' in params or '__sh_args' in params:
+            continue
+        
         # Find matching closing brace
         brace_start = m.end() - 1
         depth = 0
@@ -399,11 +404,13 @@ class VMRuntimeGenerator:
     def _gen_exit_cleanup(self) -> str:
         """Generate exit cleanup code: wipe BSS, environ, heap."""
         return r"""/* Anti-dump: wipe all secrets before exit */
-extern char __vm_dec_buf[4096]; /* defined by encrypt_string_literals */
+extern char __vm_dec_buf_export[4096]; /* defined by encrypt_string_literals */
 
 static void __vm_wipe_secrets(void) {
-    /* Wipe __vm_dec_buf */
-    memset(__vm_dec_buf, 0, 4096);
+    /* Wipe __vm_dec_buf (all 8 slots) */
+    {extern char __vm_dec_buf[8][4096];
+     for(int i=0;i<8;i++) memset(__vm_dec_buf[i], 0, 4096);}
+    memset(__vm_dec_buf_export, 0, 4096);
     
     /* Wipe environ */
     {extern char **environ; if(environ){char **_ep=environ; while(*_ep){
@@ -733,6 +740,11 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             result_lines.append(line)
             continue
         
+        # Skip VM runtime variables (integrity hash, bytecode, const pool)
+        if '__vm_integrity' in line or '__vm_bc_enc' in line or '__vm_const_' in line:
+            result_lines.append(line)
+            continue
+        
         # Skip asm volatile — clobber strings must be plaintext
         if '__asm__' in line or 'asm volatile' in line:
             result_lines.append(line)
@@ -740,11 +752,12 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
         
         # Detect array initializer pattern: type name[N] = "..."
         # Replace with: type name[N]; strcpy(name, __vm_dec_str(...))
+        # BUT skip const arrays — can't strcpy into const
         init_match = re.match(
-            r'^(\s*(?:static\s+|const\s+|extern\s+)*\w[\w\s\*]*?\s+(\w+)\s*\[[^\]]*\]\s*=\s*)"([^"]*)"',
+            r'^(\s*(?:static\s+)*(?:unsigned\s+|volatile\s+)*\w[\w\s\*]*?\s+(\w+)\s*\[[^\]]*\]\s*=\s*)"([^"]*)"',
             line
         )
-        if init_match:
+        if init_match and 'const' not in init_match.group(1):
             prefix = init_match.group(1)
             varname = init_match.group(2)
             content = init_match.group(3)
@@ -765,8 +778,16 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             # Skip short strings (< 4 chars) and format strings
             if len(content) < 4:
                 return s
-            if '%' in content and ('d' in content or 's' in content or 'l' in content):
+            # Check for printf format specifiers: %s %d %f %lf %x %c %u %ld %lu %llx etc.
+            if '%' in content and re.search(r'%(l?l?[dsxfcpul]|\.?\d*[dsxfcpul])', content):
                 return s  # format string, keep as-is
+            # Skip strings containing shell metacharacters that must stay literal
+            # (glob patterns, ${} substitutions, etc.)
+            if '${' in content or content.startswith('echo ') or '*' in content or '?' in content:
+                # These are shell command strings — encrypting them may break shell parsing
+                # Only skip if they contain glob/special patterns
+                if '*' in content or '${' in content:
+                    return s
             
             # Check context: skip if preceded by = (array initializer)
             start = m.start()
@@ -791,22 +812,26 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
     
     # Add decryption helper function at the top
     decrypt_func = """
-/* VM string decryption helper */
+/* VM string decryption helper — multi-buffer for concurrent calls */
 #include <stdio.h>
 #include <string.h>
-char __vm_dec_buf[4096];
+static char __vm_dec_buf[8][4096]; /* 8 buffers for up to 8 concurrent calls */
+static int __vm_dec_idx = 0;
+char __vm_dec_buf_export[4096]; /* for external cleanup */
 const char *__vm_dec_str(const char *hex, unsigned key) {
+    int slot = __vm_dec_idx % 8;
+    __vm_dec_idx++;
+    char *buf = __vm_dec_buf[slot];
     int len = strlen(hex) / 2;
     if (len > 4095) len = 4095;
-    /* Wipe previous content first */
-    memset(__vm_dec_buf, 0, 4096);
+    memset(buf, 0, 4096);
     for (int i = 0; i < len; i++) {
         unsigned byte;
         sscanf(hex + i*2, "%02x", &byte);
-        __vm_dec_buf[i] = (char)(byte ^ ((key >> (i % 32)) & 0xFF));
+        buf[i] = (char)(byte ^ ((key >> (i % 32)) & 0xFF));
     }
-    __vm_dec_buf[len] = 0;
-    return __vm_dec_buf;
+    buf[len] = 0;
+    return buf;
 }
 """
     
