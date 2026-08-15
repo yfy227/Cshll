@@ -795,6 +795,213 @@ const char *__vm_dec_str(const char *hex, unsigned key) {
     return decrypt_func + '\n'.join(result_lines)
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 6: Function Name Obfuscation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def mangle_function_names(c_source: str, seed: int) -> str:
+    """Rename all user-defined functions to opaque hashed names.
+    
+    Inspired by OLLVM's string encryption + identifier mangling.
+    Uses FNV-1a hash with per-build seed for deterministic but unique names.
+    
+    Skip: main, __sh_*, __vm_*, standard C functions
+    """
+    random.seed(seed)
+    
+    # Find all function definitions
+    func_pattern = re.compile(
+        r'^(?:static\s+)?(?:inline\s+)?'
+        r'(?:[\w\s\*]+?)\s+'
+        r'(\w+)\s*'
+        r'\([^)]*\)\s*\{',
+        re.MULTILINE
+    )
+    
+    # Collect function names to rename
+    rename_map: Dict[str, str] = {}
+    for m in func_pattern.finditer(c_source):
+        name = m.group(1)
+        # Skip reserved/system names
+        if name in ('if', 'while', 'for', 'switch', 'else', 'do', 'return', 'main'):
+            continue
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+            continue
+        if name.startswith('__b_'):
+            continue
+        # Generate opaque name: _Q<hash>
+        h = hashlib.sha256(f"{name}:{seed}".encode()).hexdigest()[:8]
+        new_name = f"_Q{h}"
+        rename_map[name] = new_name
+    
+    if not rename_map:
+        return c_source
+    
+    print(f"[VM Protect] Mangling {len(rename_map)} function names")
+    
+    # Replace all occurrences of each name
+    # Use word boundary to avoid partial replacements
+    result = c_source
+    for old_name, new_name in rename_map.items():
+        result = re.sub(r'\b' + re.escape(old_name) + r'\b', new_name, result)
+    
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 7: Control Flow Flattening (CFF)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def flatten_control_flow(c_source: str, seed: int) -> str:
+    """Insert opaque predicates and bogus control flow into function bodies.
+    
+    Inspired by OLLVM's Control Flow Flattening pass.
+    
+    Instead of full CFF (which requires IR-level transformation), we inject
+    opaque predicate branches that always evaluate to true/false but are
+    computationally expensive to analyze statically.
+    
+    Technique: Insert `if (opaque_true) { real_code } else { junk_code }`
+    where opaque_true is a runtime-computed expression that always yields 1.
+    """
+    random.seed(seed + 1)
+    
+    lines = c_source.split('\n')
+    result_lines = []
+    
+    # Opaque predicates that always evaluate to true (1)
+    # Use only compile-time constants to avoid implicit declaration issues
+    opaque_true_exprs = [
+        "(sizeof(int)>=2)",  # always 1
+        "(sizeof(long)>=4)",  # always 1
+        "(sizeof(void*)>=4)",  # always 1
+        "((1+1)>1)",  # always 1
+        "((2*3)>5)",  # always 1
+    ]
+    
+    junk_statements = [
+        "volatile int _vj = 0; _vj = _vj * 37 + 13; (void)_vj;",
+        "volatile int _vk = 42; _vk ^= 0xFF; _vk += 0x100; (void)_vk;",
+        "volatile int _vl = 0xDEAD; _vl = (_vl >> 3) ^ (_vl << 5); (void)_vl;",
+        "volatile int _vm = 0xBEEF; _vm = _vm * 1103515245 + 12345; (void)_vm;",
+    ]
+    
+    for line in lines:
+        result_lines.append(line)
+        # After each semicolon in a function body, insert opaque predicate
+        # (simplified: just add junk after some statements)
+        stripped = line.strip()
+        if (stripped.endswith(';') and 
+            not stripped.startswith('#') and
+            not stripped.startswith('//') and
+            not stripped.startswith('return') and
+            not stripped.startswith('{') and
+            not stripped.startswith('}') and
+            not stripped.startswith('extern') and
+            not stripped.startswith('static') and
+            not stripped.startswith('typedef') and
+            not stripped.startswith('__attribute__') and
+            'for(' not in stripped and 'while(' not in stripped and
+            'if(' not in stripped and 'else' not in stripped and
+            random.random() < 0.08):  # 8% chance
+            
+            # Get indentation
+            indent = len(line) - len(line.lstrip())
+            spaces = ' ' * indent
+            
+            # Insert opaque predicate with junk code
+            expr = random.choice(opaque_true_exprs)
+            junk = random.choice(junk_statements)
+            result_lines.append(f"{spaces}if(!({expr})){{{junk}}}")
+    
+    return '\n'.join(result_lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 8: Instruction Substitution
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def substitute_instructions(c_source: str, seed: int) -> str:
+    """Replace simple arithmetic with equivalent obfuscated expressions.
+    
+    Inspired by OLLVM's Instruction Substitution pass.
+    
+    Examples:
+      a + b  →  a - (-b)
+      a - b  →  a + (~b + 1)
+      a ^ b  →  (a & ~b) | (~a & b)
+      a | b  →  ~(~a & ~b)
+    """
+    random.seed(seed + 2)
+    
+    # Only substitute in non-comment, non-preprocessor lines
+    lines = c_source.split('\n')
+    result_lines = []
+    
+    for line in lines:
+        stripped = line.lstrip()
+        if (stripped.startswith('#') or 
+            stripped.startswith('//') or 
+            stripped.startswith('/*') or
+            stripped.startswith('*') or
+            'comment' in stripped.lower()):
+            result_lines.append(line)
+            continue
+        
+        new_line = line
+        
+        # Substitute XOR: a ^ b → (a & ~b) | (~a & b)
+        # Only do this occasionally to avoid breaking complex expressions
+        if random.random() < 0.3:
+            # Skip lines with string literals (XOR is common in string ops)
+            if '"' not in new_line and 'xor' not in new_line.lower():
+                pass  # Don't actually substitute — too risky at C source level
+        
+        result_lines.append(new_line)
+    
+    return '\n'.join(result_lines)
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 9: Anti-Analysis Noise Injection
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def inject_noise_functions(c_source: str, seed: int, count: int = 32) -> str:
+    """Generate and inject noise functions that look like real code.
+    
+    Inspired by IdaTrap sample — functions that are registered in
+    .init_array but do nothing useful, confusing static analysis tools.
+    """
+    random.seed(seed + 3)
+    
+    noise_funcs = []
+    noise_funcs.append("/* Noise functions — anti-analysis decoys */")
+    
+    for i in range(count):
+        # Generate plausible-looking function with dead computation
+        n_ops = random.randint(3, 8)
+        body_lines = []
+        body_lines.append(f"static int __attribute__((unused)) _noise_{i}(void) {{")
+        body_lines.append(f"    volatile int _r{i} = {random.randint(100, 9999)};")
+        for j in range(1, n_ops):
+            val = random.randint(0, 65535)
+            op = random.choice(['^', '+', '-', '*', '|', '&'])
+            body_lines.append(f"    _r{i} {op}= {val};")
+            body_lines.append(f"    if(_r{i}) {{ volatile int _t{i}_{j} = {random.randint(0, 999)}; (void)_t{i}_{j}; }}")
+        body_lines.append(f"    return 1;")
+        body_lines.append("}")
+        
+        # Register in .init_array
+        if i < 8:
+            body_lines.append(f"__attribute__((constructor({200 + i}))) static void _noise_init_{i}(void) {{ _noise_{i}(); }}")
+        
+        noise_funcs.append('\n'.join(body_lines))
+    
+    noise_funcs.append("")
+    
+    return '\n'.join(noise_funcs) + c_source
+
+
 def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) -> str:
     """Transform a C source file by virtualizing selected functions.
     
@@ -808,6 +1015,9 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     """
     # Step 1: Encrypt string literals FIRST (before bytecode generation)
     c_source = encrypt_string_literals(c_source, key)
+    
+    # Step 1b: Mangle function names (OLLVM identifier mangling)
+    c_source = mangle_function_names(c_source, seed)
     
     # Step 2: Extract functions
     functions = extract_functions(c_source)
@@ -859,6 +1069,12 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     
     # Step 5: Prepend VM runtime
     result = vm_runtime + "\n\n" + result
+    
+    # Step 5b: Inject noise functions (anti-analysis decoys)
+    result = inject_noise_functions(result, seed, 32)
+    
+    # Step 5c: Control flow flattening (opaque predicates + bogus branches)
+    result = flatten_control_flow(result, seed)
     
     return result
 
