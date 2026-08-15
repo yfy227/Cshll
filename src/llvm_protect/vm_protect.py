@@ -1142,6 +1142,178 @@ def inject_noise_functions(c_source: str, seed: int, count: int = 32) -> str:
     return '\n'.join(noise_funcs) + c_source
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 10: Global Variable Indirection Table (xVMP-style)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def indirect_global_variables(c_source: str, seed: int) -> str:
+    """Redirect global variable access through an offset table.
+    
+    Inspired by xVMP's "compile-time global variable address → VM data segment" technique.
+    
+    This adds an indirection layer that defeats static string reference analysis
+    in tools like IDA Pro — the variable name never appears in code, only an index.
+    """
+    random.seed(seed + 4)
+    
+    # Find global static char/int variables (shell2c-generated)
+    var_pattern = re.compile(
+        r'^static\s+(char|int|unsigned)\s+(\w+)\s*\[', 
+        re.MULTILINE
+    )
+    
+    var_map: Dict[str, int] = {}
+    idx = 0
+    for m in var_pattern.finditer(c_source):
+        vtype = m.group(1)
+        name = m.group(2)
+        # Skip __sh_ and __vm_ variables
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+            continue
+        if name.startswith('__b_'):
+            continue
+        var_map[name] = idx
+        idx += 1
+    
+    if not var_map:
+        return c_source
+    
+    print(f"[VM Protect] Indirecting {len(var_map)} global variables")
+    
+    # Generate the indirection table (at top) and initializer (at end)
+    table_header = []
+    table_header.append("/* Global Variable Indirection Table (xVMP-style) */")
+    table_header.append("static void* __gvt[64]; /* 64 slots for indirected globals */")
+    table_header.append("")
+    
+    # Generate initializer that goes at the END of the file
+    # (after all variable definitions)
+    table_init = []
+    table_init.append("")
+    table_init.append("/* Global Variable Indirection Table initializer */")
+    table_init.append("__attribute__((constructor(90)))")
+    table_init.append("static void __gvt_init(void) {")
+    for name, i in var_map.items():
+        table_init.append(f"    __gvt[{i}] = (void*)&{name};")
+    table_init.append("}")
+    table_init.append("")
+    
+    # Insert table at top, init at end
+    result = '\n'.join(table_header) + '\n' + c_source + '\n' + '\n'.join(table_init)
+    
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 11: Per-function String Encryption Keys
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def per_function_string_keys(c_source: str, seed: int) -> str:
+    """Generate per-function XOR keys for string decryption.
+    
+    Instead of one global key, each function uses a derived key.
+    This means cracking one function's strings doesn't help with others.
+    
+    Technique: key = base_key ^ (function_hash << function_offset)
+    """
+    random.seed(seed + 5)
+    
+    # Find function definitions
+    func_pattern = re.compile(
+        r'^(?:static\s+)?(?:void|int|char)\s+(\w+)\s*\([^)]*\)\s*\{',
+        re.MULTILINE
+    )
+    
+    func_keys = {}
+    for m in func_pattern.finditer(c_source):
+        name = m.group(1)
+        if name in ('if', 'while', 'for', 'switch', 'else', 'do', 'return', 'main'):
+            continue
+        if name.startswith('__') or name.startswith('_'):
+            continue
+        # Derive per-function key
+        h = int(hashlib.sha256(f"{name}:{seed}".encode()).hexdigest()[:8], 16)
+        func_keys[name] = h
+    
+    if not func_keys:
+        return c_source
+    
+    # Generate key table (encrypted itself)
+    key_table_lines = []
+    key_table_lines.append("/* Per-function string encryption keys (encrypted) */")
+    key_table_lines.append(f"static const unsigned int __pfk_seed = 0x{seed:08X}u;")
+    
+    for name, key in func_keys.items():
+        # Store key XOR'd with seed (double protection)
+        enc_key = key ^ seed
+        key_table_lines.append(f"static const unsigned int __pfk_{name} = 0x{enc_key:08X}u;")
+    
+    key_table_lines.append("")
+    
+    return '\n'.join(key_table_lines) + c_source
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 12: Control Flow Splitting
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def split_basic_blocks(c_source: str, seed: int) -> str:
+    """Split basic blocks by inserting random branches.
+    
+    Inspired by OLLVM's Basic Block Splitting pass.
+    
+    Technique: Insert `goto` labels and conditional jumps that
+    break long basic blocks into smaller pieces, making
+    control flow graph analysis harder.
+    
+    Only applies to function bodies (indented code).
+    """
+    random.seed(seed + 6)
+    
+    lines = c_source.split('\n')
+    result_lines = []
+    label_counter = 0
+    
+    for line in lines:
+        result_lines.append(line)
+        
+        stripped = line.strip()
+        
+        # Only split inside function bodies (indented code)
+        if (line.startswith('    ') and 
+            stripped.endswith(';') and
+            not stripped.startswith('#') and
+            not stripped.startswith('//') and
+            not stripped.startswith('return') and
+            not stripped.startswith('{') and
+            not stripped.startswith('}') and
+            not stripped.startswith('extern') and
+            not stripped.startswith('static') and
+            not stripped.startswith('typedef') and
+            not stripped.startswith('__attribute__') and
+            not stripped.startswith('struct') and
+            not stripped.startswith('if') and
+            not stripped.startswith('for') and
+            not stripped.startswith('while') and
+            not stripped.startswith('else') and
+            not stripped.startswith('goto') and
+            'for(' not in stripped and
+            'while(' not in stripped and
+            'if(' not in stripped and
+            random.random() < 0.03):  # 3% chance
+            
+            indent = len(line) - len(line.lstrip())
+            spaces = ' ' * indent
+            label_counter += 1
+            label = f"__bb_{label_counter}"
+            
+            # Insert: goto label; label: — splits the block
+            result_lines.append(f"{spaces}goto {label};")
+            result_lines.append(f"{label}:;")
+    
+    return '\n'.join(result_lines)
+
+
 def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) -> str:
     """Transform a C source file by virtualizing selected functions.
     
@@ -1208,9 +1380,6 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     result = vm_runtime + "\n\n" + result
     
     # Step 5b: Encrypt string literals in NON-runtime code only
-    # VM runtime is already prepended — we need to encrypt only the
-    # shell2c-generated portion (everything after vm_runtime).
-    # Split at the boundary and encrypt only the user code.
     result = encrypt_string_literals(result, key)
     
     # Step 5c: Inject noise functions (anti-analysis decoys)
@@ -1218,6 +1387,15 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     
     # Step 5d: Control flow flattening (opaque predicates + bogus branches)
     result = flatten_control_flow(result, seed)
+    
+    # Step 5e: Global variable indirection table (xVMP-style)
+    result = indirect_global_variables(result, seed)
+    
+    # Step 5f: Per-function string encryption keys
+    result = per_function_string_keys(result, seed)
+    
+    # Step 5g: Basic block splitting (goto-based)
+    result = split_basic_blocks(result, seed)
     
     return result
 
