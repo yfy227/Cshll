@@ -760,7 +760,7 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
         # Find string literals in the line
         def replace_string(m):
             s = m.group(0)
-            content = s[1:-1]  # strip quotes
+            content = s[1:-1]  # strip quotes (raw C source, may contain \", \\, etc.)
             
             # Skip short strings (< 4 chars) and format strings
             if len(content) < 4:
@@ -774,8 +774,12 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             if before.endswith('=') or before.endswith('[]='):
                 return s  # can't use function call in initializer
             
+            # Decode C escape sequences before encrypting
+            # so __vm_dec_str returns the actual string value
+            decoded = content.encode().decode('unicode_escape')
+            
             # XOR encrypt (byte-level for UTF-8 safety)
-            content_bytes = content.encode('utf-8')
+            content_bytes = decoded.encode('utf-8')
             encrypted = bytes([b ^ ((key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
             hex_str = encrypted.hex()
             
@@ -816,10 +820,13 @@ const char *__vm_dec_str(const char *hex, unsigned key) {
 def mangle_function_names(c_source: str, seed: int) -> str:
     """Rename all user-defined functions to opaque hashed names.
     
-    Inspired by OLLVM's string encryption + identifier mangling.
-    Uses FNV-1a hash with per-build seed for deterministic but unique names.
+    Inspired by OLLVM's identifier mangling.
+    Uses SHA256 hash with per-build seed for deterministic but unique names.
     
-    Skip: main, __sh_*, __vm_*, standard C functions
+    CRITICAL: Only renames identifiers in CODE context, NOT inside string literals.
+    String literals like "fib(10)=..." must keep "fib" as-is.
+    
+    Skip: main, __sh_*, __vm_*, standard C functions, control keywords
     """
     random.seed(seed)
     
@@ -853,13 +860,93 @@ def mangle_function_names(c_source: str, seed: int) -> str:
     
     print(f"[VM Protect] Mangling {len(rename_map)} function names")
     
-    # Replace all occurrences of each name
-    # Use word boundary to avoid partial replacements
-    result = c_source
-    for old_name, new_name in rename_map.items():
-        result = re.sub(r'\b' + re.escape(old_name) + r'\b', new_name, result)
+    # Replace names ONLY in code context — skip string literals
+    # Process line by line, tracking whether we're inside a string
+    result_lines = []
+    for line in c_source.split('\n'):
+        # Process the line character by character
+        new_line = []
+        i = 0
+        in_string = False
+        string_char = None
+        in_char = False
+        in_comment = False
+        
+        while i < len(line):
+            c = line[i]
+            
+            # Handle comment start
+            if not in_string and not in_char and not in_comment:
+                if i + 1 < len(line) and c == '/' and line[i+1] == '/':
+                    # Line comment — rest of line is comment
+                    new_line.append(line[i:])
+                    break
+                if i + 1 < len(line) and c == '/' and line[i+1] == '*':
+                    in_comment = True
+                    new_line.append(c)
+                    new_line.append(line[i+1])
+                    i += 2
+                    continue
+            
+            if in_comment:
+                new_line.append(c)
+                if c == '*' and i + 1 < len(line) and line[i+1] == '/':
+                    new_line.append(line[i+1])
+                    i += 2
+                    in_comment = False
+                    continue
+                i += 1
+                continue
+            
+            # Handle string literals
+            if c == '"' and not in_char:
+                if in_string and i > 0 and line[i-1] == '\\':
+                    # Escaped quote inside string
+                    new_line.append(c)
+                    i += 1
+                    continue
+                in_string = not in_string
+                new_line.append(c)
+                i += 1
+                continue
+            
+            if c == "'" and not in_string:
+                if in_char and i > 0 and line[i-1] == '\\':
+                    new_line.append(c)
+                    i += 1
+                    continue
+                in_char = not in_char
+                new_line.append(c)
+                i += 1
+                continue
+            
+            # If inside string or char literal, don't replace
+            if in_string or in_char:
+                new_line.append(c)
+                i += 1
+                continue
+            
+            # In code context — check for function name
+            if c.isalpha() or c == '_':
+                # Extract identifier
+                j = i
+                while j < len(line) and (line[j].isalnum() or line[j] == '_'):
+                    j += 1
+                ident = line[i:j]
+                
+                # Check if it's a function name to rename
+                if ident in rename_map:
+                    new_line.append(rename_map[ident])
+                else:
+                    new_line.append(ident)
+                i = j
+            else:
+                new_line.append(c)
+                i += 1
+        
+        result_lines.append(''.join(new_line))
     
-    return result
+    return '\n'.join(result_lines)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -915,9 +1002,23 @@ def flatten_control_flow(c_source: str, seed: int) -> str:
             not stripped.startswith('static') and
             not stripped.startswith('typedef') and
             not stripped.startswith('__attribute__') and
+            not stripped.startswith('struct') and
+            not stripped.startswith('enum') and
+            not stripped.startswith('union') and
+            not stripped.startswith('const') and
+            not stripped.startswith('char') and
+            not stripped.startswith('int') and
+            not stripped.startswith('void') and
+            not stripped.startswith('unsigned') and
+            not stripped.startswith('size_t') and
+            not stripped.startswith('volatile') and
+            not stripped.startswith('FILE') and
+            not stripped.startswith('DIR') and
             'for(' not in stripped and 'while(' not in stripped and
             'if(' not in stripped and 'else' not in stripped and
-            random.random() < 0.08):  # 8% chance
+            # Only inside function bodies (heuristic: indented)
+            line.startswith('    ') and
+            random.random() < 0.05):  # 5% chance
             
             # Get indentation
             indent = len(line) - len(line.lstrip())
