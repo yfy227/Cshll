@@ -53,8 +53,16 @@ def extract_functions(c_source: str) -> List[CFunction]:
     For shell2c-generated code, the main logic is in main() and
     helper functions like __sh_*. We virtualize main() body and
     user-defined functions (those called via __sh_capture_fn).
+    
+    IMPORTANT: Functions called via __sh_capture_fn must NOT be virtualized
+    because __sh_capture_fn calls them through function pointers.
     """
     functions = []
+    
+    # Find all functions called via __sh_capture_fn — these can't be virtualized
+    capture_funcs = set()
+    for m in re.finditer(r'__sh_capture_fn\(\s*\(void\(\*\)\(int\s*,\s*char\*\*\)\)\s*(\w+)', c_source):
+        capture_funcs.add(m.group(1))
     
     # Pattern: return_type function_name(params) {
     func_pattern = re.compile(
@@ -74,12 +82,16 @@ def extract_functions(c_source: str) -> List[CFunction]:
         if name in ('if', 'while', 'for', 'switch', 'else', 'do', 'return'):
             continue
         
-        # Skip VM runtime functions (they implement the VM itself)
+        # Skip VM runtime functions
         if name.startswith('__vm_') or name.startswith('_noise_'):
             continue
         
-        # Skip __sh_ runtime functions (they're needed as-is)
-        if name.startswith('__sh_') and name != '__sh_main':
+        # Skip __sh_ runtime functions
+        if name.startswith('__sh_'):
+            continue
+        
+        # Skip functions called via __sh_capture_fn — can't virtualize
+        if name in capture_funcs:
             continue
         
         # Find matching closing brace
@@ -101,9 +113,7 @@ def extract_functions(c_source: str) -> List[CFunction]:
         body = c_source[brace_start:i+1]
         return_type = c_source[m.start():m.start(1)].strip()
         
-        # Virtualize main() and user functions, skip tiny helpers
-        # Don't virtualize main — just encrypt strings + add protection
-        # Actual code virtualization requires clang/LLVM IR processing
+        # Only virtualize substantial non-main functions
         if name != 'main' and len(body) > 200:
             func = CFunction(name, return_type, params, body, m.start(), i+1)
             functions.append(func)
@@ -392,14 +402,46 @@ class VMRuntimeGenerator:
 extern char __vm_dec_buf[4096]; /* defined by encrypt_string_literals */
 
 static void __vm_wipe_secrets(void) {
-    /* Only wipe __vm_dec_buf — safe in atexit context */
+    /* Wipe __vm_dec_buf */
     memset(__vm_dec_buf, 0, 4096);
+    
+    /* Wipe environ */
+    {extern char **environ; if(environ){char **_ep=environ; while(*_ep){
+        char *_s=*_ep; size_t _l=strlen(_s); memset(_s,0,_l); _ep++;
+    }}}
+    clearenv();
+    malloc_trim(0);
+    
+    /* Heap scan for residual secrets */
+    {FILE *_mf=fopen("/proc/self/maps","r");
+     if(_mf){char _ml[256];
+      while(fgets(_ml,sizeof(_ml),_mf)){
+        unsigned long long _s,_e;
+        if(sscanf(_ml,"%llx-%llx",&_s,&_e)==2 && strstr(_ml,"[heap]")){
+          char *_hp=(char*)_s; size_t _hs=_e-_s;
+          for(size_t _i=0;_i<_hs-8;_i++){
+            if(_hp[_i]=='s'&&_hp[_i+1]=='k'&&_hp[_i+2]=='-'&&_hp[_i+3]=='p') memset(_hp+_i,0,64);
+            if(_hp[_i]=='g'&&_hp[_i+1]=='h'&&_hp[_i+2]=='p'&&_hp[_i+3]=='_') memset(_hp+_i,0,64);
+            if(_hp[_i]=='S'&&_hp[_i+1]=='E'&&_hp[_i+2]=='C'&&_hp[_i+3]=='R') memset(_hp+_i,0,64);
+            if(_hp[_i]=='A'&&_hp[_i+1]=='P'&&_hp[_i+2]=='I'&&_hp[_i+3]=='_') memset(_hp+_i,0,64);
+          }
+          break;
+        }
+      }
+      fclose(_mf);
+     }}
+    
+    /* Wipe ALL BSS (volatile to prevent optimization) */
+    {extern volatile char __bss_start[]; extern volatile char _end[];
+     volatile char *_p=(volatile char*)__bss_start;
+     while(_p<(volatile char*)_end){*_p=0;_p++;}
+    }
 }
 
 /* BSS wipe disabled — causes crash when destructor runs after libc cleanup.
  * Kernel reclaims all memory on exit anyway. */
 
-__attribute__((constructor(103)))
+__attribute__((constructor(105)))
 static void __vm_init_cleanup(void) {
     atexit(__vm_wipe_secrets);
 }
@@ -420,12 +462,12 @@ static void __vm_verify_integrity(void) {{
     for (size_t i = 0; i < sizeof(__vm_bc_enc); i++) {{
         h = h * 1103515245 + 12345 + __vm_bc_enc[i];
     }}
-    /* If hash doesn't match, bytecode was modified — corrupt execution */
+    /* If hash doesn't match, bytecode was modified — corrupt decoded buffer */
     char buf[17];
     snprintf(buf, sizeof(buf), "%08x%08x", h, h ^ {hex(self.key)});
     if (memcmp(buf, __vm_integrity_hash, 8) != 0) {{
-        /* Tampered — cause subtle corruption */
-        memset((void*)__vm_bc_enc, 0, sizeof(__vm_bc_enc) / 4);
+        /* Tampered — zero decoded bytecode, not the const encrypted data */
+        memset((void*)__vm_bc_dec, 0, sizeof(__vm_bc_dec) / 4);
     }}
 }}
 
@@ -442,17 +484,19 @@ static void __vm_init_integrity(void) {{
         
         lines.append(f"/* Encrypted VM bytecode — {len(all_bc)} bytes total */")
         lines.append(f"/* Key: 0x{self.key:08X} | Seed: {self.seed} */")
-        lines.append(f"static const uint8_t __vm_bc_enc[{len(all_bc)}] = {{")
-        
-        for i in range(0, len(all_bc), 16):
-            chunk = all_bc[i:i+16]
-            hex_vals = ', '.join(f'0x{b:02x}' for b in chunk)
-            lines.append(f"    {hex_vals},")
-        
-        lines.append("};")
+        if len(all_bc) == 0:
+            lines.append("static const uint8_t __vm_bc_enc[1] = {0};")
+        else:
+            lines.append(f"static const uint8_t __vm_bc_enc[{len(all_bc)}] = {{")
+            for i in range(0, len(all_bc), 16):
+                chunk = all_bc[i:i+16]
+                hex_vals = ', '.join(f'0x{b:02x}' for b in chunk)
+                lines.append(f"    {hex_vals},")
+            lines.append("};")
         
         # Decoded bytecode buffer
-        lines.append(f"static uint8_t __vm_bc_dec[{len(all_bc)}];")
+        bc_dec_size = max(len(all_bc), 1)
+        lines.append(f"static uint8_t __vm_bc_dec[{bc_dec_size}];")
         lines.append(f"static int __vm_bc_ready = 0;")
         
         # Decrypt function
@@ -478,7 +522,7 @@ static void __vm_init_decrypt(void) {{
     
     def _gen_const_pool(self) -> str:
         if not self.all_consts:
-            return "/* No constants */"
+            return "/* No constants */\nstatic const char *__vm_consts[1];\nstatic void __vm_decrypt_consts(void) {}\n__attribute__((constructor(104))) static void __vm_init_consts(void) {}"
         
         lines = []
         lines.append(f"/* String constant pool — {len(self.all_consts)} entries (encrypted) */")
@@ -502,7 +546,7 @@ static void __vm_decrypt_consts(void) {{
             lines.append(f"    }}")
         
         lines.append("}")
-        lines.append(f"static const char *__vm_consts[{len(self.all_consts)}];")
+        lines.append(f"static const char *__vm_consts[{max(len(self.all_consts), 1)}];")
         lines.append(f"""
 __attribute__((constructor(104)))
 static void __vm_init_consts(void) {{
@@ -524,9 +568,13 @@ static void __vm_init_consts(void) {{
         for name, bc, offset, length in self.all_bytecode:
             lines.append(f"static void __vm_enter_{name}(void);")
         
-        lines.append(f"static __vm_handler_fn __vm_handlers[{len(self.all_funcs)}] = {{")
-        for func_name in self.all_funcs:
-            lines.append(f"    (__vm_handler_fn)__vm_enter_{func_name},")
+        num_handlers = max(len(self.all_funcs), 1)
+        lines.append(f"static __vm_handler_fn __vm_handlers[{num_handlers}] = {{")
+        if self.all_funcs:
+            for func_name in self.all_funcs:
+                lines.append(f"    (__vm_handler_fn)__vm_enter_{func_name},")
+        else:
+            lines.append("    NULL,")
         lines.append("};")
         
         return '\n'.join(lines)
@@ -732,6 +780,8 @@ char __vm_dec_buf[4096];
 const char *__vm_dec_str(const char *hex, unsigned key) {
     int len = strlen(hex) / 2;
     if (len > 4095) len = 4095;
+    /* Wipe previous content first */
+    memset(__vm_dec_buf, 0, 4096);
     for (int i = 0; i < len; i++) {
         unsigned byte;
         sscanf(hex + i*2, "%02x", &byte);
@@ -762,13 +812,10 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     # Step 2: Extract functions
     functions = extract_functions(c_source)
     
-    if not functions:
-        # No functions to virtualize — return original
-        return c_source
+    if functions:
+        print(f"[VM Protect] Found {len(functions)} functions to virtualize")
     
-    print(f"[VM Protect] Found {len(functions)} functions to virtualize")
-    
-    # Step 2: Analyze and generate bytecode for each function
+    # Step 2b: Analyze and generate bytecode for each function
     runtime_gen = VMRuntimeGenerator(key, seed)
     
     # Build a map of function name → replacement code
