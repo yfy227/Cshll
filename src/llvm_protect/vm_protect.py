@@ -431,11 +431,14 @@ static void __vm_wipe_secrets(void) {
       fclose(_mf);
      }}
     
-    /* Wipe ALL BSS (volatile to prevent optimization) */
+    /* Wipe ALL BSS LAST — after this, no libc calls are safe */
     {extern volatile char __bss_start[]; extern volatile char _end[];
      volatile char *_p=(volatile char*)__bss_start;
      while(_p<(volatile char*)_end){*_p=0;_p++;}
     }
+    /* Must use inline asm to exit — libc functions may access BSS */
+    __asm__ volatile("mov $60, %%eax; xor %%edi, %%edi; syscall" ::: "eax", "edi", "memory");
+    while(1){}
 }
 
 /* BSS wipe disabled — causes crash when destructor runs after libc cleanup.
@@ -721,6 +724,17 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
         # Skip preprocessor, comments, includes
         stripped = line.lstrip()
         if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('/*'):
+            result_lines.append(line)
+            continue
+        
+        # Skip lines in VM runtime (heap scan patterns, etc.)
+        # These strings must remain plaintext for runtime pattern matching
+        if '__vm_wipe_secrets' in line or '_hp[_i]==' in line or 'strstr(_ml' in line:
+            result_lines.append(line)
+            continue
+        
+        # Skip asm volatile — clobber strings must be plaintext
+        if '__asm__' in line or 'asm volatile' in line:
             result_lines.append(line)
             continue
         
@@ -1013,13 +1027,10 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     Returns:
         Virtualized C source code with VM runtime embedded
     """
-    # Step 1: Encrypt string literals FIRST (before bytecode generation)
-    c_source = encrypt_string_literals(c_source, key)
-    
-    # Step 1b: Mangle function names (OLLVM identifier mangling)
+    # Step 1: Mangle function names (OLLVM identifier mangling)
     c_source = mangle_function_names(c_source, seed)
     
-    # Step 2: Extract functions
+    # Step 2: Extract functions (before string encryption — we need original strings)
     functions = extract_functions(c_source)
     
     if functions:
@@ -1070,10 +1081,16 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     # Step 5: Prepend VM runtime
     result = vm_runtime + "\n\n" + result
     
-    # Step 5b: Inject noise functions (anti-analysis decoys)
+    # Step 5b: Encrypt string literals in NON-runtime code only
+    # VM runtime is already prepended — we need to encrypt only the
+    # shell2c-generated portion (everything after vm_runtime).
+    # Split at the boundary and encrypt only the user code.
+    result = encrypt_string_literals(result, key)
+    
+    # Step 5c: Inject noise functions (anti-analysis decoys)
     result = inject_noise_functions(result, seed, 32)
     
-    # Step 5c: Control flow flattening (opaque predicates + bogus branches)
+    # Step 5d: Control flow flattening (opaque predicates + bogus branches)
     result = flatten_control_flow(result, seed)
     
     return result
