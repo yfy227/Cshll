@@ -159,8 +159,8 @@ typedef enum {
     OP_STR_SUBSTR  = 0xF9,  /* pop len, pop off, pop str, push substr */
     OP_STR_LEN     = 0xFA,  /* pop str, push length */
     OP_COALESCE    = 0xFB,  /* pop b, pop a: push a if non-empty, else push b */
-    OP_STRIP_PREFIX= 0xFC,  /* pop pat, pop str: strip prefix matching pat */
-    OP_STRIP_SUFFIX= 0xFD,  /* pop pat, pop str: strip suffix matching pat */
+    OP_STRIP_PREFIX= 0xFC,  /* pop pat, pop str: strip prefix matching pat (* = wildcard) */
+    OP_STRIP_SUFFIX= 0xFD,  /* pop pat, pop str: strip suffix matching pat (* = wildcard) */
     OP_ALL_ARGS    = 0xFE,  /* push all positional params (space-joined) */
 
     OP_INVALID   = 0xFF
