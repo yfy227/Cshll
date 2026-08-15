@@ -176,11 +176,13 @@ static void *transpile_thread(void *arg){
     char **argv = g_argv;
     int do_obfuscate = 0;
     int do_vm = 0;
+    int do_llvm_vm = 0;
     for(int i=3;i<argc;i++){
         if(!strcmp(argv[i],"--obfuscate")) do_obfuscate=1;
         if(!strcmp(argv[i],"--vm")) do_vm=1;
+        if(!strcmp(argv[i],"--llvm-vm")) do_llvm_vm=1;
     }
-    /* VM mode implies obfuscate — full protection stack */
+    /* VM mode implies obfuscate; LLVM-VM is standalone protection */
     if(do_vm) do_obfuscate = 1;
 
     /* Initialize name mangler */
@@ -197,7 +199,10 @@ static void *transpile_thread(void *arg){
             "  --obfuscate  Generate obfuscated C code (anti-analysis)\n"
             "  --vm         Generate VM-protected output (bytecode + hybrid JIT)\n"
             "               Custom stack-based ISA with hot-path native JIT.\n"
-            "               Implies --obfuscate for bytecode encoding.\n",
+            "               Implies --obfuscate for bytecode encoding.\n"
+            "  --llvm-vm    Generate LLVM IR-level virtualized output (auto VM)\n"
+            "               Post-processes C with LLVM-based virtualization pass.\n"
+            "               Automatically virtualizes ALL functions — no opcode limitation.\n",
             argv[0]);
         g_retcode=1; return NULL;
     }
@@ -428,6 +433,22 @@ static void *transpile_thread(void *arg){
         fclose(fout);
     }
     printf("[OK] %s -> %s\n",argv[1],argv[2]);
+
+    /* LLVM VM mode: post-process with vm_protect.py */
+    if(do_llvm_vm){
+        char cmd[4096];
+        snprintf(cmd,sizeof(cmd),
+            "python3 src/llvm_protect/vm_protect.py %s %s --key 0x%X --seed %d 2>&1",
+            argv[2], argv[2], (unsigned)(time(NULL)*2654435761U), (int)(time(NULL)%65536));
+        printf("[LLVM-VM] Running virtualization pass...\n");
+        int rc=system(cmd);
+        if(rc!=0){
+            fprintf(stderr,"[LLVM-VM] Virtualization failed, using original C\n");
+        } else {
+            printf("[LLVM-VM] Virtualized C written to %s\n",argv[2]);
+        }
+        g_retcode=0;
+    }
 
     int make_run=0;
     for(int i=3;i<argc;i++){
@@ -1092,7 +1113,7 @@ int main(int argc, char **argv){
             "  --run        Compile and run the output immediately\n"
             "  --obfuscate  Generate obfuscated C code (anti-analysis)\n"
             "  --vm         Generate VM-protected output (bytecode + hybrid JIT)\n"
-            "  -all         Generate a self-bootstrapping terminal C file.\n"
+            "  --llvm-vm    Generate LLVM IR-level virtualized output (auto VM)\n"            "  -all         Generate a self-bootstrapping terminal C file.\n"
             "               The compiled terminal auto-installs gcc/git, clones\n"
             "               the project repo, compiles it, and provides a shell.\n"
             "               Options: -o <file.c> -r <repo_url> -n <project_name>\n",
