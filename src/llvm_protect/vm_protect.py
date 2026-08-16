@@ -900,8 +900,16 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
                 content_bytes = content.encode('utf-8')
                 encrypted = bytes([b ^ ((per_str_key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
                 hex_str = encrypted.hex()
+                # Obfuscate key with runtime seed masks
+                seed = 0xDEB69AEE
+                lo_mask = 0xA5A5 ^ (seed & 0xFFFF)
+                hi_mask = 0x3C3C ^ (seed & 0xFFFF)
+                key_hi = (per_str_key >> 16) & 0xFFFF
+                key_lo = per_str_key & 0xFFFF
+                obf_lo = key_lo ^ lo_mask
+                obf_hi = key_hi ^ hi_mask
                 rest = line[init_match.end():]
-                new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{per_str_key:08X}u));{rest}'
+                new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{obf_lo:04X}u,0x{obf_hi:04X}u));{rest}'
                 result_lines.append(new_line)
                 continue
         
@@ -962,24 +970,53 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             encrypted = bytes([b ^ ((per_str_key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
             hex_str = encrypted.hex()
             
-            # Generate decryption code with per-string key
-            return f'__vm_dec_str("{hex_str}",0x{per_str_key:08X}u)'
+            # Key obfuscation: split key into two halves, masks computed from __vm_ks()
+            # seed = 0xDEB69AEE (computed at runtime by __vm_ks(), volatile prevents static analysis)
+            seed = 0xDEB69AEE
+            lo_mask = 0xA5A5 ^ (seed & 0xFFFF)  # 0x3F4B
+            hi_mask = 0x3C3C ^ (seed & 0xFFFF)  # 0xA6D2
+            key_hi = (per_str_key >> 16) & 0xFFFF
+            key_lo = per_str_key & 0xFFFF
+            obf_lo = key_lo ^ lo_mask
+            obf_hi = key_hi ^ hi_mask
+            
+            # Generate decryption code with obfuscated key
+            return f'__vm_dec_str("{hex_str}",0x{obf_lo:04X}u,0x{obf_hi:04X}u)'
         
         new_line = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', replace_string, line)
         result_lines.append(new_line)
     
     # Add decryption helper function at the top
     decrypt_func = """
-/* VM string decryption helper — multi-buffer for concurrent calls */
+/* VM string decryption helper — multi-buffer, runtime key derivation */
 #include <stdio.h>
 #include <string.h>
-static char __vm_dec_buf[8][4096]; /* 8 buffers for up to 8 concurrent calls */
+static char __vm_dec_buf[8][4096];
 static int __vm_dec_idx = 0;
-char __vm_dec_buf_export[4096]; /* for external cleanup */
-const char *__vm_dec_str(const char *hex, unsigned key) {
+char __vm_dec_buf_export[4096];
+
+/* Runtime key seed — assembled from scattered constants to prevent static extraction */
+static unsigned int __vm_ks(void) {
+    /* Key parts scattered across different computations */
+    volatile unsigned int a = 0x1234;
+    volatile unsigned int b = 0x5678;
+    a = a * 37 + 0xABCD;
+    b = b ^ 0xEF01;
+    a = (a << 3) | (a >> 29);
+    b = b + a;
+    return b ^ 0xDEADBEEF;
+}
+
+/* Key reassembly: lo_mask and hi_mask computed from __vm_ks() */
+const char *__vm_dec_str(const char *hex, unsigned obf_lo, unsigned obf_hi) {
     int slot = __vm_dec_idx % 8;
     __vm_dec_idx++;
     char *buf = __vm_dec_buf[slot];
+    /* Compute masks at runtime — prevents static key extraction */
+    unsigned int seed = __vm_ks();
+    unsigned int lo_mask = 0xA5A5u ^ (seed & 0xFFFF);
+    unsigned int hi_mask = 0x3C3Cu ^ (seed & 0xFFFF);
+    unsigned key = ((obf_hi ^ hi_mask) << 16) | (obf_lo ^ lo_mask);
     int len = strlen(hex) / 2;
     if (len > 4095) len = 4095;
     memset(buf, 0, 4096);
