@@ -1335,6 +1335,124 @@ def split_basic_blocks(c_source: str, seed: int) -> str:
     return '\n'.join(result_lines)
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 13: Function Pointer Indirection (Obfusk8-style)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def indirect_function_calls(c_source: str, seed: int) -> str:
+    """Replace direct function calls with indirect calls through XOR'd pointer table.
+    
+    Inspired by Obfusk8's OBF_CALL_VIA_OBF_PTR technique.
+    """
+    random.seed(seed + 7)
+    
+    # Find user-defined shell2c functions (after mangling, names are _Q<hex>)
+    # Signatures: (int __sh_argc, char **__sh_args) or (int,char**)
+    func_pattern = re.compile(
+        r'^static\s+void\s+(\w+)\s*\((?:int\s+__sh_argc|int)\s*,\s*char\s*\*?\*?',
+        re.MULTILINE
+    )
+    
+    func_map: Dict[str, int] = {}
+    idx = 0
+    for m in func_pattern.finditer(c_source):
+        name = m.group(1)
+        # Skip VM/runtime functions but allow _Q (mangled user functions)
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+            continue
+        if name.startswith('__b_'):
+            continue
+        func_map[name] = idx
+        idx += 1
+    
+    if not func_map:
+        return c_source
+    
+    print(f"[VM Protect] Indirecting {len(func_map)} function calls")
+    
+    xor_key = random.randint(0x10000000, 0xFFFFFFFF)
+    
+    table_lines = []
+    table_lines.append("/* Function Pointer Indirection Table (Obfusk8-style) */")
+    table_lines.append("static void* __fpt[64]; /* function pointer table */")
+    table_lines.append(f"static const unsigned int __fpt_xor = 0x{xor_key:08X}u;")
+    table_lines.append("")
+    
+    table_init = []
+    table_init.append("")
+    table_init.append("/* Function Pointer Table initializer */")
+    table_init.append("__attribute__((constructor(89)))")
+    table_init.append("static void __fpt_init(void) {")
+    for name, i in func_map.items():
+        table_init.append(f"    __fpt[{i}] = (void*)((unsigned long)&{name} ^ __fpt_xor);")
+    table_init.append("}")
+    table_init.append("")
+    
+    result = '\n'.join(table_lines) + '\n' + c_source + '\n' + '\n'.join(table_init)
+    return result
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 14: Integer Constant Obfuscation
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+def obfuscate_integers(c_source: str, seed: int) -> str:
+    """Replace integer constants with computed expressions.
+    
+    Inspired by OLLVM's constant substitution.
+    """
+    random.seed(seed + 8)
+    
+    lines = c_source.split('\n')
+    result_lines = []
+    int_pattern = re.compile(r'\b(\d{2,6})\b')
+    
+    for line in lines:
+        stripped = line.lstrip()
+        
+        if (stripped.startswith('#') or stripped.startswith('//') or
+            stripped.startswith('/*') or stripped.startswith('*') or
+            stripped.startswith('extern') or stripped.startswith('typedef') or
+            stripped.startswith('static') or stripped.startswith('__attribute__') or
+            stripped.startswith('struct') or stripped.startswith('enum') or
+            stripped.startswith('union') or
+            '"' in stripped or 'include' in stripped or
+            'define' in stripped or '0x' in stripped):
+            result_lines.append(line)
+            continue
+        
+        if not line.startswith('    '):
+            result_lines.append(line)
+            continue
+        
+        if '__vm_dec_str' in line or '__gvt' in line or '__fpt' in line:
+            result_lines.append(line)
+            continue
+        
+        def replace_int(m):
+            n = int(m.group(1))
+            if n < 10:
+                return m.group(0)
+            strategy = random.randint(0, 2)
+            if strategy == 0:
+                a = random.randint(1, n - 1)
+                return f"({a}+{n-a})"
+            elif strategy == 1:
+                a = random.randint(1, 255)
+                return f"({n^a}^{a})"
+            else:
+                s = random.randint(1, 4)
+                a = n >> s
+                r = n & ((1 << s) - 1)
+                if r == 0:
+                    return f"({a}<<{s})"
+                return f"(({a}<<{s})|{r})"
+        
+        result_lines.append(int_pattern.sub(replace_int, line))
+    
+    return '\n'.join(result_lines)
+
+
 def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) -> str:
     """Transform a C source file by virtualizing selected functions.
     
@@ -1417,6 +1535,12 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     
     # Step 5g: Basic block splitting (goto-based)
     result = split_basic_blocks(result, seed)
+    
+    # Step 5h: Function pointer indirection (Obfusk8-style)
+    result = indirect_function_calls(result, seed)
+    
+    # Step 5i: Integer constant obfuscation (OLLVM constant substitution)
+    result = obfuscate_integers(result, seed)
     
     return result
 
