@@ -667,8 +667,15 @@ char *translate_expr(const char *tok){
                 char nm[128]; int j=0;
                 if(*s=='{'){
                     s++;
-                    while(*s && *s!='}') nm[j++]=*s++;
-                    nm[j]=0; if(*s) s++;
+                    /* Use translate_brace_expansion for ${...} inside $(( )) */
+                    char brace_body[256]; int bj=0;
+                    while(*s && *s!='}' && bj<(int)sizeof(brace_body)-1) brace_body[bj++]=*s++;
+                    brace_body[bj]=0; if(*s) s++;
+                    char *e=translate_brace_expansion(brace_body);
+                    int el=(int)strlen(e);
+                    if(q+el<(int)sizeof(buf)-2){ memcpy(buf+q,e,el); q+=el; }
+                    free(e);
+                    continue;
                 } else if(isdigit((unsigned char)*s)){
                     int n_arg=0;
                     while(isdigit((unsigned char)*s)) n_arg=n_arg*10+(*s++)-'0';
