@@ -71,12 +71,15 @@ const char *mangle(const char *name){
     if(strcmp(name,"_opq")==0) return name;
     if(strcmp(name,"_dec")==0) return name;
 
-    static char buf[256];
+    static char buf[4][256];
+    static int buf_idx = 0;
+    char *b = buf[buf_idx];
+    buf_idx = (buf_idx + 1) % 4;
     unsigned int h = fnv_hash(name);
 
     /* Generate opaque name: _Q + hex hash */
-    snprintf(buf, sizeof(buf), "_Q%08x", h);
-    return buf;
+    snprintf(b, sizeof(buf[0]), "_Q%08x", h);
+    return b;
 }
 
 /* Mangle __sh_* names */
