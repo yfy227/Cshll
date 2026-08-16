@@ -762,11 +762,15 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             varname = init_match.group(2)
             content = init_match.group(3)
             if len(content) >= 4 and not ('%' in content and any(c in content for c in 'dsl')):
+                # Per-string key
+                import hashlib as _hl2
+                str_hash = int(_hl2.md5(content.encode()).hexdigest()[:8], 16)
+                per_str_key = key ^ str_hash
                 content_bytes = content.encode('utf-8')
-                encrypted = bytes([b ^ ((key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
+                encrypted = bytes([b ^ ((per_str_key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
                 hex_str = encrypted.hex()
                 rest = line[init_match.end():]
-                new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{key:08X}u));{rest}'
+                new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{per_str_key:08X}u));{rest}'
                 result_lines.append(new_line)
                 continue
         
@@ -782,7 +786,6 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             if '%' in content and re.search(r'%(l?l?[dsxfcpul]|\.?\d*[dsxfcpul])', content):
                 return s  # format string, keep as-is
             # Skip strings containing shell metacharacters that must stay literal
-            # (glob patterns, ${} substitutions, etc.)
             if '${' in content or '*' in content:
                 return s
             
@@ -793,16 +796,21 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
                 return s  # can't use function call in initializer
             
             # Decode C escape sequences before encrypting
-            # so __vm_dec_str returns the actual string value
             decoded = content.encode().decode('unicode_escape')
             
-            # XOR encrypt (byte-level for UTF-8 safety)
+            # Per-string key: base key XOR hash of content
+            # This means each string uses a different key — cracking one doesn't help others
+            import hashlib as _hl
+            str_hash = int(_hl.md5(decoded.encode()).hexdigest()[:8], 16)
+            per_str_key = key ^ str_hash
+            
+            # XOR encrypt with per-string key
             content_bytes = decoded.encode('utf-8')
-            encrypted = bytes([b ^ ((key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
+            encrypted = bytes([b ^ ((per_str_key >> (i % 32)) & 0xFF) for i, b in enumerate(content_bytes)])
             hex_str = encrypted.hex()
             
-            # Generate decryption code
-            return f'__vm_dec_str("{hex_str}",0x{key:08X}u)'
+            # Generate decryption code with per-string key
+            return f'__vm_dec_str("{hex_str}",0x{per_str_key:08X}u)'
         
         new_line = re.sub(r'"([^"\\]*(?:\\.[^"\\]*)*)"', replace_string, line)
         result_lines.append(new_line)
