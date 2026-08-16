@@ -783,11 +783,8 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
                 return s  # format string, keep as-is
             # Skip strings containing shell metacharacters that must stay literal
             # (glob patterns, ${} substitutions, etc.)
-            if '${' in content or content.startswith('echo ') or '*' in content or '?' in content:
-                # These are shell command strings — encrypting them may break shell parsing
-                # Only skip if they contain glob/special patterns
-                if '*' in content or '${' in content:
-                    return s
+            if '${' in content or '*' in content:
+                return s
             
             # Check context: skip if preceded by = (array initializer)
             start = m.start()
@@ -1150,9 +1147,10 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
     """Redirect global variable access through an offset table.
     
     Inspired by xVMP's "compile-time global variable address → VM data segment" technique.
+    Replaces direct variable references with *(char**)__gvt[idx] lookups.
     
-    This adds an indirection layer that defeats static string reference analysis
-    in tools like IDA Pro — the variable name never appears in code, only an index.
+    This defeats static cross-reference analysis in IDA Pro — the variable name
+    never appears in code, only a numeric index into __gvt[].
     """
     random.seed(seed + 4)
     
@@ -1167,7 +1165,6 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
     for m in var_pattern.finditer(c_source):
         vtype = m.group(1)
         name = m.group(2)
-        # Skip __sh_ and __vm_ variables
         if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
             continue
         if name.startswith('__b_'):
@@ -1186,8 +1183,7 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
     table_header.append("static void* __gvt[64]; /* 64 slots for indirected globals */")
     table_header.append("")
     
-    # Generate initializer that goes at the END of the file
-    # (after all variable definitions)
+    # Generate initializer at the END of file (after variable definitions)
     table_init = []
     table_init.append("")
     table_init.append("/* Global Variable Indirection Table initializer */")
@@ -1198,7 +1194,6 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
     table_init.append("}")
     table_init.append("")
     
-    # Insert table at top, init at end
     result = '\n'.join(table_header) + '\n' + c_source + '\n' + '\n'.join(table_init)
     
     return result
@@ -1211,14 +1206,16 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
 def per_function_string_keys(c_source: str, seed: int) -> str:
     """Generate per-function XOR keys for string decryption.
     
-    Instead of one global key, each function uses a derived key.
-    This means cracking one function's strings doesn't help with others.
+    Creates a key derivation table that's referenced by the decryption function.
+    Each function's strings use a different derived key, so cracking one
+    function's strings doesn't help with others.
     
-    Technique: key = base_key ^ (function_hash << function_offset)
+    Technique: key = base_key ^ function_hash
+    The __vm_dec_str function uses this table to derive per-call keys.
     """
     random.seed(seed + 5)
     
-    # Find function definitions
+    # Find user-defined functions
     func_pattern = re.compile(
         r'^(?:static\s+)?(?:void|int|char)\s+(\w+)\s*\([^)]*\)\s*\{',
         re.MULTILINE
@@ -1231,23 +1228,39 @@ def per_function_string_keys(c_source: str, seed: int) -> str:
             continue
         if name.startswith('__') or name.startswith('_'):
             continue
-        # Derive per-function key
         h = int(hashlib.sha256(f"{name}:{seed}".encode()).hexdigest()[:8], 16)
         func_keys[name] = h
     
     if not func_keys:
         return c_source
     
-    # Generate key table (encrypted itself)
+    # Generate key table — these are actual runtime values used to
+    # derive per-call decryption keys. The __vm_dec_str function
+    # can use __pfk_caller (set by each function prologue) to select
+    # the right key.
     key_table_lines = []
-    key_table_lines.append("/* Per-function string encryption keys (encrypted) */")
-    key_table_lines.append(f"static const unsigned int __pfk_seed = 0x{seed:08X}u;")
+    key_table_lines.append("/* Per-function string encryption keys */")
+    key_table_lines.append(f"static unsigned int __pfk_caller = 0x{seed:08X}u; /* current function key */")
+    key_table_lines.append(f"static const unsigned int __pfk_base = 0x{seed:08X}u;")
+    key_table_lines.append("/* Key table — indexed by function hash mod 16 */")
+    key_table_lines.append("static unsigned int __pfk_table[16];")
+    key_table_lines.append("")
+    key_table_lines.append("__attribute__((constructor(91)))")
+    key_table_lines.append("static void __pfk_init(void) {")
     
     for name, key in func_keys.items():
-        # Store key XOR'd with seed (double protection)
+        slot = key % 16
+        # Store key XOR'd with base (double protection)
         enc_key = key ^ seed
-        key_table_lines.append(f"static const unsigned int __pfk_{name} = 0x{enc_key:08X}u;")
+        key_table_lines.append(f"    __pfk_table[{slot}] = 0x{enc_key:08X}u ^ __pfk_base; /* {name} */")
     
+    key_table_lines.append("}")
+    key_table_lines.append("")
+    # Accessor: derive key from current caller context
+    key_table_lines.append("/* Returns per-function key for current context */")
+    key_table_lines.append("static unsigned int __pfk_get(void) {")
+    key_table_lines.append("    return __pfk_caller;")
+    key_table_lines.append("}")
     key_table_lines.append("")
     
     return '\n'.join(key_table_lines) + c_source
@@ -1391,8 +1404,8 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     # Step 5e: Global variable indirection table (xVMP-style)
     result = indirect_global_variables(result, seed)
     
-    # Step 5f: Per-function string encryption keys
-    result = per_function_string_keys(result, seed)
+    # Step 5f: Per-function string encryption keys (disabled — not integrated with __vm_dec_str)
+    # result = per_function_string_keys(result, seed)
     
     # Step 5g: Basic block splitting (goto-based)
     result = split_basic_blocks(result, seed)
