@@ -372,6 +372,43 @@ char *translate_arith(const char *expr){
             VarKind vk=get_var_kind(nm);
             /* check for = assignment (not ==, <=, >=, !=) */
             const char *np=s; while(*np==' '||*np=='\t') np++;
+            /* check for += compound assignment (bash only supports +=) */
+            if(*np=='+' && *(np+1)=='=' && *(np+2)!='='){
+                /* bash: x+=val means string append */
+                q+=snprintf(buf+q,sizeof(buf)-q,"strncat(%s,",cn);
+                s=np+2;
+                while(*s==' '||*s=='\t') s++;
+                /* read RHS */
+                if(*s=='"'){
+                    s++;
+                    char rhs[256]; int ri=0;
+                    while(*s && *s!='"' && ri<(int)sizeof(rhs)-1) rhs[ri++]=*s++;
+                    if(*s=='"') s++;
+                    rhs[ri]=0;
+                    q+=snprintf(buf+q,sizeof(buf)-q,"\"%s\",sizeof(%s)-strlen(%s)-1)",rhs,cn,cn);
+                } else {
+                    /* unquoted — could be number or variable */
+                    char rhs[256]; int ri=0;
+                    while(*s && *s!=';' && *s!='"' && ri<(int)sizeof(rhs)-1){
+                        rhs[ri++]=*s++;
+                    }
+                    rhs[ri]=0;
+                    /* check if it's a number */
+                    int is_num=1;
+                    for(int i=0;i<ri;i++){
+                        if(!isdigit((unsigned char)rhs[i]) && rhs[i]!='-'){ is_num=0; break; }
+                    }
+                    if(is_num){
+                        q+=snprintf(buf+q,sizeof(buf)-q,"\"%s\",sizeof(%s)-strlen(%s)-1)",rhs,cn,cn);
+                    } else {
+                        /* variable — use its string value */
+                        const char *cn2=safe_cname(rhs);
+                        q+=snprintf(buf+q,sizeof(buf)-q,"%s,sizeof(%s)-strlen(%s)-1)",cn2,cn,cn);
+                    }
+                }
+                buf[q++]=')';
+                continue;
+            }
             if(*np=='='&&*(np+1)!='='){
                 /* assignment: var = expr */
                 if(vk==V_STR){
@@ -723,6 +760,35 @@ char *translate_expr(const char *tok){
                         add_var(nm,V_INT);
                         vk=V_INT; cn=safe_cname(nm);
                     }
+                }
+                /* check for += compound assignment (bash string append) */
+                if(*s=='+'&&*(s+1)=='='&&*(s+2)!='='){
+                    /* x+=val → strncat(x, val, sizeof(x)-strlen(x)-1) */
+                    s+=2;
+                    while(*s==' '||*s=='\t') s++;
+                    if(*s=='"'){
+                        s++;
+                        char rhs[256]; int ri=0;
+                        while(*s && *s!='"' && ri<(int)sizeof(rhs)-1) rhs[ri++]=*s++;
+                        if(*s=='"') s++;
+                        rhs[ri]=0;
+                        q+=snprintf(buf+q,sizeof(buf)-q,"strncat(%s,\"%s\",sizeof(%s)-strlen(%s)-1)",cn,rhs,cn,cn);
+                    } else {
+                        char rhs[256]; int ri=0;
+                        while(*s && *s!=';' && *s!='"' && ri<(int)sizeof(rhs)-1) rhs[ri++]=*s++;
+                        rhs[ri]=0;
+                        int is_num=1;
+                        for(int i=0;i<ri;i++){
+                            if(!isdigit((unsigned char)rhs[i]) && rhs[i]!='-'){ is_num=0; break; }
+                        }
+                        if(is_num){
+                            q+=snprintf(buf+q,sizeof(buf)-q,"strncat(%s,\"%s\",sizeof(%s)-strlen(%s)-1)",cn,rhs,cn,cn);
+                        } else {
+                            const char *cn2=safe_cname(rhs);
+                            q+=snprintf(buf+q,sizeof(buf)-q,"strncat(%s,%s,sizeof(%s)-strlen(%s)-1)",cn,cn2,cn,cn);
+                        }
+                    }
+                    continue;
                 }
                 /* check for ++ or -- after variable (post-increment/decrement) */
                 if(vk==V_STR && (*s=='+'&&*(s+1)=='+')){

@@ -820,22 +820,29 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             Node *nd=new_node(NODE_ASSIGN,lineno);
             nd->lhs=xstrdup(toks[0]);
             if(is_append){
-                /* For -=, *=, /=, %= — always arithmetic, not string append */
+                /* For -=, *=, /=, %= — bash doesn't support these, emit as command */
                 if(append_op > 0){
-                    /* Arithmetic compound assignment: x -= 3 → x = x - 3 */
-                    char rhs[4096]=""; strncpy(rhs,eq+1,4095);
+                    /* bash: x-=3 → "x-=3: command not found" */
+                    /* Emit as failed command */
+                    char cmd[4200];
+                    snprintf(cmd,sizeof(cmd),"%s",toks[0]);
+                    const char *ops[]={"","+","-","*","/","%"};
+                    char full_op[8]; snprintf(full_op,sizeof(full_op),"%s=",ops[append_op]);
+                    strncat(cmd,full_op,sizeof(cmd)-strlen(cmd)-1);
+                    strncat(cmd,eq+1,sizeof(cmd)-strlen(cmd)-1);
                     for(int i=1;i<ntoks;i++){
                         if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
-                        if(rhs[0]) strncat(rhs," ",sizeof(rhs)-strlen(rhs)-1);
-                        strncat(rhs,toks[i],sizeof(rhs)-strlen(rhs)-1);
+                        strncat(cmd," ",sizeof(cmd)-strlen(cmd)-1);
+                        strncat(cmd,toks[i],sizeof(cmd)-strlen(cmd)-1);
                     }
-                    const char *ops[]={"","+","-","*","/","%"};
-                    char arith_expr[4200];
-                    snprintf(arith_expr,sizeof(arith_expr),"%s %s %s",toks[0],ops[append_op],rhs);
-                    add_var(nd->lhs,V_INT);
-                    nd->rhs=xstrdup(arith_expr);
-                    nd->lineno = -4; /* signal arithmetic assign from expr */
-                    parser_append(nd); return;
+                    Node *nd2=new_node(NODE_CMD,lineno);
+                    nd2->argv=malloc(2*sizeof(char*));
+                    nd2->argv[0]=xstrdup(cmd);
+                    nd2->argv[1]=NULL;
+                    nd2->argc=1;
+                    parser_append(nd2);
+                    free(nd->lhs); free(nd);
+                    return;
                 }
                 /* arr+=value — append to variable */
                 char rhs[4096]=""; strncpy(rhs,eq+1,4095);

@@ -1967,13 +1967,14 @@ void emit_node(FILE *out, Node *n){
         }
         if(n->lineno==-2){
             /* string append: var+=value */
-            /* BUG-14 fix: if var is V_INT, use arithmetic += instead */
+            /* bash: x+=val is string concat, but declare -i x makes += arithmetic */
             VarKind vk=get_var_kind(n->lhs);
             if(vk==V_INT){
+                /* integer variable (from declare -i or numeric assignment): += is arithmetic */
                 add_var(n->lhs,V_INT);
                 const char *cn=safe_cname(n->lhs);
                 char *e=translate_arith(n->rhs);
-                fprintf(out,"    %s+=(%s);\n",cn,e);
+                fprintf(out,"    {char _t[64];snprintf(_t,sizeof(_t),\"%%d\",atoi(%s)+(%s));strncpy(%s,_t,sizeof(%s)-1);}\n",cn,e,cn,cn);
                 free(e);
                 break;
             }
