@@ -424,10 +424,44 @@ static void *__vm_memset(void *dst, int c, size_t n) {
     return dst;
 }
 
+/* Inline strcmp — avoid GLIBC PLT hook */
+static int __vm_strcmp(const char *a, const char *b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
+/* Inline strncmp — avoid GLIBC PLT hook */
+static int __vm_strncmp(const char *a, const char *b, size_t n) {
+    while (n > 0 && *a && *a == *b) { a++; b++; n--; }
+    if (n == 0) return 0;
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
 #define strncpy __vm_strncpy
 #define strlen __vm_strlen
 #define memcpy __vm_memcpy
 #define memset __vm_memset
+#define strcmp __vm_strcmp
+#define strncmp __vm_strncmp
+
+/* Inline system() — avoid GLIBC PLT hook via LD_PRELOAD */
+static int __vm_system(const char *cmd) {
+    /* Use fork+execl instead of system() to avoid PLT interception */
+    pid_t pid = fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* Child */
+        unsetenv("LD_PRELOAD");
+        unsetenv("LD_AUDIT");
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    int status;
+    waitpid(pid, &status, 0);
+    return status;
+}
+
+#define system __vm_system
 
 /* Inline popen — avoid GLIBC PLT hook via LD_PRELOAD */
 /* Uses fork+pipe+execl instead of popen to avoid PLT interception */
