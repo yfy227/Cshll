@@ -116,7 +116,7 @@ void add_var(const char *name, VarKind k){
         if(strcmp(var_table[i].name,name)==0){
             if(k==V_ARRAY) var_table[i].kind=V_ARRAY;
             else if(k==V_INT) var_table[i].kind=V_INT;
-            /* V_STR does NOT upgrade from V_INT (declare -i preserves int type) */
+            else if(k==V_STR && var_table[i].kind==V_INT) var_table[i].kind=V_STR; /* += upgrades to string */
             return;
         }
     }
