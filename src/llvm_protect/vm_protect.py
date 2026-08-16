@@ -1572,6 +1572,157 @@ def obfuscate_integers(c_source: str, seed: int) -> str:
     return '\n'.join(result_lines)
 
 
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Phase 15: Native Command Replacement — 核心架构修复
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Embedded MD5 implementation (RFC 1321 reference, public domain)
+MD5_IMPL = r"""
+/* ── Embedded MD5 implementation (no external md5sum dependency) ── */
+typedef struct { uint32_t a,b,c,d; } __md5_ctx;
+static uint32_t __md5_rotl(uint32_t x, int n){ return (x<<n)|(x>>(32-n)); }
+static void __md5_round(uint32_t *a,uint32_t *b,uint32_t *c,uint32_t *d,
+    uint32_t M,uint32_t s,uint32_t K){
+    uint32_t f,g;
+    switch((*a)&3){
+        case 0: f=(*b&*c)|(~*b&*d); g=*a; break;
+        case 1: f=(*d&*b)|(~*d&*c); g=(5**a+1)&15; break;
+        case 2: f=*b^*c^*d; g=(3**a+5)&15; break;
+        case 3: f=*c^(~*b|*d); g=(7**a)&15; break;
+    }
+    *a = __md5_rotl(*a+M+K, s) + *b;
+    uint32_t t=*d; *d=*c; *c=*b; *b=t;
+}
+static void __md5_block(const uint8_t *blk, uint32_t *h){
+    static const uint32_t __md5_K[64]={
+        0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,
+        0xa8304613,0xfd469501,0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,
+        0x6b901122,0xfd987193,0xa679438e,0x49b40821,0xf61e2562,0xc040b340,
+        0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+        0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,
+        0x676f02d9,0x8d2a4c8a,0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,
+        0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,0x289b7ec6,0xeaa127fa,
+        0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+        0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,
+        0xffeff47d,0x85845dd1,0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,
+        0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391};
+    static const int __md5_S[64]={
+        7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+        5,9,14,20,5,9,14,20,5,9,14,20,5,9,14,20,
+        4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+        6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21};
+    uint32_t W[16]; for(int i=0;i<16;i++)
+        W[i]=(uint32_t)blk[i*4]|((uint32_t)blk[i*4+1]<<8)|
+             ((uint32_t)blk[i*4+2]<<16)|((uint32_t)blk[i*4+3]<<24);
+    uint32_t a=h[0],b=h[1],c=h[2],d=h[3];
+    for(int i=0;i<64;i++){
+        uint32_t f,g;
+        switch(i>>4){
+            case 0: f=(b&c)|(~b&d); g=i; break;
+            case 1: f=(d&b)|(~d&c); g=(5*i+1)&15; break;
+            case 2: f=b^c^d; g=(3*i+5)&15; break;
+            case 3: f=c^(~b|d); g=(7*i)&15; break;
+        }
+        uint32_t t=d; d=c; c=b;
+        b=__md5_rotl(a+f+__md5_K[i]+W[g],__md5_S[i])+b;
+        a=t;
+    }
+    h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
+}
+static void __md5_hex(const uint8_t *data, size_t len, char *out){
+    uint32_t h[4]={0x67452301,0xefcdab89,0x98badcfe,0x10325476};
+    uint8_t buf[64]; size_t i;
+    for(i=0;i+64<=len;i+=64) __md5_block(data+i,h);
+    size_t rem=len-i; memcpy(buf,data+i,rem);
+    buf[rem]=0x80; if(rem>=56){
+        memset(buf+rem+1,0,64-rem-1);
+        __md5_block(buf,h); memset(buf,0,56);
+    } else memset(buf+rem+1,0,56-rem-1);
+    uint64_t bits=(uint64_t)len*8;
+    memcpy(buf+56,&bits,8); __md5_block(buf,h);
+    static const char __hex[]="0123456789abcdef";
+    for(int j=0;j<4;j++){
+        out[j*8]=__hex[(h[j]>>4)&15]; out[j*8+1]=__hex[h[j]&15];
+        out[j*8+2]=__hex[(h[j]>>12)&15]; out[j*8+3]=__hex[(h[j]>>8)&15];
+        out[j*8+4]=__hex[(h[j]>>20)&15]; out[j*8+5]=__hex[(h[j]>>16)&15];
+        out[j*8+6]=__hex[(h[j]>>28)&15]; out[j*8+7]=__hex[(h[j]>>24)&15];
+    }
+    out[32]=0;
+}
+/* Compute MD5 of string, return hex digest (33 bytes) */
+static char __md5_out[33];
+static const char *__md5_str(const char *s){
+    __md5_hex((const uint8_t*)s, strlen(s), __md5_out);
+    return __md5_out;
+}
+"""
+
+
+def native_command_replacement(c_source: str) -> str:
+    """Replace external shell commands with native C implementations.
+    
+    This is the core architectural fix: shell2c transpiles 
+    `$(echo -n "$X" | md5sum | cut -d' ' -f1)` to
+    `__sh_cmd_output(__sh_fmt("echo -n \"%s%s\" | md5sum | cut -d' ' -f1", X, Y))`
+    which calls popen("/bin/sh -c ...") — leaking secrets to child process.
+    
+    This pass intercepts __sh_cmd_output calls containing "echo ... | md5sum"
+    and replaces them with __md5_str() — a native C MD5 implementation.
+    No external shell process is spawned; no secret appears in command line.
+    """
+    # Check if source contains md5sum pattern
+    if 'md5sum' not in c_source:
+        return c_source
+    
+    print("[VM Protect] Replacing external md5sum with native C implementation")
+    
+    # Pattern: __sh_cmd_output(__sh_fmt("echo -n \"%s%s\" | md5sum | cut -d' ' -f1", A, B))
+    # → __md5_str(__sh_fmt("%s%s", A, B))
+    #
+    # Also handle: __sh_cmd_output("echo -n \"literal\" | md5sum | cut -d' ' -f1")
+    # → __md5_str("literal")
+    
+    # Pattern 1: __sh_cmd_output(__sh_fmt("echo -n \"%s%s\" | md5sum | cut -d' ' -f1", A, B))
+    pattern1 = re.compile(
+        r'__sh_cmd_output\(\s*__sh_fmt\(\s*"echo\s+-n\s+\\"%s%s\\"\s*\|\s*md5sum\s*\|\s*cut\s+-d.*?-f1"\s*,\s*([^,]+),\s*([^)]+)\)\s*\)'
+    )
+    
+    def replace1(m):
+        a = m.group(1).strip()
+        b = m.group(2).strip()
+        return f'__md5_str(__sh_fmt("%s%s", {a}, {b}))'
+    
+    c_source = pattern1.sub(replace1, c_source)
+    
+    # Pattern 2: __sh_cmd_output("echo -n \"literal\" | md5sum | cut -d' ' -f1")
+    pattern2 = re.compile(
+        r'__sh_cmd_output\(\s*"echo\s+-n\s+\\"([^"]*)\\"\s*\|\s*md5sum\s*\|\s*cut.*?"\s*\)'
+    )
+    
+    def replace2(m):
+        literal = m.group(1)
+        return f'__md5_str("{literal}")'
+    
+    c_source = pattern2.sub(replace2, c_source)
+    
+    # Pattern 3: __sh_cmd_output(__sh_fmt("echo -n \"%s\" | md5sum | cut -d' ' -f1", A))
+    pattern3 = re.compile(
+        r'__sh_cmd_output\(\s*__sh_fmt\(\s*"echo\s+-n\s+\\"%s\\"\s*\|\s*md5sum\s*\|\s*cut.*?-f1"\s*,\s*([^)]+)\)\s*\)'
+    )
+    
+    def replace3(m):
+        a = m.group(1).strip()
+        return f'__md5_str({a})'
+    
+    c_source = pattern3.sub(replace3, c_source)
+    
+    # Prepend MD5 implementation if any replacement was made
+    if '__md5_str(' in c_source and '__md5_hex' not in c_source:
+        c_source = MD5_IMPL + "\n" + c_source
+    
+    return c_source
+
+
 def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) -> str:
     """Transform a C source file by virtualizing selected functions.
     
@@ -1585,6 +1736,9 @@ def virtualize_c_source(c_source: str, key: int = 0xDEADBEEF, seed: int = 42) ->
     """
     # Step 1: Mangle function names (OLLVM identifier mangling)
     c_source = mangle_function_names(c_source, seed)
+    
+    # Step 1b: Native command replacement — replace popen("echo|md5sum") with C native
+    c_source = native_command_replacement(c_source)
     
     # Step 2: Extract functions (before string encryption — we need original strings)
     functions = extract_functions(c_source)
