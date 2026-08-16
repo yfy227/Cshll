@@ -357,10 +357,107 @@ class VMRuntimeGenerator:
         lines.append("#include <stdint.h>")
         lines.append("#include <unistd.h>")
         lines.append("#include <malloc.h>")
+        lines.append("#include <dlfcn.h>")
         lines.append("#include <sys/ptrace.h>")
         lines.append("#include <sys/wait.h>")
         lines.append("#include <sys/syscall.h>")
         lines.append("#include <signal.h>")
+        lines.append("")
+        
+        # Anti-LD_PRELOAD detection
+        lines.append(r"""/* Anti-LD_PRELOAD: detect and neutralize library injection */
+static int __vm_check_preload(void) {
+    /* Check LD_PRELOAD environment variable */
+    char *lp = getenv("LD_PRELOAD");
+    if (lp && lp[0]) {
+        /* LD_PRELOAD is set — likely hooking attempt */
+        /* Clear it to prevent child processes from inheriting */
+        unsetenv("LD_PRELOAD");
+        /* Also check LD_AUDIT */
+        char *la = getenv("LD_AUDIT");
+        if (la && la[0]) unsetenv("LD_AUDIT");
+    }
+    /* Check /etc/ld.so.preload — system-wide hook */
+    FILE *pf = fopen("/etc/ld.so.preload", "r");
+    if (pf) {
+        char buf[256];
+        if (fgets(buf, sizeof(buf), pf)) {
+            /* preload file has content — be wary */
+            fclose(pf);
+            /* We can't prevent system preload, but we can detect it */
+        } else {
+            fclose(pf);
+        }
+    }
+    return 0;
+}
+
+/* Inline strncpy — avoid GLIBC PLT hook via LD_PRELOAD */
+static char *__vm_strncpy(char *dst, const char *src, size_t n) {
+    size_t i;
+    for (i = 0; i < n && src[i]; i++)
+        dst[i] = src[i];
+    for (; i < n; i++)
+        dst[i] = 0;
+    return dst;
+}
+
+/* Inline strlen — avoid GLIBC PLT hook */
+static size_t __vm_strlen(const char *s) {
+    size_t i = 0;
+    while (s[i]) i++;
+    return i;
+}
+
+/* Inline memcpy — avoid GLIBC PLT hook */
+static void *__vm_memcpy(void *dst, const void *src, size_t n) {
+    char *d = (char*)dst;
+    const char *s = (const char*)src;
+    while (n--) *d++ = *s++;
+    return dst;
+}
+
+/* Inline memset — avoid GLIBC PLT hook */
+static void *__vm_memset(void *dst, int c, size_t n) {
+    char *d = (char*)dst;
+    while (n--) *d++ = (char)c;
+    return dst;
+}
+
+#define strncpy __vm_strncpy
+#define strlen __vm_strlen
+#define memcpy __vm_memcpy
+#define memset __vm_memset
+
+/* Inline popen — avoid GLIBC PLT hook via LD_PRELOAD */
+/* Uses fork+pipe+execl instead of popen to avoid PLT interception */
+static FILE *__vm_popen(const char *cmd, const char *mode) {
+    int pfd[2];
+    if (pipe(pfd) < 0) return NULL;
+    pid_t pid = fork();
+    if (pid < 0) { close(pfd[0]); close(pfd[1]); return NULL; }
+    if (pid == 0) {
+        /* Child — redirect stdout to pipe, then exec shell */
+        close(pfd[0]);
+        dup2(pfd[1], 1);
+        close(pfd[1]);
+        /* Clear LD_PRELOAD in child to prevent hook inheritance */
+        unsetenv("LD_PRELOAD");
+        unsetenv("LD_AUDIT");
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    /* Parent */
+    close(pfd[1]);
+    return fdopen(pfd[0], mode);
+}
+
+#define popen __vm_popen
+
+__attribute__((constructor(50)))
+static void __vm_init_anti_preload(void) {
+    __vm_check_preload();
+}""")
         lines.append("")
         
         # Anti-debug check
@@ -779,19 +876,41 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             s = m.group(0)
             content = s[1:-1]  # strip quotes (raw C source, may contain \", \\, etc.)
             
-            # Skip short strings (< 4 chars) and format strings
+            # Skip short strings (< 4 chars)
             if len(content) < 4:
                 return s
-            # Check for printf format specifiers: %s %d %f %lf %x %c %u %ld %lu %llx etc.
+            
+            # Check context: is this a printf format string?
+            start = m.start()
+            before = line[:start].rstrip()
+            
+            # Only skip %s/%d format strings for actual printf/fprintf/snprintf calls
+            # __sh_fmt uses %s for shell variable substitution — should be encrypted
+            is_printf_format = False
             if '%' in content and re.search(r'%(l?l?[dsxfcpul]|\.?\d*[dsxfcpul])', content):
+                # Check if this string is the format argument of a printf-family call
+                # Look for pattern: printf("/fprintf(/snprintf( ... "string"
+                # But NOT __sh_fmt("string") or __sh_cmd_output("string")
+                if re.search(r'\b(printf|fprintf|snprintf|sprintf)\s*\([^)]*$', before):
+                    is_printf_format = True
+                # Also skip if it's the sscanf format string
+                elif re.search(r'\bsscanf\s*\([^)]*$', before):
+                    is_printf_format = True
+                # If __sh_fmt or __sh_cmd_output, encrypt it even with %s
+                # (these are shell commands, not C format strings)
+                elif re.search(r'\b__sh_(fmt|cmd_output)\s*\(', before):
+                    is_printf_format = False  # DO encrypt
+                else:
+                    # Ambiguous — skip to be safe
+                    is_printf_format = True
+            
+            if is_printf_format:
                 return s  # format string, keep as-is
             # Skip strings containing shell metacharacters that must stay literal
             if '${' in content or '*' in content:
                 return s
             
-            # Check context: skip if preceded by = (array initializer)
-            start = m.start()
-            before = line[:start].rstrip()
+            # Skip if preceded by = (array initializer)
             if before.endswith('=') or before.endswith('[]='):
                 return s  # can't use function call in initializer
             
