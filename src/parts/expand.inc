@@ -371,19 +371,36 @@ void expand_string(const char *s, ExpandResult *er){
                     snprintf(r,sizeof(r),"__sh_capture_fn((void(*)(int,char**))%s,%d,%s)",
                              safe_cname(fname),nargs,args);
                 } else {
-                    char *expanded=expand_cmd_subst(cmd);
-                    if(expanded){
-                        snprintf(r,sizeof(r),"__sh_cmd_output(%s)",expanded);
-                    } else {
-                        char esc[1050]; int e=0;
-                        for(int i=0;cmd[i]&&e<(int)sizeof(esc)-6;i++){
-                            if(cmd[i]=='"'||cmd[i]=='\\') esc[e++]='\\';
-                            if(cmd[i]=='\n'){ esc[e++]='\\'; esc[e++]='n'; continue; }
-                            if(cmd[i]=='\t'){ esc[e++]='\\'; esc[e++]='t'; continue; }
-                            esc[e++]=cmd[i];
+                    /* Check for [[ ... ]] — bash extended test */
+                    if(cmd[0]=='[' && cmd[1]=='[' && cmd[2]==' '){
+                        /* Extract condition between [[ and ]] */
+                        const char *cs=cmd+3;
+                        int clen=(int)strlen(cs);
+                        /* Remove trailing ]] */
+                        while(clen>0 && (cs[clen-1]==' '||cs[clen-1]==']')) clen--;
+                        /* Find end of condition (before ]] at end) */
+                        char cond[1024]; int ci2=0;
+                        for(int i=0;i<clen && ci2<(int)sizeof(cond)-1;i++){
+                            cond[ci2++]=cs[i];
                         }
-                        esc[e]=0;
-                        snprintf(r,sizeof(r),"__sh_cmd_output(\"%s\")",esc);
+                        cond[ci2]=0;
+                        /* Translate [[ cond ]] → __sh_test_ext("cond") */
+                        snprintf(r,sizeof(r),"__sh_test_ext(\"%s\")",cond);
+                    } else {
+                        char *expanded=expand_cmd_subst(cmd);
+                        if(expanded){
+                            snprintf(r,sizeof(r),"__sh_cmd_output(%s)",expanded);
+                        } else {
+                            char esc[1050]; int e=0;
+                            for(int i=0;cmd[i]&&e<(int)sizeof(esc)-6;i++){
+                                if(cmd[i]=='"'||cmd[i]=='\\') esc[e++]='\\';
+                                if(cmd[i]=='\n'){ esc[e++]='\\'; esc[e++]='n'; continue; }
+                                if(cmd[i]=='\t'){ esc[e++]='\\'; esc[e++]='t'; continue; }
+                                esc[e++]=cmd[i];
+                            }
+                            esc[e]=0;
+                            snprintf(r,sizeof(r),"__sh_cmd_output(\"%s\")",esc);
+                        }
                     }
                 }
                 if(er->nargs<EXPAND_MAX_ARGS){
