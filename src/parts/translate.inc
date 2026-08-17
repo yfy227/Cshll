@@ -91,7 +91,13 @@ char *translate_brace_expansion(const char *body){
                 if(!isdigit((unsigned char)*q) && *q!='+' && *q!='-' && *q!='$' && *q!='('){ is_numeric=0; break; }
             }
             if(is_numeric && idx[0]){
-                snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
+                /* Check for negative index: ${arr[-1]} → arr[arr_count-1] */
+                if(idx[0]=='-' && isdigit((unsigned char)idx[1])){
+                    /* Negative index: __arr_<name>[__sh_arr_count(__arr_<name>)-N] */
+                    snprintf(r,sizeof(r),"__arr_%s[__sh_arr_count(__arr_%s)%s]",safe_cname(name),safe_cname(name),idx);
+                } else {
+                    snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
+                }
             } else {
                 /* String key — use associative lookup */
                 /* If idx is $var, translate to runtime expression */
@@ -518,7 +524,14 @@ char *translate_arith(const char *expr){
                 while(*np==' '||*np=='\t') np++;
                 if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
                     /* /0 or %0 — emit runtime error + safe fallback */
-                    q+=snprintf(buf+q,sizeof(buf)-q,"%c(__sh_div_zero(),1)",*s);
+                    /* Build expression string for error message */
+                    char div_expr[64]; int di2=0;
+                    /* Look back to find the dividend */
+                    int bs2=q; while(bs2>0 && (isdigit((unsigned char)buf[bs2-1])||buf[bs2-1]==' ')) bs2--;
+                    int be2=bs2; while(be2<q) div_expr[di2++]=buf[be2++];
+                    div_expr[di2++]=' '; div_expr[di2++]=*s; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                    q=bs2; /* remove dividend from buf — it'll be in the call */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                     s=np+1; continue;
                 }
             }

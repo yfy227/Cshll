@@ -1459,7 +1459,12 @@ void emit_command(FILE *out, char **argv, int ac, int id){
         const char *vars[8]; int nv=0;
         int read_array=0;
         for(int i=1;i<ac;i++){
-            if(!strcmp(argv[i],"-r")||!strcmp(argv[i],"-p")) continue;
+            if(!strcmp(argv[i],"-r")) continue;
+            if(!strcmp(argv[i],"-p")){
+                /* -p PROMPT: skip the prompt string */
+                if(i+1<ac) i++; /* skip prompt argument */
+                continue;
+            }
             if(argv[i][0]=='-'){
                 for(const char *fc=argv[i];*fc;fc++) if(*fc=='a') read_array=1;
                 continue;
@@ -1493,8 +1498,26 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     }
     if(!strcmp(cmd,"exit")){
         if(ac>1){
-            char *w=emit_word(out,argv[1]);
-            fprintf(out,"    exit(atoi(%s));\n",w); free(w);
+            /* Check if argument is a pure number (possibly quoted) */
+            const char *arg=argv[1];
+            /* Strip surrounding quotes if present */
+            char stripped[256];
+            if(arg[0]=='"' && arg[strlen(arg)-1]=='"'){
+                size_t l=strlen(arg)-2;
+                if(l<sizeof(stripped)){ memcpy(stripped,arg+1,l); stripped[l]=0; arg=stripped; }
+            }
+            int is_num = (arg[0] != 0);
+            for(const char *p=arg;*p;p++){
+                if(!isdigit((unsigned char)*p) && *p!='-'){ is_num=0; break; }
+            }
+            if(is_num){
+                /* exit N — direct integer */
+                fprintf(out,"    exit(%s);\n",arg);
+            } else {
+                /* exit $var or exit "$(cmd)" — use atoi */
+                char *w=emit_word(out,argv[1]);
+                fprintf(out,"    exit(atoi(%s));\n",w); free(w);
+            }
         } else fprintf(out,"    exit(__exit_status);\n");
         return;
     }
@@ -2663,7 +2686,23 @@ void emit_node(FILE *out, Node *n){
         break;
     case NODE_EXIT:
         if(n->exit_str){
-            fprintf(out,"    exit(atoi(%s));\n",n->exit_str);
+            /* Check if exit_str is a pure number */
+            const char *es=n->exit_str;
+            char estripped[256];
+            if(es[0]=='"' && es[strlen(es)-1]=='"'){
+                size_t l=strlen(es)-2;
+                if(l<sizeof(estripped)){ memcpy(estripped,es+1,l); estripped[l]=0; es=estripped; }
+            }
+            int es_num = (es[0]!=0);
+            for(const char *p=es;*p;p++){
+                if(!isdigit((unsigned char)*p) && *p!='-'){ es_num=0; break; }
+            }
+            if(es_num){
+                fprintf(out,"    exit(%s);\n",es);
+            } else {
+                char *w=emit_word(out,n->exit_str);
+                fprintf(out,"    exit(atoi(%s));\n",w); free(w);
+            }
         } else {
             fprintf(out,"    exit(%d);\n",n->exit_code>=0?n->exit_code:0);
         }

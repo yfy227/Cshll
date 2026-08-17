@@ -164,6 +164,11 @@ Node *make_cmd(char **toks,int n,int ln){
         int has_a=0; /* -a flag: read into array */
         for(int i=1;i<n;i++){
             if(toks[i][0]=='-'){
+                /* -p PROMPT: skip flag AND its argument */
+                if(!strcmp(toks[i],"-p") && i+1<n){
+                    i++; /* skip prompt string */
+                    continue;
+                }
                 for(const char *fc=toks[i];*fc;fc++) if(*fc=='a') has_a=1;
                 continue;  /* skip flags like -r, -p */
             }
