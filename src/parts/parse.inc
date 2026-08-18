@@ -592,7 +592,17 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             Node **_pi=parse_insert;
             parser_append(nd);
             BlkFrame fr={BLK_CASE,nd,NULL,_pi};
-            parser_push(fr); parse_insert=NULL; return;
+            parser_push(fr); parse_insert=NULL;
+            /* If 'in' is in the same segment, dispatch remaining tokens */
+            int in_idx=-1;
+            for(int i=2;i<ntoks;i++){
+                if(!strcmp(toks[i],"in")){ in_idx=i; break; }
+            }
+            if(in_idx>=0 && in_idx+1<ntoks){
+                /* Dispatch remaining tokens after 'in' in the same segment */
+                dispatch_segment(toks+in_idx+1, ntoks-in_idx-1, lineno);
+            }
+            return;
         }
         if(!strcmp(kw,"in")) return;
 
