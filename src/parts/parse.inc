@@ -349,13 +349,15 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 }
             }
             /* translate as arithmetic expression, set __exit_status */
+            /* Save raw expr for re-translation at emit time */
             char arith[2100];
             snprintf(arith,sizeof(arith),"$((%s))",expr);
             char *e=translate_expr(arith);
             Node *nd=new_node(NODE_CMD,lineno);
             nd->argv=malloc(3*sizeof(char*));
             nd->argv[0]=xstrdup("__arith");
-            nd->argv[1]=xstrdup(e);
+            /* Store raw bash expression in argv[1] for re-translation at emit time */
+            nd->argv[1]=xstrdup(expr);
             nd->argc=2;
             nd->argv[2]=NULL;
             free(e);

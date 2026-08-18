@@ -1832,6 +1832,13 @@ def wrap_shell_functions(c_source: str, seed: int) -> str:
     
     print(f"[VM Protect] Wrapping {len(wrapped_funcs)} shell functions with VM dispatch")
     
+    # Generate forward declarations for mangled functions
+    forward_decls = []
+    forward_decls.append("/* Forward declarations for mangled user functions */")
+    for name in wrapped_funcs:
+        forward_decls.append(f"static void {name}(int __sh_argc, char **__sh_args);")
+    forward_decls.append("")
+    
     # Generate VM dispatch table
     dispatch_code = []
     dispatch_code.append("/* VM Function Dispatch Table — wraps user functions */")
@@ -1892,8 +1899,8 @@ def wrap_shell_functions(c_source: str, seed: int) -> str:
                 new_lines.append(new_line)
         result = '\n'.join(new_lines)
     
-    # Prepend dispatch table
-    result = '\n'.join(dispatch_code) + result
+    # Prepend forward declarations + dispatch table
+    result = '\n'.join(forward_decls) + '\n'.join(dispatch_code) + result
     
     return result
 

@@ -272,7 +272,7 @@ void expand_string(const char *s, ExpandResult *er){
                             char base[256]; int bl=k-bs;
                             memcpy(base,expr+bs,bl); base[bl]=0;
                             k=bs;
-                            const char *fn="(int)__sh_pow("; while(*fn) expr[k++]=*fn++;
+                            const char *fn="(long long)__sh_pow("; while(*fn) expr[k++]=*fn++;
                             for(int bi=0;base[bi];bi++) expr[k++]=base[bi];
                             expr[k++]=',';
                             p+=2;
@@ -287,14 +287,24 @@ void expand_string(const char *s, ExpandResult *er){
                     }
                     else if(isdigit((unsigned char)*p)){
                         /* Integer literal — copy digits and add LL suffix for 64-bit arithmetic */
-                        while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4)
-                            expr[k++]=*p++;
-                        if(*p=='.' && isdigit((unsigned char)*(p+1))){
-                            /* float literal — don't add LL */
-                            expr[k++]=*p++;
-                            while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4) expr[k++]=*p++;
-                        } else if(k<(int)sizeof(expr)-3){
-                            expr[k++]='L'; expr[k++]='L';
+                        /* Check for hex (0x) or octal (0) prefix */
+                        if(*p=='0' && (*(p+1)=='x'||*(p+1)=='X')){
+                            /* Hex literal: copy 0x prefix + hex digits */
+                            expr[k++]='0'; expr[k++]='0'; p++; /* write 00, skip the 0 */
+                            expr[k++]='x'; p++; /* write x, skip the x */
+                            while(isxdigit((unsigned char)*p) && k<(int)sizeof(expr)-4)
+                                expr[k++]=*p++;
+                            if(k<(int)sizeof(expr)-3){ expr[k++]='L'; expr[k++]='L'; }
+                        } else {
+                            while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4)
+                                expr[k++]=*p++;
+                            if(*p=='.' && isdigit((unsigned char)*(p+1))){
+                                /* float literal — don't add LL */
+                                expr[k++]=*p++;
+                                while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4) expr[k++]=*p++;
+                            } else if(k<(int)sizeof(expr)-3){
+                                expr[k++]='L'; expr[k++]='L';
+                            }
                         }
                         continue;
                     }

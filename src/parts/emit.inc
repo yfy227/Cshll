@@ -768,7 +768,15 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     const char *cmd=argv[0];
     /* internal: arithmetic command from (( expr )) */
     if(!strcmp(cmd,"__arith")&&ac>=2){
-        fprintf(out,"    __exit_status=((%s)!=0);\n",argv[1]);
+        /* ((expr)) sets exit status to 0 if expr is non-zero, 1 if zero.
+         * Re-translate the expression at emit time to pick up latest var types */
+        char *e=translate_arith(argv[1]);
+        if(e){
+            fprintf(out,"    { long long __arith_rc=(long long)(%s); __exit_status=__arith_rc?0:1; }\n",e);
+            free(e);
+        } else {
+            fprintf(out,"    __exit_status=0;\n");
+        }
         return;
     }
     if(!strcmp(cmd,"echo")){ emit_echo(out,argv,ac); return; }

@@ -689,7 +689,7 @@ char *translate_arith(const char *expr){
                     char base[256]; int bl=q-bs;
                     memcpy(base,buf+bs,bl); base[bl]=0;
                     q=bs;
-                    const char *fn="(int)__sh_pow("; while(*fn) buf[q++]=*fn++;
+                    const char *fn="(long long)__sh_pow("; while(*fn) buf[q++]=*fn++;
                     for(int bi=0;base[bi];bi++) buf[q++]=base[bi];
                     buf[q++]=',';
                     s+=2;
@@ -988,7 +988,7 @@ char *translate_expr(const char *tok){
                         char base[256]; int bl=q-bs;
                         memcpy(base,buf+bs,bl); base[bl]=0;
                         q=bs;
-                        const char *fn="(int)__sh_pow("; while(*fn) buf[q++]=*fn++;
+                        const char *fn="(long long)__sh_pow("; while(*fn) buf[q++]=*fn++;
                         for(int bi=0;base[bi];bi++) buf[q++]=base[bi];
                         buf[q++]=',';
                         s+=2;
