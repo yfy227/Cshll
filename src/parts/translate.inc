@@ -643,6 +643,41 @@ char *translate_arith(const char *expr){
                     q=bs2; /* remove dividend from buf — it'll be in the call */
                     q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                     s=np+1; continue;
+                } else if(isalpha((unsigned char)*np)||*np=='_'){
+                    /* Division/modulo by variable — use __sh_safe_div/mod to
+                     * catch runtime zero divisor (avoids SIGFPE crash) */
+                    char div_var[128]; int dvi=0;
+                    const char *dp=np;
+                    while(*dp && (isalnum((unsigned char)*dp)||*dp=='_')){
+                        if(dvi<127) div_var[dvi++]=*dp; dp++;
+                    }
+                    div_var[dvi]=0;
+                    /* Look back for dividend expression in buf */
+                    int bs2=q;
+                    while(bs2>0 && buf[bs2-1]==' ') bs2--;
+                    int ds2=bs2;
+                    if(bs2>0 && buf[bs2-1]==')'){
+                        int pd=1; int pp=bs2-1;
+                        while(pp>0 && pd>0){ pp--; if(buf[pp]==')') pd++; else if(buf[pp]=='(') pd--; }
+                        while(pp>0 && (isalnum((unsigned char)buf[pp-1])||buf[pp-1]=='_')) pp--;
+                        ds2=pp;
+                    } else {
+                        while(ds2>0 && (isalnum((unsigned char)buf[ds2-1])||buf[ds2-1]=='_')) ds2--;
+                    }
+                    char dividend[256]; int dl=0;
+                    for(int i=ds2;i<bs2&&dl<255;i++) dividend[dl++]=buf[i];
+                    dividend[dl]=0;
+                    const char *cn2=safe_cname(div_var);
+                    VarKind dvk=get_var_kind(div_var);
+                    char div_expr_c[256];
+                    if(dvk==V_STR) snprintf(div_expr_c,sizeof(div_expr_c),"atoi(%s)",cn2);
+                    else snprintf(div_expr_c,sizeof(div_expr_c),"%s",cn2);
+                    q=ds2;
+                    if(*s=='/')
+                        q+=snprintf(buf+q,sizeof(buf)-q,"__sh_safe_div(%s,%s,\"%s/%s\",\"%s\")",dividend,div_expr_c,dividend,div_var,div_var);
+                    else
+                        q+=snprintf(buf+q,sizeof(buf)-q,"__sh_safe_mod(%s,%s,\"%s%%%s\",\"%s\")",dividend,div_expr_c,dividend,div_var,div_var);
+                    s=dp; continue;
                 }
             }
             /* ** → power operator */
@@ -993,6 +1028,46 @@ char *translate_expr(const char *tok){
                         q=bs2;
                         q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                         s=np+1; continue;
+                    } else if(isalpha((unsigned char)*np)||*np=='_'){
+                        /* Division/modulo by variable — use __sh_safe_div/mod to
+                         * catch runtime zero divisor (avoids SIGFPE crash) */
+                        char div_var[128]; int dvi=0;
+                        const char *dp=np;
+                        while(*dp && (isalnum((unsigned char)*dp)||*dp=='_')){
+                            if(dvi<127) div_var[dvi++]=*dp; dp++;
+                        }
+                        div_var[dvi]=0;
+                        /* Look back for dividend expression in buf */
+                        int bs2=q;
+                        while(bs2>0 && buf[bs2-1]==' ') bs2--;
+                        int ds2=bs2; /* dividend start */
+                        if(bs2>0 && buf[bs2-1]==')'){
+                            /* Match parens to find function call start (e.g. atoi(...)) */
+                            int pd=1; int pp=bs2-1;
+                            while(pp>0 && pd>0){ pp--; if(buf[pp]==')') pd++; else if(buf[pp]=='(') pd--; }
+                            /* pp points to (, look for function name before it */
+                            while(pp>0 && (isalnum((unsigned char)buf[pp-1])||buf[pp-1]=='_')) pp--;
+                            ds2=pp;
+                        } else {
+                            while(ds2>0 && (isalnum((unsigned char)buf[ds2-1])||buf[ds2-1]=='_')) ds2--;
+                        }
+                        /* Extract dividend expression */
+                        char dividend[256]; int dl=0;
+                        for(int i=ds2;i<bs2&&dl<255;i++) dividend[dl++]=buf[i];
+                        dividend[dl]=0;
+                        /* Build divisor expression (handle string vars) */
+                        const char *cn2=safe_cname(div_var);
+                        VarKind dvk=get_var_kind(div_var);
+                        char div_expr_c[256];
+                        if(dvk==V_STR) snprintf(div_expr_c,sizeof(div_expr_c),"atoi(%s)",cn2);
+                        else snprintf(div_expr_c,sizeof(div_expr_c),"%s",cn2);
+                        /* Replace dividend in buf with safe call */
+                        q=ds2;
+                        if(*s=='/')
+                            q+=snprintf(buf+q,sizeof(buf)-q,"__sh_safe_div(%s,%s)",dividend,div_expr_c);
+                        else
+                            q+=snprintf(buf+q,sizeof(buf)-q,"__sh_safe_mod(%s,%s)",dividend,div_expr_c);
+                        s=dp; continue;
                     }
                 }
                 buf[q++]=*s++;

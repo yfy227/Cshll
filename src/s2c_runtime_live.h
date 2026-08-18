@@ -148,8 +148,8 @@ static const char *__sh_indirect_args(int argc, char **args){
   return "";
 }
 static int __sh_safe_div_guard(void){ fprintf(stderr,"division by 0\n"); __exit_status=1; return 1; }
-static int __sh_safe_div(int a,int b){ if(b==0){ fprintf(stderr,"division by 0\n"); __exit_status=1; return 0; } return a/b; }
-static int __sh_safe_mod(int a,int b){ if(b==0){ fprintf(stderr,"modulo by 0\n"); __exit_status=1; return 0; } return a%b; }
+static int __sh_safe_div(int a,int b,const char *expr,const char *token){ if(b==0){ fprintf(stderr,"%s: line %d: %s: division by 0 (error token is \"%s\")\n",__sh_script_name[0]?__sh_script_name:"shell2c",__sh_lineno,expr?expr:"0",token?token:"0"); __exit_status=1; __sh_div_error=1; return 0; } return a/b; }
+static int __sh_safe_mod(int a,int b,const char *expr,const char *token){ if(b==0){ fprintf(stderr,"%s: line %d: %s: modulo by 0 (error token is \"%s\")\n",__sh_script_name[0]?__sh_script_name:"shell2c",__sh_lineno,expr?expr:"0",token?token:"0"); __exit_status=1; __sh_div_error=1; return 0; } return a%b; }
 static int __sh_arr_count(const char **arr){
   int n=0; for(int i=0;i<256;i++) if(arr[i]) n++; return n;
 }

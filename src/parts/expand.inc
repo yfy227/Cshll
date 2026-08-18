@@ -110,13 +110,13 @@ void expand_string(const char *s, ExpandResult *er){
                                             char *t=translate_arith(arg);
                                             if(t){
                                                 if(nargs>0) argbuf[abi++]=',';
-                                                const char *pre="__sh_fmt(\"%d\",";
+                                                const char *pre="__sh_fmt(\"%lld\",(long long)(";
                                                 while(*pre && abi<(int)sizeof(argbuf)-32) argbuf[abi++]=*pre++;
                                                 for(int ai=0;t[ai]&&abi<(int)sizeof(argbuf)-8;ai++){
                                                     if(t[ai]=='"') argbuf[abi++]='\\';
                                                     argbuf[abi++]=t[ai];
                                                 }
-                                                argbuf[abi++]=')'; nargs++;
+                                                argbuf[abi++]=')'; argbuf[abi++]=')'; nargs++;
                                                 free(t);
                                             }
                                             while(*ap==')') ap++;
@@ -285,6 +285,19 @@ void expand_string(const char *s, ExpandResult *er){
                             expr[k++]='*'; p+=2;
                         }
                     }
+                    else if(isdigit((unsigned char)*p)){
+                        /* Integer literal — copy digits and add LL suffix for 64-bit arithmetic */
+                        while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4)
+                            expr[k++]=*p++;
+                        if(*p=='.' && isdigit((unsigned char)*(p+1))){
+                            /* float literal — don't add LL */
+                            expr[k++]=*p++;
+                            while(isdigit((unsigned char)*p) && k<(int)sizeof(expr)-4) expr[k++]=*p++;
+                        } else if(k<(int)sizeof(expr)-3){
+                            expr[k++]='L'; expr[k++]='L';
+                        }
+                        continue;
+                    }
                     else {
                         /* Detect /0 or %0 — emit runtime error + safe fallback */
                         if((*p=='/'||*p=='%')){
@@ -293,21 +306,63 @@ void expand_string(const char *s, ExpandResult *er){
                             if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
                                 /* Build expression string for error message */
                                 char div_expr[64]; int di2=0;
-                                int bs2=k; while(bs2>0 && (isdigit((unsigned char)expr[bs2-1])||expr[bs2-1]==' ')) bs2--;
-                                /* copy dividend, skipping trailing spaces */
+                                int bs2=k;
+                                /* Skip trailing spaces first */
+                                while(bs2>0 && expr[bs2-1]==' ') bs2--;
+                                /* Skip LL suffix if present */
+                                while(bs2>0 && expr[bs2-1]=='L') bs2--;
+                                while(bs2>0 && (isdigit((unsigned char)expr[bs2-1])||expr[bs2-1]==' ')) bs2--;
+                                /* copy dividend, skipping trailing spaces and LL suffix */
                                 int be2=bs2;
                                 while(be2<k){
                                     int end2=be2; while(end2<k && expr[end2]==' ') end2++;
                                     if(end2>=k) break;
-                                    while(end2<k && expr[end2]!=' ') div_expr[di2++]=expr[end2++];
+                                    while(end2<k && expr[end2]!=' ' && expr[end2]!='L') div_expr[di2++]=expr[end2++];
+                                    if(end2<k && expr[end2]=='L') { end2++; while(end2<k && expr[end2]=='L') end2++; }
                                     be2=end2;
                                     if(be2<k && expr[be2]==' ') { /* skip one space */ }
                                     be2++;
                                 }
                                 div_expr[di2++]=' '; div_expr[di2++]=*p; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
                                 k=bs2;
-                                k+=snprintf(expr+k,sizeof(expr)-k,"(__sh_div_zero(\"%s\"),1)",div_expr);
+                                k+=snprintf(expr+k,sizeof(expr)-k,"(__sh_div_zero(\"%s\"),1LL)",div_expr);
                                 p=np+1; continue;
+                            } else if(isalpha((unsigned char)*np)||*np=='_'){
+                                /* Division/modulo by variable — use __sh_safe_div/mod */
+                                char div_var[128]; int dvi=0;
+                                const char *dp=np;
+                                while(*dp && (isalnum((unsigned char)*dp)||*dp=='_')){
+                                    if(dvi<127) div_var[dvi++]=*dp; dp++;
+                                }
+                                div_var[dvi]=0;
+                                /* Look back for dividend in expr */
+                                int bs2=k;
+                                while(bs2>0 && expr[bs2-1]=='L') bs2--; /* skip LL suffix */
+                                while(bs2>0 && expr[bs2-1]==' ') bs2--;
+                                int ds2=bs2;
+                                if(bs2>0 && expr[bs2-1]==')'){
+                                    int pd=1; int pp=bs2-1;
+                                    while(pp>0 && pd>0){ pp--; if(expr[pp]==')') pd++; else if(expr[pp]=='(') pd--; }
+                                    while(pp>0 && (isalnum((unsigned char)expr[pp-1])||expr[pp-1]=='_')) pp--;
+                                    ds2=pp;
+                                } else {
+                                    while(ds2>0 && (isalnum((unsigned char)expr[ds2-1])||expr[ds2-1]=='_')) ds2--;
+                                }
+                                char dividend[256]; int dl=0;
+                                for(int i=ds2;i<bs2&&dl<255;i++) dividend[dl++]=expr[i];
+                                dividend[dl]=0;
+                                /* Determine if var is string or int */
+                                VarKind dvk=get_var_kind(div_var);
+                                const char *cn2=safe_cname(div_var);
+                                char div_expr_c[256];
+                                if(dvk==V_STR) snprintf(div_expr_c,sizeof(div_expr_c),"atoi(%s)",cn2);
+                                else snprintf(div_expr_c,sizeof(div_expr_c),"%s",cn2);
+                                k=ds2;
+                                if(*p=='/')
+                                    k+=snprintf(expr+k,sizeof(expr)-k,"(long)__sh_safe_div(%s,%s,\"%s/%s\",\"%s\")",dividend,div_expr_c,dividend,div_var,div_var);
+                                else
+                                    k+=snprintf(expr+k,sizeof(expr)-k,"(long)__sh_safe_mod(%s,%s,\"%s%%%s\",\"%s\")",dividend,div_expr_c,dividend,div_var,div_var);
+                                p=dp; continue;
                             }
                         }
                         expr[k++]=*p++;
@@ -315,9 +370,11 @@ void expand_string(const char *s, ExpandResult *er){
                     if(k>=(int)sizeof(expr)-2) break;
                 }
                 expr[k]=0;
-                fmt[fi++]='%'; fmt[fi++]='d';
+                fmt[fi++]='%'; fmt[fi++]='l'; fmt[fi++]='l'; fmt[fi++]='d';
                 if(er->nargs<EXPAND_MAX_ARGS){
-                    er->args[er->nargs]=xstrdup(expr);
+                    char *expr_ll=malloc(strlen(expr)+24);
+                    sprintf(expr_ll,"(long long)(%s)",expr);
+                    er->args[er->nargs]=expr_ll;
                     er->arg_is_int[er->nargs++]=1;
                 }
             } else {
@@ -361,7 +418,7 @@ void expand_string(const char *s, ExpandResult *er){
                         if(arg[0]=='$' && arg[1]=='(' && arg[2]=='('){
                             /* $((expr)) — int result, convert to string via __sh_fmt */
                             char *e=translate_expr(arg);
-                            ai += snprintf(args+ai,sizeof(args)-ai,"__sh_fmt(\"%%d\",(int)(%s)),",e);
+                            ai += snprintf(args+ai,sizeof(args)-ai,"__sh_fmt(\"%%lld\",(long long)(%s)),",e);
                             free(e);
                         } else if(arg[0]=='$' && arg[1]=='('){
                             /* $(cmd) — string result */
