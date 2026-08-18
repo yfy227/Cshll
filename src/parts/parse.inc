@@ -840,13 +840,12 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
             Node *nd=new_node(NODE_ASSIGN,lineno);
             nd->lhs=xstrdup(toks[0]);
             if(is_append){
-                /* For -=, *=, /=, %= — bash doesn't support these, emit as command */
+                /* For -=, *=, /=, %= — bash doesn't support these, emit error */
                 if(append_op > 0){
-                    /* bash: x-=3 → "x-=3: command not found" */
-                    /* Emit as failed command */
+                    /* bash: x-=3 → "script: line N: x-=3: command not found" */
                     char cmd[4200];
                     snprintf(cmd,sizeof(cmd),"%s",toks[0]);
-                    const char *ops[]={"","+","-","*","/","%"};
+                    const char *ops[]={"+","-","*","/","%"};
                     char full_op[8]; snprintf(full_op,sizeof(full_op),"%s=",ops[append_op]);
                     strncat(cmd,full_op,sizeof(cmd)-strlen(cmd)-1);
                     strncat(cmd,eq+1,sizeof(cmd)-strlen(cmd)-1);
@@ -855,13 +854,10 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                         strncat(cmd," ",sizeof(cmd)-strlen(cmd)-1);
                         strncat(cmd,toks[i],sizeof(cmd)-strlen(cmd)-1);
                     }
-                    Node *nd2=new_node(NODE_CMD,lineno);
-                    nd2->argv=malloc(2*sizeof(char*));
-                    nd2->argv[0]=xstrdup(cmd);
-                    nd2->argv[1]=NULL;
-                    nd2->argc=1;
-                    parser_append(nd2);
-                    free(nd->lhs); free(nd);
+                    /* Emit as NODE_ASSIGN with lineno=-5 to signal "command not found" */
+                    nd->rhs=xstrdup(cmd);
+                    nd->lineno = -lineno - 1000; /* encode original lineno as negative */
+                    parser_append(nd);
                     return;
                 }
                 /* arr+=value — append to variable */

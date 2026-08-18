@@ -1855,6 +1855,8 @@ void emit_command(FILE *out, char **argv, int ac, int id){
 
 void emit_node(FILE *out, Node *n){
     if(!n) return;
+    /* Track line number for error reporting (e.g. division by zero) */
+    if(n->lineno > 0) fprintf(out, "    __sh_lineno=%d;\n", n->lineno);
     switch(n->type){
 
     case NODE_ASSIGN:{
@@ -1986,6 +1988,13 @@ void emit_node(FILE *out, Node *n){
             char *e=translate_arith(n->rhs);
             fprintf(out,"    %s=(%s);\n",cn,e);
             free(e);
+            break;
+        }
+        if(n->lineno < -1000){
+            /* command not found error: x-=3 → "script: line N: x-=3: command not found" */
+            int orig_lineno = -n->lineno - 1000;
+            fprintf(out,"    fprintf(stderr,\"%%s: line %%d: %%s: command not found\\n\",__sh_script_name[0]?__sh_script_name:\"shell2c\",%d,\"%s\");\n",orig_lineno,n->rhs?n->rhs:"");
+            fprintf(out,"    __exit_status=127;\n");
             break;
         }
         if(n->lineno==-2){

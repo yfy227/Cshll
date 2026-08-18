@@ -179,7 +179,7 @@ fruits=(apple banana cherry date elderberry)
 for f in "${fruits[@]}"; do
     echo "fruit: $f"
 done
-echo "count=${#fruits[@]}
+echo "count=${#fruits[@]}"
 echo "last=${fruits[-1]}"'
 
 stress_test "S67_array_slice" '

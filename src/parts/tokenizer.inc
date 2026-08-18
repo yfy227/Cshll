@@ -83,8 +83,19 @@ int tokenize(const char *line, char **toks, int maxtoks){
             if(*p=='"') p++;
             /* consume trailing bare chars (e.g. } after "str"}) */
             while(*p && !isspace((unsigned char)*p) && *p!=';' && *p!='|' && *p!='&'
-                   && *p!='<' && *p!='>' && *p!='(' && *p!=')' && *p!='[' && *p!=']')
+                   && *p!='<' && *p!='>' && *p!='(' && *p!=')' && *p!='[' && *p!=']'){
+                /* Skip ${...} as a unit so ${arr[-1]} isn't split at [ */
+                if(*p=='$' && *(p+1)=='{'){
+                    p+=2; int bd=1;
+                    while(*p&&bd){
+                        if(*p=='{')bd++; else if(*p=='}')bd--;
+                        if(bd>0) p++;
+                    }
+                    if(*p=='}') p++;
+                    continue;
+                }
                 p++;
+            }
             toks[n++]=pool_dup(s,(int)(p-s)); continue;
         }
         /* Note: standalone single-quoted strings are handled by the bare word

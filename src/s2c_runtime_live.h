@@ -39,6 +39,8 @@ static int __sh_pipestatus[16]={0};
 static int __sh_shlvl=1;
 static unsigned int __sh_rand_seed=0;
 static time_t __sh_start_time=0;
+static int __sh_div_error = 0;
+static char __sh_script_name[65536]="";
 /* __sh_getenv_special: resolve bash special vars (uses static buffer, no pool dependency) */
 static const char *__sh_special_var(const char *name){
   static char __sv_buf[256];
@@ -167,9 +169,8 @@ static long __sh_pow(long base,long exp){
   long r=1; while(exp-->0) r*=base; return r;
 }
 static int __sh_div_zero(const char *expr){
-  (void)expr;
-  fprintf(stderr,"shell2c: division by zero\n");
-  __exit_status=1;
+  fprintf(stderr,"%s: line %d: %s: division by 0 (error token is \"0\")\n",__sh_script_name[0]?__sh_script_name:"shell2c",__sh_lineno,expr?expr:"0");
+  __exit_status=1; __sh_div_error=1;
   return 0;
 }
 static const char *__sh_arr_slice(const char **arr,int off,int len){

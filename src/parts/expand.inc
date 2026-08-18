@@ -294,7 +294,16 @@ void expand_string(const char *s, ExpandResult *er){
                                 /* Build expression string for error message */
                                 char div_expr[64]; int di2=0;
                                 int bs2=k; while(bs2>0 && (isdigit((unsigned char)expr[bs2-1])||expr[bs2-1]==' ')) bs2--;
-                                int be2=bs2; while(be2<k) div_expr[di2++]=expr[be2++];
+                                /* copy dividend, skipping trailing spaces */
+                                int be2=bs2;
+                                while(be2<k){
+                                    int end2=be2; while(end2<k && expr[end2]==' ') end2++;
+                                    if(end2>=k) break;
+                                    while(end2<k && expr[end2]!=' ') div_expr[di2++]=expr[end2++];
+                                    be2=end2;
+                                    if(be2<k && expr[be2]==' ') { /* skip one space */ }
+                                    be2++;
+                                }
                                 div_expr[di2++]=' '; div_expr[di2++]=*p; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
                                 k=bs2;
                                 k+=snprintf(expr+k,sizeof(expr)-k,"(__sh_div_zero(\"%s\"),1)",div_expr);

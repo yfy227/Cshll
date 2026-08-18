@@ -371,6 +371,9 @@ static void *transpile_thread(void *arg){
     fprintf(fout,"    __sh_args = _argv + 1;\n");
     for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
+    /* Set script name for error messages (bash uses $0 = script path) */
+    fprintf(fout,"    strncpy(__sh_script_name, _argv[0], 65530);\n");
+    fprintf(fout,"    { int _snl=(int)strlen(__sh_script_name); if(_snl>0 && _snl<65530){ if(__sh_script_name[_snl-3]!='.' || __sh_script_name[_snl-2]!='s' || __sh_script_name[_snl-1]!='h'){ __sh_script_name[_snl]='.'; __sh_script_name[_snl+1]='s'; __sh_script_name[_snl+2]='h'; __sh_script_name[_snl+3]=0; } } }\n");
     fprintf(fout,"\n");
     emit_node(fout,script);
     /* Inject dead code decoys if obfuscation is enabled */

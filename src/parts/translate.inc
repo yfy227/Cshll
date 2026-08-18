@@ -94,9 +94,9 @@ char *translate_brace_expansion(const char *body){
                 /* Check for negative index: ${arr[-1]} → arr[arr_count-1] */
                 if(idx[0]=='-' && isdigit((unsigned char)idx[1])){
                     /* Negative index: __arr_<name>[__sh_arr_count(__arr_<name>)-N] */
-                    snprintf(r,sizeof(r),"__arr_%s[__sh_arr_count(__arr_%s)%s]",safe_cname(name),safe_cname(name),idx);
+                    snprintf(r,sizeof(r),"(__arr_%s[__sh_arr_count(__arr_%s)%s]?__arr_%s[__sh_arr_count(__arr_%s)%s]:\"\")",safe_cname(name),safe_cname(name),idx,safe_cname(name),safe_cname(name),idx);
                 } else {
-                    snprintf(r,sizeof(r),"__arr_%s[%s]",safe_cname(name),idx);
+                    snprintf(r,sizeof(r),"(__arr_%s[%s]?__arr_%s[%s]:\"\")",safe_cname(name),idx,safe_cname(name),idx);
                 }
             } else {
                 /* String key — use associative lookup */
@@ -166,7 +166,12 @@ char *translate_brace_expansion(const char *body){
             if(def_expanded){
                 def_val = def_expanded;
             } else {
-                snprintf(def_buf,sizeof(def_buf),"\"%s\"",def);
+                /* Strip surrounding quotes if present (e.g. ${x:-"default"}) */
+                char *def_start=def; int def_len=strlen(def);
+                if(def_len>=2 && ((def[0]=='"'&&def[def_len-1]=='"') || (def[0]=='\''&&def[def_len-1]=='\''))){
+                    def_start=def+1; def_len-=2;
+                }
+                snprintf(def_buf,sizeof(def_buf),"\"%.*s\"",def_len,def_start);
                 def_val = def_buf;
             }
             switch(op){
@@ -215,20 +220,116 @@ char *translate_brace_expansion(const char *body){
     /* ${var#pattern}  ${var##pattern} — prefix removal */
     if(*p=='#'){
         int greedy=(*(p+1)=='#'); if(greedy) p++;
-        p++; char pat[128]; int k=0;
-        while(*p && *p!='}') pat[k++]=*p++;
+        p++; char pat[256]; int k=0;
+        int bd=0;
+        while(*p && !(*p=='}' && bd==0)){
+            if(*p=='{') bd++;
+            else if(*p=='}') bd--;
+            if(k<(int)sizeof(pat)-1) pat[k++]=*p;
+            p++;
+        }
         pat[k]=0; if(*p) p++;
         char r[512];
+        /* Check if pattern contains ${...} — needs runtime evaluation */
+        if(strstr(pat,"${")){
+            /* Strip surrounding double quotes if present */
+            char ipat[256]; strncpy(ipat,pat,sizeof(ipat)-1); ipat[sizeof(ipat)-1]=0;
+            if(ipat[0]=='"'){
+                int pl=strlen(ipat);
+                if(pl>1 && ipat[pl-1]=='"'){ ipat[pl-1]=0; memmove(ipat,ipat+1,strlen(ipat)); }
+            }
+            /* If entire pattern is ${...} — translate directly */
+            int il=strlen(ipat);
+            if(ipat[0]=='$' && ipat[1]=='{' && il>3 && ipat[il-1]=='}'){
+                char ibody[256]; int ilen=il-3;
+                strncpy(ibody,ipat+2,ilen); ibody[ilen]=0;
+                char *e2=translate_brace_expansion(ibody);
+                if(e2){
+                    snprintf(r,sizeof(r),"__sh_strip_prefix(%s,%s,%d)",safe_cname(name),e2,greedy);
+                    free(e2);
+                    return xstrdup(r);
+                }
+            }
+            /* Mixed pattern — use expand_string + __sh_fmt */
+            ExpandResult er; expand_string(pat,&er);
+            if(er.nargs>0){
+                char args_buf[1024]; int ai=0;
+                for(int i=0;i<er.nargs && ai<(int)sizeof(args_buf)-16;i++){
+                    if(i>0) args_buf[ai++]=',';
+                    int al=strlen(er.args[i]);
+                    if(ai+al<(int)sizeof(args_buf)-8){ memcpy(args_buf+ai,er.args[i],al); ai+=al; }
+                }
+                args_buf[ai]=0;
+                /* Escape format string for C string literal */
+                char esc_fmt[512]; int ei=0;
+                for(const char *fp=er.fmt;*fp && ei<(int)sizeof(esc_fmt)-4;fp++){
+                    if(*fp=='"'||*fp=='\\') esc_fmt[ei++]='\\';
+                    esc_fmt[ei++]=*fp;
+                }
+                esc_fmt[ei]=0;
+                snprintf(r,sizeof(r),"__sh_strip_prefix(%s,__sh_fmt(\"%s\",%s),%d)",
+                    safe_cname(name),esc_fmt,args_buf,greedy);
+                expand_free(&er);
+                return xstrdup(r);
+            }
+            expand_free(&er);
+        }
         snprintf(r,sizeof(r),"__sh_strip_prefix(%s,\"%s\",%d)",safe_cname(name),pat,greedy);
         return xstrdup(r);
     }
     /* ${var%pattern}  ${var%%pattern} — suffix removal */
     if(*p=='%'){
         int greedy=(*(p+1)=='%'); if(greedy) p++;
-        p++; char pat[128]; int k=0;
-        while(*p && *p!='}') pat[k++]=*p++;
+        p++; char pat[256]; int k=0;
+        int bd=0;
+        while(*p && !(*p=='}' && bd==0)){
+            if(*p=='{') bd++;
+            else if(*p=='}') bd--;
+            if(k<(int)sizeof(pat)-1) pat[k++]=*p;
+            p++;
+        }
         pat[k]=0; if(*p) p++;
         char r[512];
+        /* Check if pattern contains ${...} — needs runtime evaluation */
+        if(strstr(pat,"${")){
+            char ipat[256]; strncpy(ipat,pat,sizeof(ipat)-1); ipat[sizeof(ipat)-1]=0;
+            if(ipat[0]=='"'){
+                int pl=strlen(ipat);
+                if(pl>1 && ipat[pl-1]=='"'){ ipat[pl-1]=0; memmove(ipat,ipat+1,strlen(ipat)); }
+            }
+            int il=strlen(ipat);
+            if(ipat[0]=='$' && ipat[1]=='{' && il>3 && ipat[il-1]=='}'){
+                char ibody[256]; int ilen=il-3;
+                strncpy(ibody,ipat+2,ilen); ibody[ilen]=0;
+                char *e2=translate_brace_expansion(ibody);
+                if(e2){
+                    snprintf(r,sizeof(r),"__sh_strip_suffix(%s,%s,%d)",safe_cname(name),e2,greedy);
+                    free(e2);
+                    return xstrdup(r);
+                }
+            }
+            ExpandResult er; expand_string(pat,&er);
+            if(er.nargs>0){
+                char args_buf[1024]; int ai=0;
+                for(int i=0;i<er.nargs && ai<(int)sizeof(args_buf)-16;i++){
+                    if(i>0) args_buf[ai++]=',';
+                    int al=strlen(er.args[i]);
+                    if(ai+al<(int)sizeof(args_buf)-8){ memcpy(args_buf+ai,er.args[i],al); ai+=al; }
+                }
+                args_buf[ai]=0;
+                char esc_fmt[512]; int ei=0;
+                for(const char *fp=er.fmt;*fp && ei<(int)sizeof(esc_fmt)-4;fp++){
+                    if(*fp=='"'||*fp=='\\') esc_fmt[ei++]='\\';
+                    esc_fmt[ei++]=*fp;
+                }
+                esc_fmt[ei]=0;
+                snprintf(r,sizeof(r),"__sh_strip_suffix(%s,__sh_fmt(\"%s\",%s),%d)",
+                    safe_cname(name),esc_fmt,args_buf,greedy);
+                expand_free(&er);
+                return xstrdup(r);
+            }
+            expand_free(&er);
+        }
         snprintf(r,sizeof(r),"__sh_strip_suffix(%s,\"%s\",%d)",safe_cname(name),pat,greedy);
         return xstrdup(r);
     }
@@ -528,7 +629,16 @@ char *translate_arith(const char *expr){
                     char div_expr[64]; int di2=0;
                     /* Look back to find the dividend */
                     int bs2=q; while(bs2>0 && (isdigit((unsigned char)buf[bs2-1])||buf[bs2-1]==' ')) bs2--;
-                    int be2=bs2; while(be2<q) div_expr[di2++]=buf[be2++];
+                    /* copy dividend, skipping trailing spaces */
+                    int be2=bs2;
+                    while(be2<q){
+                        int end2=be2; while(end2<q && buf[end2]==' ') end2++; /* skip leading spaces */
+                        if(end2>=q) break;
+                        while(end2<q && buf[end2]!=' ') div_expr[di2++]=buf[end2++];
+                        be2=end2;
+                        if(be2<q && buf[be2]==' ') { /* skip one space between tokens */ }
+                        be2++;
+                    }
                     div_expr[di2++]=' '; div_expr[di2++]=*s; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
                     q=bs2; /* remove dividend from buf — it'll be in the call */
                     q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
