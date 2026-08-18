@@ -291,11 +291,13 @@ void expand_string(const char *s, ExpandResult *er){
                             const char *np=p+1;
                             while(*np==' '||*np=='\t') np++;
                             if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
-                                expr[k++]=*p; expr[k++]='('; expr[k++]='_'; expr[k++]='_';
-                                expr[k++]='s'; expr[k++]='h'; expr[k++]='_'; expr[k++]='d';
-                                expr[k++]='i'; expr[k++]='v'; expr[k++]='_'; expr[k++]='z';
-                                expr[k++]='e'; expr[k++]='r'; expr[k++]='o'; expr[k++]='(';
-                                expr[k++]=')'; expr[k++]=','; expr[k++]='1'; expr[k++]=')';
+                                /* Build expression string for error message */
+                                char div_expr[64]; int di2=0;
+                                int bs2=k; while(bs2>0 && (isdigit((unsigned char)expr[bs2-1])||expr[bs2-1]==' ')) bs2--;
+                                int be2=bs2; while(be2<k) div_expr[di2++]=expr[be2++];
+                                div_expr[di2++]=' '; div_expr[di2++]=*p; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                                k=bs2;
+                                k+=snprintf(expr+k,sizeof(expr)-k,"(__sh_div_zero(\"%s\"),1)",div_expr);
                                 p=np+1; continue;
                             }
                         }

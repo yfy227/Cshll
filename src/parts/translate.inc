@@ -870,13 +870,18 @@ char *translate_expr(const char *tok){
                 if((*s=='&'&&*(s+1)=='&')||(*s=='|'&&*(s+1)=='|')){
                     buf[q++]=*s++; buf[q++]=*s++; continue;
                 }
-                /* Detect division/modulo by zero — replace /0 with (1/(!0)) which is
-                 * a no-op that avoids SIGFPE. Set exit_status. */
+                /* Detect division/modulo by zero — emit runtime error + safe fallback */
                 if(*s=='/'||*s=='%'){
                     const char *np=s+1;
                     while(*np==' '||*np=='\t') np++;
                     if(*np=='0' && !isdigit((unsigned char)*(np+1)) && *(np+1)!='x' && *(np+1)!='X'){
-                        q+=snprintf(buf+q,sizeof(buf)-q,"/1");
+                        /* Build expression string for error message */
+                        char div_expr[64]; int di2=0;
+                        int bs2=q; while(bs2>0 && (isdigit((unsigned char)buf[bs2-1])||buf[bs2-1]==' ')) bs2--;
+                        int be2=bs2; while(be2<q) div_expr[di2++]=buf[be2++];
+                        div_expr[di2++]=' '; div_expr[di2++]=*s; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                        q=bs2;
+                        q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                         s=np+1; continue;
                     }
                 }

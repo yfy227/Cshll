@@ -1989,11 +1989,15 @@ void emit_node(FILE *out, Node *n){
             break;
         }
         if(n->lineno==-2){
-            /* string append: var+=value — bash always does string concat for non-declare-i vars */
-            /* Force V_STR so variable is declared as char[] not int */
-            add_var(n->lhs,V_STR);
+            /* string append: var+=value — bash does string concat for str vars, arith add for int vars */
+            VarKind vk = get_var_kind(n->lhs);
             const char *cn=safe_cname(n->lhs);
-            if(strchr(n->rhs,'$')){
+            if(vk==V_INT){
+                /* declare -i var: n+=5 → n = n + 5 (arithmetic) */
+                char *e=translate_num_operand(n->rhs);
+                fprintf(out,"    %s+=%s;\n",cn,e);
+                free(e);
+            } else if(strchr(n->rhs,'$')){
                 ExpandResult er; expand_string(n->rhs,&er);
                 fprintf(out,"    strncat(%s,",cn);
                 /* build temp string */

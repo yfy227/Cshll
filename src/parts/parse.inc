@@ -884,8 +884,9 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                     /* mark as append */
                     nd->lineno = -1; /* use lineno=-1 to signal append */
                 } else {
-                    /* string/numeric append */
-                    add_var(nd->lhs,V_STR);
+                    /* string/numeric append — preserve V_INT if already declared as int */
+                    VarKind existing_vk = get_var_kind(nd->lhs);
+                    if(existing_vk != V_INT) add_var(nd->lhs,V_STR);
                     nd->rhs=xstrdup(rhs);
                     nd->lineno = -2; /* signal string append */
                 }

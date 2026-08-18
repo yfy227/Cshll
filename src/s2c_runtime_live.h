@@ -166,7 +166,8 @@ static long __sh_pow(long base,long exp){
   if(exp<0) return 0;
   long r=1; while(exp-->0) r*=base; return r;
 }
-static int __sh_div_zero(void){
+static int __sh_div_zero(const char *expr){
+  (void)expr;
   fprintf(stderr,"shell2c: division by zero\n");
   __exit_status=1;
   return 0;
