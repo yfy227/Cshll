@@ -752,14 +752,19 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                     *eq=0;
                     if(is_array || (eq[1]=='('))
                         add_var(nd->argv[j],V_ARRAY);
-                    else if(is_int)
+                    else if(is_int){
                         add_var(nd->argv[j],V_INT);
+                        set_declared_int(nd->argv[j]);
+                    }
                     else
                         add_var(nd->argv[j],V_STR);
                     *eq='=';
                 } else {
                     if(is_array) add_var(nd->argv[j],V_ARRAY);
-                    else if(is_int) add_var(nd->argv[j],V_INT);
+                    else if(is_int){
+                        add_var(nd->argv[j],V_INT);
+                        set_declared_int(nd->argv[j]);
+                    }
                     else add_var(nd->argv[j],V_STR);
                 }
             }
@@ -884,9 +889,9 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                     /* mark as append */
                     nd->lineno = -1; /* use lineno=-1 to signal append */
                 } else {
-                    /* string/numeric append — preserve V_INT if already declared as int */
-                    VarKind existing_vk = get_var_kind(nd->lhs);
-                    if(existing_vk != V_INT) add_var(nd->lhs,V_STR);
+                    /* string/numeric append — bash: x+=val does string concat
+                     * unless x was declared with declare -i */
+                    if(!is_declared_int(nd->lhs)) add_var(nd->lhs,V_STR);
                     nd->rhs=xstrdup(rhs);
                     nd->lineno = -2; /* signal string append */
                 }

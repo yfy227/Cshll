@@ -9,7 +9,7 @@
 #include "s2c_common.h"
 
 typedef enum { V_INT, V_STR, V_ARRAY, V_UNKNOWN } VarKind;
-typedef struct { char name[128]; VarKind kind; int is_local; } VarInfo;
+typedef struct { char name[128]; VarKind kind; int is_local; int is_decl_int; } VarInfo;
 
 #define MAX_VARS 16384
 extern VarInfo var_table[MAX_VARS];
@@ -18,6 +18,8 @@ extern int var_count;
 void add_var(const char *name, VarKind k);
 VarKind get_var_kind(const char *name);
 int is_known_var(const char *name);
+int is_declared_int(const char *name);
+void set_declared_int(const char *name);
 const char *var_c_expr(const char *name);
 
 /* Function table */

@@ -125,6 +125,7 @@ void add_var(const char *name, VarKind k){
     var_table[var_count].name[127]=0;
     var_table[var_count].kind=k;
     var_table[var_count].is_local=0;
+    var_table[var_count].is_decl_int=0;
     var_count++;
 }
 VarKind get_var_kind(const char *name){
@@ -138,6 +139,29 @@ int is_known_var(const char *name){
     for(int i=0;i<var_count;i++)
         if(strcmp(var_table[i].name,name)==0) return 1;
     return 0;
+}
+int is_declared_int(const char *name){
+    if(!name) return 0;
+    for(int i=0;i<var_count;i++)
+        if(strcmp(var_table[i].name,name)==0) return var_table[i].is_decl_int;
+    return 0;
+}
+void set_declared_int(const char *name){
+    if(!name||!*name) return;
+    for(int i=0;i<var_count;i++){
+        if(strcmp(var_table[i].name,name)==0){
+            var_table[i].is_decl_int=1;
+            return;
+        }
+    }
+    /* not found — create as V_INT with decl_int flag */
+    if(var_count>=MAX_VARS) return;
+    strncpy(var_table[var_count].name,name,127);
+    var_table[var_count].name[127]=0;
+    var_table[var_count].kind=V_INT;
+    var_table[var_count].is_local=0;
+    var_table[var_count].is_decl_int=1;
+    var_count++;
 }
 const char *var_c_expr(const char *name){
     if(is_known_var(name)) return safe_cname(name);
