@@ -93,8 +93,16 @@ char *translate_brace_expansion(const char *body){
             if(is_numeric && idx[0]){
                 /* Check for negative index: ${arr[-1]} → arr[arr_count-1] */
                 if(idx[0]=='-' && isdigit((unsigned char)idx[1])){
-                    /* Negative index: __arr_<name>[__sh_arr_count(__arr_<name>)-N] */
-                    snprintf(r,sizeof(r),"(__arr_%s[__sh_arr_count(__arr_%s)%s]?__arr_%s[__sh_arr_count(__arr_%s)%s]:\"\")",safe_cname(name),safe_cname(name),idx,safe_cname(name),safe_cname(name),idx);
+                    /* Negative index with bounds check: if count+idx<0, "bad array subscript" */
+                    snprintf(r,sizeof(r),
+                        "((__sh_arr_count(__arr_%s)+(%s)>=0)"
+                        "?(__arr_%s[__sh_arr_count(__arr_%s)+(%s)]?__arr_%s[__sh_arr_count(__arr_%s)+(%s)]:\"\")"
+                        ":(fprintf(stderr,\"%%s: line %%d: %s: bad array subscript\\n\","
+                        "__sh_script_name[0]?__sh_script_name:\"shell2c\",__sh_lineno),\"\"))",
+                        safe_cname(name),idx,
+                        safe_cname(name),safe_cname(name),idx,
+                        safe_cname(name),safe_cname(name),idx,
+                        name);
                 } else {
                     snprintf(r,sizeof(r),"(__arr_%s[%s]?__arr_%s[%s]:\"\")",safe_cname(name),idx,safe_cname(name),idx);
                 }
