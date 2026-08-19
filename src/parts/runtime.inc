@@ -442,6 +442,8 @@ const char *RT_HEADER =
 "      else if(*p=='o'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%so\",mods); printf(f,s?atoi(s):0); }\n"
 "      else if(*p=='f'||*p=='e'||*p=='g'||*p=='E'||*p=='G'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),\"%%%sf\",mods); printf(f,s?atof(s):0.0); }\n"
 "      else if(*p=='%'){ putchar('%'); }\n"
+"      else if(*p=='b'){ const char *s=va_arg(ap,const char*); /* %b: interpret backslash escapes */ __sh_echo_escape(s?s:\"\"); }\n"
+"      else if(*p=='q'){ const char *s=va_arg(ap,const char*); /* %q: shell-escape — single-quote */ putchar('\\''); if(s){while(*s){if(*s=='\\'')fputs(\"'\\\\''\",stdout);else putchar(*s);s++;}}putchar('\\''); }\n"
 "      else { putchar('%'); fputs(mods,stdout); putchar(*p); }\n"
 "    } else { putchar(*p); }\n"
 "    p++;\n"

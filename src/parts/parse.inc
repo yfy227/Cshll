@@ -910,6 +910,22 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 parser_append(nd); return;
             }
             char rhs[4096]=""; strncpy(rhs,eq+1,4095);
+            /* Convert $'...' ANSI-C quoting to $(echo -e "...") */
+            if(rhs[0]=='$' && rhs[1]=='\''){
+                char raw[2048]; int ri=0; const char *sp=rhs+2;
+                while(*sp && *sp!='\'' && ri<(int)sizeof(raw)-1){
+                    if(*sp=='\\' && *(sp+1)=='\''){ raw[ri++]='\''; sp+=2; }
+                    else { raw[ri++]=*sp++; }
+                }
+                raw[ri]=0;
+                snprintf(rhs,sizeof(rhs),"$(printf '%%b' \"");
+                for(int i=0;raw[i]&&strlen(rhs)<sizeof(rhs)-4;i++){
+                    if(raw[i]=='"'){ strncat(rhs,"\\\"",sizeof(rhs)-strlen(rhs)-1); }
+                    else if(raw[i]=='\\'){ strncat(rhs,"\\\\",sizeof(rhs)-strlen(rhs)-1); }
+                    else { char tmp[2]={raw[i],0}; strncat(rhs,tmp,sizeof(rhs)-strlen(rhs)-1); }
+                }
+                strncat(rhs,"\")",sizeof(rhs)-strlen(rhs)-1);
+            }
             int is_arr=(rhs[0]=='(')||(rhs[0]=='\0'&&ntoks>1&&!strcmp(toks[1],"("));
             if(is_arr){
                 char arr_rhs[4096]; arr_rhs[0]='('; arr_rhs[1]=0;

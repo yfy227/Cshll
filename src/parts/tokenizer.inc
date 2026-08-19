@@ -22,6 +22,29 @@ int tokenize(const char *line, char **toks, int maxtoks){
         if(!*p) break;
         /* comments */
         if(*p=='#'){ break; }
+        /* ANSI-C quoting: $'...' — convert to $(echo -e '...') for runtime evaluation */
+        if(*p=='$' && *(p+1)=='\''){
+            p+=2; /* skip $' */
+            /* Collect the raw content (between $' and ') */
+            char raw[2048]; int ri=0;
+            while(*p && *p!='\'' && ri<(int)sizeof(raw)-1){
+                if(*p=='\\' && *(p+1)=='\''){ raw[ri++]='\''; p+=2; }
+                else { raw[ri++]=*p++; }
+            }
+            if(*p=='\'') p++;
+            raw[ri]=0;
+            /* Emit as $(echo -e "...") so __sh_cmd_output processes escapes at runtime */
+            char buf[4096]; int bi=0;
+            const char *pre = "$(printf '%b' \"";
+            while(*pre && bi<(int)sizeof(buf)-3) buf[bi++]=*pre++;
+            for(int i=0; raw[i] && bi<(int)sizeof(buf)-3; i++){
+                if(raw[i]=='"'){ buf[bi++]='\\'; buf[bi++]='"'; }
+                else if(raw[i]=='\\'){ buf[bi++]='\\'; buf[bi++]='\\'; }
+                else buf[bi++]=raw[i];
+            }
+            buf[bi++]='"'; buf[bi++]=')'; buf[bi]=0;
+            toks[n++]=pool_dup(buf,bi); continue;
+        }
         /* double-quoted string (keep quotes, but convert backticks to $(...)) */
         if(*p=='"'){
             const char *s=p; p++;
