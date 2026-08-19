@@ -126,11 +126,16 @@ static unsigned int var_hash(const char *name){
     return h & VAR_HASH_MASK;
 }
 
+static int var_hash_initialized = 0;
+
 static void var_hash_init(void){
     memset(var_hash_buckets, -1, sizeof(var_hash_buckets));
+    memset(var_hash_next, -1, sizeof(var_hash_next));
+    var_hash_initialized = 1;
 }
 
 static int var_hash_find(const char *name){
+    if(!var_hash_initialized) var_hash_init();
     unsigned int h = var_hash(name);
     int idx = var_hash_buckets[h];
     while(idx >= 0){
@@ -147,8 +152,6 @@ static void var_hash_insert(int idx){
 }
 
 void add_var(const char *name, VarKind k){
-    static int hash_initialized = 0;
-    if(!hash_initialized){ var_hash_init(); hash_initialized = 1; }
     if(!name||!*name) return;
     int idx = var_hash_find(name);
     if(idx >= 0){
@@ -183,8 +186,6 @@ int is_declared_int(const char *name){
 }
 void set_declared_int(const char *name){
     if(!name||!*name) return;
-    static int hash_initialized = 0;
-    if(!hash_initialized){ var_hash_init(); hash_initialized = 1; }
     int idx = var_hash_find(name);
     if(idx >= 0){
         var_table[idx].is_decl_int=1;
