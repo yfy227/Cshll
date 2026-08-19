@@ -190,9 +190,23 @@ Node *make_cmd(char **toks,int n,int ln){
 void parse_for_header(const char *src,char *var,char ***list,int *len){
     char tmp[1024]; strncpy(tmp,src,1023); tmp[1023]=0;
     char *p;
-    if((p=strstr(tmp,"; do")))*p=0;
-    else if((p=strstr(tmp,";do")))*p=0;
-    else if((p=strstr(tmp," do")))*p=0;
+    /* Truncate at "; do", ";do", or " do" — but verify "do" is a complete
+     * word to avoid matching "dog", "done", "door", etc. (BUG-fix) */
+    if((p=strstr(tmp,"; do"))){
+        while(p && !(p[4]==0||p[4]==' '||p[4]=='\t'||p[4]==';'))
+            p=strstr(p+1,"; do");
+        if(p) *p=0;
+    } else if((p=strstr(tmp,";do"))){
+        while(p && !(p[3]==0||p[3]==' '||p[3]=='\t'||p[3]==';'))
+            p=strstr(p+1,";do");
+        if(p) *p=0;
+    } else {
+        p=tmp;
+        while((p=strstr(p," do"))){
+            if(p[3]==0||p[3]==' '||p[3]=='\t'||p[3]==';'){ *p=0; break; }
+            p++;
+        }
+    }
     sscanf(tmp,"%127s",var);
     char *ls=tmp+strlen(var);
     while(isspace((unsigned char)*ls))ls++;

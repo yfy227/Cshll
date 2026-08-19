@@ -2254,8 +2254,14 @@ void emit_node(FILE *out, Node *n){
             /* Check if any list item contains glob chars */
             int has_glob=0;
             for(int i=0;i<n->for_len;i++){
-                for(const char *g=n->for_list[i];*g;g++){
-                    if(*g=='*'||*g=='?'||*g=='['){ has_glob=1; break; }
+                /* Check for glob chars, but skip ${...} expressions */
+                const char *g=n->for_list[i];
+                int in_dollar_brace=0;
+                for(;*g;g++){
+                    if(*g=='$'&&g[1]=='{'){ in_dollar_brace=1; g++; continue; }
+                    if(in_dollar_brace&&*g=='}'){ in_dollar_brace=0; continue; }
+                    if(in_dollar_brace) continue;
+                    if(*g=='*'||*g=='?'||(*g=='['&&g[1]!='A'&&g[1]!='a')){ has_glob=1; break; }
                 }
                 if(has_glob) break;
             }
@@ -2267,6 +2273,17 @@ void emit_node(FILE *out, Node *n){
                     fprintf(out,"    { glob_t __g; if(glob(\"%s\",0,NULL,&__g)==0){ for(unsigned __gi=0;__gi<__g.gl_pathc&&__nfl%d<255;__gi++) __fl%d[__nfl%d++]=strdup(__g.gl_pathv[__gi]); } globfree(&__g); }\n",esc,n->lineno,n->lineno,n->lineno);
                     free(esc);
                 }
+                fprintf(out,"    __fl%d[__nfl%d]=NULL;\n",n->lineno,n->lineno);
+            } else if(n->for_len==1 && n->for_list[0][0]=='$' && strstr(n->for_list[0],"${")){
+                /* ${...} expansion (e.g. ${!arr[@]}, ${arr[@]}) — expand to string then split */
+                char *w=emit_word(out,n->for_list[0]);
+                fprintf(out,"    char __fl%d_buf[8192]; snprintf(__fl%d_buf,sizeof(__fl%d_buf),\"%%s\",%s);\n",
+                    n->lineno,n->lineno,n->lineno,w);
+                free(w);
+                fprintf(out,"    const char *__fl%d[256]; int __nfl%d=0;\n",n->lineno,n->lineno);
+                fprintf(out,"    { char *__s=__fl%d_buf; char *__tk=strtok(__s,\" \");\n",n->lineno);
+                fprintf(out,"      while(__tk&&__nfl%d<255){__fl%d[__nfl%d++]=__tk;__tk=strtok(NULL,\" \");} }\n",
+                    n->lineno,n->lineno,n->lineno);
                 fprintf(out,"    __fl%d[__nfl%d]=NULL;\n",n->lineno,n->lineno);
             } else {
             fprintf(out,"    const char *__fl%d[] = {",n->lineno);

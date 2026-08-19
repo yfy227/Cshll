@@ -42,17 +42,28 @@ char *translate_brace_expansion(const char *body){
             snprintf(r,sizeof(r),"(int)strlen(%s)",safe_cname(name));
         return xstrdup(r);
     }
-    /* ${!var} — indirect */
+    /* ${!var} — indirect, or ${!arr[@]} — array indices */
     if(*p=='!' && *(p+1)!='}'){
         p++;
-        while(*p && *p!='}') name[j++]=*p++;
+        while(*p && *p!='}' && *p!='[') name[j++]=*p++;
         name[j]=0;
         char r[2048];
         if(!strcmp(name,"#")){
             /* ${!#} = last positional parameter */
             snprintf(r,sizeof(r),"__sh_indirect_args(__sh_argc,__sh_args)");
-        } else
-            snprintf(r,sizeof(r),"__sh_indirect(\"%s\")",name);
+            return xstrdup(r);
+        }
+        /* ${!arr[@]} or ${!arr[*]} — array indices */
+        if(*p=='['){
+            p++; char idx[32]; int k=0;
+            while(*p && *p!=']') idx[k++]=*p++;
+            idx[k]=0; if(*p) p++;
+            if(!strcmp(idx,"@")||!strcmp(idx,"*")){
+                snprintf(r,sizeof(r),"__sh_arr_indices(__arr_%s)",safe_cname(name));
+                return xstrdup(r);
+            }
+        }
+        snprintf(r,sizeof(r),"__sh_indirect(\"%s\")",name);
         return xstrdup(r);
     }
     /* read name up to operator */
@@ -78,6 +89,35 @@ char *translate_brace_expansion(const char *body){
                     snprintf(r,sizeof(r),"__sh_arr_slice(__arr_%s,%s,%s)",safe_cname(name),off,len);
                 else
                     snprintf(r,sizeof(r),"__sh_arr_slice(__arr_%s,%s,-1)",safe_cname(name),off);
+            } else if(*p=='#'){
+                /* ${arr[@]#pattern} — strip shortest prefix from each element */
+                p++; char pat[256]; int k=0;
+                while(*p && *p!='}') pat[k++]=*p++;
+                pat[k]=0; if(*p) p++;
+                snprintf(r,sizeof(r),"__sh_arr_strip_prefix_all(__arr_%s,\"%s\",0)",safe_cname(name),pat);
+            } else if(*p=='%'){
+                /* ${arr[@]%%pattern} or ${arr[@]%pattern} — strip suffix from each element */
+                int greedy=(*(p+1)=='%'); if(greedy) p++;
+                p++; char pat[256]; int k=0;
+                while(*p && *p!='}') pat[k++]=*p++;
+                pat[k]=0; if(*p) p++;
+                snprintf(r,sizeof(r),"__sh_arr_strip_suffix_all(__arr_%s,\"%s\",%d)",safe_cname(name),pat,greedy);
+            } else if(*p=='^' || *p==','){
+                /* ${arr[@]^^} / ${arr[@],,} — upper/lower each element */
+                int upper=(*p=='^'); int all=(*(p+1)==*p);
+                p += all ? 2 : 1;
+                if(*p=='}') p++;
+                snprintf(r,sizeof(r),"__sh_arr_case_all(__arr_%s,%d)",safe_cname(name),upper?(all?2:1):(all?-2:-1));
+            } else if(*p=='/'){
+                /* ${arr[@]/old/new} or ${arr[@]//old/new} — replace in each element */
+                int global=(*(p+1)=='/'); if(global) p++;
+                p++; char old[128]; int ok=0;
+                while(*p && *p!='/' && *p!='}' && ok<(int)sizeof(old)-1) old[ok++]=*p++;
+                old[ok]=0;
+                char newp[128]="";
+                if(*p=='/'){ p++; int nl=0; while(*p&&*p!='}'&&nl<(int)sizeof(newp)-1) newp[nl++]=*p++; newp[nl]=0; }
+                if(*p=='}') p++;
+                snprintf(r,sizeof(r),"__sh_arr_replace_all(__arr_%s,\"%s\",\"%s\",%d)",safe_cname(name),old,newp,global);
             } else {
                 if(*p=='}') p++;
                 snprintf(r,sizeof(r),"__sh_arr_join(__arr_%s)",safe_cname(name));
