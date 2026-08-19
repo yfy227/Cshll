@@ -333,7 +333,12 @@ void expand_string(const char *s, ExpandResult *er){
                                     if(be2<k && expr[be2]==' ') { /* skip one space */ }
                                     be2++;
                                 }
-                                div_expr[di2++]=' '; div_expr[di2++]=*p; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                                { int sp_b=(p[-1]==' '||p[-1]=='\t');
+                                  int sp_a=(p[1]==' '||p[1]=='\t');
+                                  if(sp_b) div_expr[di2++]=' ';
+                                  div_expr[di2++]=*p;
+                                  if(sp_a) div_expr[di2++]=' ';
+                                  div_expr[di2++]='0'; div_expr[di2]=0; }
                                 k=bs2;
                                 k+=snprintf(expr+k,sizeof(expr)-k,"(__sh_div_zero(\"%s\"),1LL)",div_expr);
                                 p=np+1; continue;

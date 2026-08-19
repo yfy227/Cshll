@@ -647,7 +647,12 @@ char *translate_arith(const char *expr){
                         if(be2<q && buf[be2]==' ') { /* skip one space between tokens */ }
                         be2++;
                     }
-                    div_expr[di2++]=' '; div_expr[di2++]=*s; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                    { int sp_b=(s>expr&&(s[-1]==' '||s[-1]=='\t'));
+                      int sp_a=(s[1]==' '||s[1]=='\t');
+                      if(sp_b) div_expr[di2++]=' ';
+                      div_expr[di2++]=*s;
+                      if(sp_a) div_expr[di2++]=' ';
+                      div_expr[di2++]='0'; div_expr[di2]=0; }
                     q=bs2; /* remove dividend from buf — it'll be in the call */
                     q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                     s=np+1; continue;
@@ -1032,7 +1037,13 @@ char *translate_expr(const char *tok){
                         char div_expr[64]; int di2=0;
                         int bs2=q; while(bs2>0 && (isdigit((unsigned char)buf[bs2-1])||buf[bs2-1]==' ')) bs2--;
                         int be2=bs2; while(be2<q) div_expr[di2++]=buf[be2++];
-                        div_expr[di2++]=' '; div_expr[di2++]=*s; div_expr[di2++]=' '; div_expr[di2++]='0'; div_expr[di2]=0;
+                        while(di2>0 && div_expr[di2-1]==' ') di2--;  /* strip trailing spaces */
+                        { int sp_b=(s>tok&&(s[-1]==' '||s[-1]=='\t'));
+                          int sp_a=(s[1]==' '||s[1]=='\t');
+                          if(sp_b) div_expr[di2++]=' ';
+                          div_expr[di2++]=*s;
+                          if(sp_a) div_expr[di2++]=' ';
+                          div_expr[di2++]='0'; div_expr[di2]=0; }
                         q=bs2;
                         q+=snprintf(buf+q,sizeof(buf)-q,"(__sh_div_zero(\"%s\"),1)",div_expr);
                         s=np+1; continue;
