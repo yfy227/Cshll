@@ -144,7 +144,7 @@ static int _sbox_emitted = 0;
 
 static void emit_scatter_string(FILE *out, const char *target, const char *src, int target_size) {
     int plen = (int)strlen(src);
-    if(plen < 6) {
+    if(plen < 12) {
         char *esc = c_escape_literal(src);
         fprintf(out, "    strncpy(%s,\"%s\",%d);\n", target, esc, target_size - 1);
         free(esc);
