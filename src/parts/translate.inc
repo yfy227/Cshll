@@ -201,7 +201,7 @@ char *translate_brace_expansion(const char *body){
                         else esc_def[ei++]=*dp;
                     }
                     esc_def[ei]=0;
-                    snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%s\\n\"),exit(1),\"\"))",cn,cn,esc_def);
+                    snprintf(r,sizeof(r),"(%s[0]?%s:(fprintf(stderr,\"%%s: line %%d: %s: %s\\n\",__sh_script_name[0]?__sh_script_name:\"shell2c\",__sh_lineno),exit(1),\"\"))",cn,cn,name,esc_def);
                     break;
                 }
                 default:  snprintf(r,sizeof(r),"%s",cn); break;

@@ -290,7 +290,7 @@ void expand_string(const char *s, ExpandResult *er){
                         /* Check for hex (0x) or octal (0) prefix */
                         if(*p=='0' && (*(p+1)=='x'||*(p+1)=='X')){
                             /* Hex literal: copy 0x prefix + hex digits */
-                            expr[k++]='0'; expr[k++]='0'; p++; /* write 00, skip the 0 */
+                            expr[k++]='0'; p++; /* write 0, skip the 0 */
                             expr[k++]='x'; p++; /* write x, skip the x */
                             while(isxdigit((unsigned char)*p) && k<(int)sizeof(expr)-4)
                                 expr[k++]=*p++;

@@ -454,7 +454,10 @@ char *translate_cond(const char *cond){
                         for(j=wi+1; j<nw; j++){
                             /* stop at && || ! */
                             if(!strcmp(words[j],"&&")||!strcmp(words[j],"||")||!strcmp(words[j],"!")) break;
-                            fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"\"%s\",",words[j]);
+                            /* Use translate_expr to expand $var, ${...}, $((...)) etc. */
+                            char *e=translate_expr(words[j]);
+                            fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"%s,",e);
+                            free(e);
                             fnargs++;
                         }
                         fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"NULL}; __sh_argc=%d; %s(__sh_argc,__av); __sh_argc=__save_argc; (__exit_status==0);",
@@ -618,7 +621,10 @@ char *translate_cond(const char *cond){
                 else if(*p=='\''){ p++; while(*p && *p!='\'' && al<(int)sizeof(arg)-1) arg[al++]=*p++; if(*p=='\'')p++; }
                 else { while(*p && *p!=' ' && *p!='\t' && al<(int)sizeof(arg)-1) arg[al++]=*p++; }
                 arg[al]=0;
-                ai+=snprintf(args+ai,sizeof(args)-ai,"\"%s\",",arg);
+                { char *e=translate_expr(arg);
+                  ai+=snprintf(args+ai,sizeof(args)-ai,"%s,",e);
+                  free(e);
+                }
                 nargs++;
             }
             ai+=snprintf(args+ai,sizeof(args)-ai,"NULL}; int __save_argc=__sh_argc; __sh_argc=%d; %s(__sh_argc,__av); __sh_argc=__save_argc; (__exit_status==0);",nargs,safe_cname(fname));
