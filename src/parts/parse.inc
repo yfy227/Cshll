@@ -181,7 +181,22 @@ Node *make_cmd(char **toks,int n,int ln){
     if(n>=2 && !strcmp(toks[0],"unset")){
         for(int i=1;i<n;i++){
             if(toks[i][0]=='-') continue;
-            add_var(toks[i],V_STR);
+            /* Strip surrounding quotes for variable registration */
+            const char *arg=toks[i];
+            size_t al=strlen(arg);
+            if(al>=2 && ((arg[0]=='\''&&arg[al-1]=='\'') || (arg[0]=='"'&&arg[al-1]=='"'))){
+                char tmp[256]; size_t l=al-2;
+                if(l<sizeof(tmp)){ memcpy(tmp,arg+1,l); tmp[l]=0; add_var(tmp,V_STR); }
+            } else {
+                /* For arr[idx] syntax, register the array name */
+                const char *lb=strchr(arg,'[');
+                if(lb && lb>arg){
+                    char aname[128]; int alen=(int)(lb-arg);
+                    if(alen<127){ memcpy(aname,arg,alen); aname[alen]=0; add_var(aname,V_ARRAY); }
+                } else {
+                    add_var(arg,V_STR);
+                }
+            }
         }
     }
     return nd;
@@ -222,11 +237,22 @@ void parse_for_header(const char *src,char *var,char ***list,int *len){
         char item[512]; int il=0;
         if(*s=='"'){
             s++;
-            while(*s && *s!='"' && il<(int)sizeof(item)-1){
-                if(*s=='\\' && *(s+1)) s++;
-                item[il++]=*s++;
+            /* Preserve quotes for "$@" and "$*" so emitter can distinguish
+             * quoted (no IFS split) from unquoted (IFS split) */
+            if(*s=='$' && (s[1]=='@' || s[1]=='*')){
+                item[il++]='"';
+                while(*s && *s!='"' && il<(int)sizeof(item)-1){
+                    if(*s=='\\' && *(s+1)) s++;
+                    item[il++]=*s++;
+                }
+                if(*s=='"'){ item[il++]='"'; s++; }
+            } else {
+                while(*s && *s!='"' && il<(int)sizeof(item)-1){
+                    if(*s=='\\' && *(s+1)) s++;
+                    item[il++]=*s++;
+                }
+                if(*s=='"') s++;
             }
-            if(*s=='"') s++;
         } else if(*s=='\''){
             s++;
             while(*s && *s!='\'' && il<(int)sizeof(item)-1) item[il++]=*s++;

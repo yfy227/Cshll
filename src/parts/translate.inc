@@ -585,41 +585,28 @@ char *translate_arith(const char *expr){
             VarKind vk=get_var_kind(nm);
             /* check for = assignment (not ==, <=, >=, !=) */
             const char *np=s; while(*np==' '||*np=='\t') np++;
-            /* check for += compound assignment (bash only supports +=) */
-            if(*np=='+' && *(np+1)=='=' && *(np+2)!='='){
-                /* bash: x+=val means string append */
-                q+=snprintf(buf+q,sizeof(buf)-q,"strncat(%s,",cn);
+            /* check for compound arithmetic assignment: += -= *= /= %=
+             * In ((...)) arithmetic context, these are always arithmetic operations */
+            if((*np=='+'&&*(np+1)=='='&&*(np+2)!='=') ||
+               (*np=='-'&&*(np+1)=='='&&*(np+2)!='=') ||
+               (*np=='*'&&*(np+1)=='='&&*(np+2)!='=') ||
+               (*np=='/'&&*(np+1)=='='&&*(np+2)!='=') ||
+               (*np=='%'&&*(np+1)=='='&&*(np+2)!='=')){
+                /* Arithmetic compound assignment: x += 5 → x += 5 (C operator) */
+                if(vk==V_STR){
+                    /* String var: convert to int for arithmetic */
+                    q+=snprintf(buf+q,sizeof(buf)-q,"atoi(%s)",cn);
+                    buf[q++]=*np;     /* + - * / % */
+                    buf[q++]='=';
+                } else {
+                    if(!is_known_var(nm)) add_var(nm,V_INT);
+                    cn=safe_cname(nm);
+                    while(*cn) buf[q++]=*cn++;
+                    buf[q++]=*np;     /* + - * / % */
+                    buf[q++]='=';
+                }
                 s=np+2;
                 while(*s==' '||*s=='\t') s++;
-                /* read RHS */
-                if(*s=='"'){
-                    s++;
-                    char rhs[256]; int ri=0;
-                    while(*s && *s!='"' && ri<(int)sizeof(rhs)-1) rhs[ri++]=*s++;
-                    if(*s=='"') s++;
-                    rhs[ri]=0;
-                    q+=snprintf(buf+q,sizeof(buf)-q,"\"%s\",sizeof(%s)-strlen(%s)-1)",rhs,cn,cn);
-                } else {
-                    /* unquoted — could be number or variable */
-                    char rhs[256]; int ri=0;
-                    while(*s && *s!=';' && *s!='"' && ri<(int)sizeof(rhs)-1){
-                        rhs[ri++]=*s++;
-                    }
-                    rhs[ri]=0;
-                    /* check if it's a number */
-                    int is_num=1;
-                    for(int i=0;i<ri;i++){
-                        if(!isdigit((unsigned char)rhs[i]) && rhs[i]!='-'){ is_num=0; break; }
-                    }
-                    if(is_num){
-                        q+=snprintf(buf+q,sizeof(buf)-q,"\"%s\",sizeof(%s)-strlen(%s)-1)",rhs,cn,cn);
-                    } else {
-                        /* variable — use its string value */
-                        const char *cn2=safe_cname(rhs);
-                        q+=snprintf(buf+q,sizeof(buf)-q,"%s,sizeof(%s)-strlen(%s)-1)",cn2,cn,cn);
-                    }
-                }
-                buf[q++]=')';
                 continue;
             }
             if(*np=='='&&*(np+1)!='='){
@@ -794,11 +781,23 @@ char *translate_arith(const char *expr){
             }
             /* ** → power operator */
             if(*s=='*'&&*(s+1)=='*'){
-                /* Find base: last token in buf */
+                /* Find base: last expression in buf.
+                 * Base can be: identifier, number, or (...) balanced parens */
                 int bs=q;
-                while(bs>0 && (isalnum((unsigned char)buf[bs-1])||buf[bs-1]=='_')) bs--;
+                /* Skip trailing whitespace */
+                while(bs>0 && (buf[bs-1]==' '||buf[bs-1]=='\t')) bs--;
+                if(bs>0 && buf[bs-1]==')'){
+                    /* Base ends with ) — scan back for matching ( */
+                    int pd=1; bs--;
+                    while(bs>0 && pd>0){ bs--; if(buf[bs]==')') pd++; else if(buf[bs]=='(') pd--; }
+                    /* bs now points to ( — include the ( */
+                } else {
+                    /* Base is identifier or number — scan back alnum/_ */
+                    while(bs>0 && (isalnum((unsigned char)buf[bs-1])||buf[bs-1]=='_')) bs--;
+                }
                 if(bs<q){
                     char base[256]; int bl=q-bs;
+                    if(bl>255) bl=255;
                     memcpy(base,buf+bs,bl); base[bl]=0;
                     q=bs;
                     const char *fn="(long long)__sh_pow("; while(*fn) buf[q++]=*fn++;

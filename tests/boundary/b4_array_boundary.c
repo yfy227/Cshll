@@ -35,6 +35,7 @@
 static int __exit_status=0;
 static int __sh_argc=0;
 static char **__sh_args=NULL;
+static char *__sh_pos_args[10]={NULL};
 static int __sh_last_bg_pid=0;
 static int __sh_set_e=0;
 static int __sh_set_u=0;
@@ -179,6 +180,20 @@ static int __sh_div_zero(const char *expr){
   __exit_status=1; __sh_div_error=1;
   return 0;
 }
+/* ${!arr[@]} — return space-separated list of array indices */
+static const char *__sh_arr_indices(const char **arr){
+  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
+  buf[0]=0; int first=1;
+  for(int i=0;arr[i]&&i<256;i++){
+    if(arr[i]){
+      char num[16]; snprintf(num,sizeof(num),"%d",i);
+      if(!first) strncat(buf," ",8192-strlen(buf)-1);
+      strncat(buf,num,8192-strlen(buf)-1);
+      first=0;
+    }
+  }
+  return buf;
+}
 static const char *__sh_arr_slice(const char **arr,int off,int len){
   char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
   int n=0; while(arr[n]) n++;
@@ -223,9 +238,10 @@ static const char *__sh_replace(const char *s,const char *old,const char *newp,i
   int oi=0; int sl=(int)strlen(s); int ol=(int)strlen(old); int nl=(int)strlen(newp);
   int i=0; int done=0;
   while(i<sl && oi<4096-nl-2){
-    if(!done && (anchor_start?i==0:1) && strncmp(s+i,old,ol)==0){
+    if(!done && (anchor_start?i==0:1) && (anchor_end?(i+ol==sl):1) && strncmp(s+i,old,ol)==0){
       memcpy(out+oi,newp,nl); oi+=nl; i+=ol; if(!global){ done=1; }
       if(anchor_start) anchor_start=0;
+      if(anchor_end) anchor_end=0;
     } else { out[oi++]=s[i++]; }
   }
   out[oi]=0;
@@ -238,6 +254,53 @@ static const char *__sh_upper(const char *s){
 static const char *__sh_lower(const char *s){
   char *buf = __sh_pool_next(__sh_lower_p0,__sh_lower_p1,__sh_lower_p2,__sh_lower_p3,&__sh_lower_i);
   int i; for(i=0;s[i]&&i<4095;i++) buf[i]=tolower((unsigned char)s[i]); buf[i]=0; return buf;
+}
+static const char *__sh_upper_first(const char *s){
+  char *buf = __sh_pool_next(__sh_upper_p0,__sh_upper_p1,__sh_upper_p2,__sh_upper_p3,&__sh_upper_i);
+  int i; for(i=0;s[i]&&i<4095;i++) buf[i]=(i==0)?toupper((unsigned char)s[i]):s[i]; buf[i]=0; return buf;
+}
+static const char *__sh_lower_first(const char *s){
+  char *buf = __sh_pool_next(__sh_lower_p0,__sh_lower_p1,__sh_lower_p2,__sh_lower_p3,&__sh_lower_i);
+  int i; for(i=0;s[i]&&i<4095;i++) buf[i]=(i==0)?tolower((unsigned char)s[i]):s[i]; buf[i]=0; return buf;
+}
+/* ${arr[@]#pattern} — strip prefix from each element, then join */
+static const char *__sh_strip_prefix(const char *s,const char *pat,int greedy);
+static const char *__sh_strip_suffix(const char *s,const char *pat,int greedy);
+static const char *__sh_arr_strip_prefix_all(const char **arr,const char *pat,int greedy){
+  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
+  buf[0]=0;
+  for(int i=0;arr[i]&&i<256;i++){ const char *r=__sh_strip_prefix(arr[i],pat,greedy); if(i>0) strncat(buf," ",8192-strlen(buf)-1); strncat(buf,r,8192-strlen(buf)-1); }
+  return buf;
+}
+/* ${arr[@]%%pattern} — strip suffix from each element, then join */
+static const char *__sh_arr_strip_suffix_all(const char **arr,const char *pat,int greedy){
+  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
+  buf[0]=0;
+  for(int i=0;arr[i]&&i<256;i++){ const char *r=__sh_strip_suffix(arr[i],pat,greedy); if(i>0) strncat(buf," ",8192-strlen(buf)-1); strncat(buf,r,8192-strlen(buf)-1); }
+  return buf;
+}
+/* ${arr[@]^^}/${arr[@],,} — upper/lower each element, then join */
+static const char *__sh_upper(const char *s);
+static const char *__sh_lower(const char *s);
+static const char *__sh_upper_first(const char *s);
+static const char *__sh_lower_first(const char *s);
+static const char *__sh_arr_case_all(const char **arr,int mode){
+  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
+  buf[0]=0;
+  for(int i=0;arr[i]&&i<256;i++){ const char *r;
+    if(mode==2) r=__sh_upper(arr[i]);
+    else if(mode==1) r=__sh_upper_first(arr[i]);
+    else if(mode==-2) r=__sh_lower(arr[i]);
+    else r=__sh_lower_first(arr[i]);
+    if(i>0) strncat(buf," ",8192-strlen(buf)-1); strncat(buf,r,8192-strlen(buf)-1); }
+  return buf;
+}
+/* ${arr[@]/old/new} — replace in each element, then join */
+static const char *__sh_arr_replace_all(const char **arr,const char *old,const char *newp,int global){
+  char *buf = __sh_pool_next(__sh_arr_p0,__sh_arr_p1,__sh_arr_p2,__sh_arr_p3,&__sh_arr_i);
+  buf[0]=0;
+  for(int i=0;arr[i]&&i<256;i++){ const char *r=__sh_replace(arr[i],old,newp,global,0,0); if(i>0) strncat(buf," ",8192-strlen(buf)-1); strncat(buf,r,8192-strlen(buf)-1); }
+  return buf;
 }
 static const char *__sh_cmd_output(const char *cmd){
   char *buf = __sh_pool_next(__sh_cmd_out_p0,__sh_cmd_out_p1,__sh_cmd_out_p2,__sh_cmd_out_p3,&__sh_cmd_out_i);
@@ -401,6 +464,8 @@ static void __sh_printf(const char *fmt,...){
       else if(*p=='o'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),"%%%so",mods); printf(f,s?atoi(s):0); }
       else if(*p=='f'||*p=='e'||*p=='g'||*p=='E'||*p=='G'){ const char *s=va_arg(ap,const char*); char f[40]; snprintf(f,sizeof(f),"%%%sf",mods); printf(f,s?atof(s):0.0); }
       else if(*p=='%'){ putchar('%'); }
+      else if(*p=='b'){ const char *s=va_arg(ap,const char*); /* %b: interpret backslash escapes */ __sh_echo_escape(s?s:""); }
+      else if(*p=='q'){ const char *s=va_arg(ap,const char*); /* %q: shell-escape — single-quote */ putchar('\''); if(s){while(*s){if(*s=='\'')fputs("'\\''",stdout);else putchar(*s);s++;}}putchar('\''); }
       else { putchar('%'); fputs(mods,stdout); putchar(*p); }
     } else { putchar(*p); }
     p++;
@@ -927,9 +992,13 @@ int main(int _argc, char **_argv){
     if (_argc > 7) strncpy(__sh_arg7, _argv[7], 4095);
     if (_argc > 8) strncpy(__sh_arg8, _argv[8], 4095);
     if (_argc > 9) strncpy(__sh_arg9, _argv[9], 4095);
-    strncpy(__sh_script_name, _argv[0], 65530);
-    { char*_sp=__sh_script_name; while(_sp[0]=='.'&&_sp[1]=='/') _sp+=2; if(_sp!=__sh_script_name) memmove(__sh_script_name,_sp,strlen(_sp)+1); }
-    { int _snl=(int)strlen(__sh_script_name); if(_snl>0 && _snl<65530){ if(__sh_script_name[_snl-3]!='.' || __sh_script_name[_snl-2]!='s' || __sh_script_name[_snl-1]!='h'){ __sh_script_name[_snl]='.'; __sh_script_name[_snl+1]='s'; __sh_script_name[_snl+2]='h'; __sh_script_name[_snl+3]=0; } } }
+    __sh_pos_args[0]=__sh_arg1; __sh_pos_args[1]=__sh_arg2;
+    __sh_pos_args[2]=__sh_arg3; __sh_pos_args[3]=__sh_arg4;
+    __sh_pos_args[4]=__sh_arg5; __sh_pos_args[5]=__sh_arg6;
+    __sh_pos_args[6]=__sh_arg7; __sh_pos_args[7]=__sh_arg8;
+    __sh_pos_args[8]=__sh_arg9; __sh_pos_args[9]=__sh_arg0;
+    if(__sh_argc<=9) __sh_args=__sh_pos_args;
+    strncpy(__sh_script_name, "b4_array_boundary.sh", 65530);
 
     __sh_lineno=3;
     {

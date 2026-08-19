@@ -169,6 +169,69 @@ static void emit_block(FILE *out, Node *n);
 Node *pending_pipe_cmd=NULL;
 int pipe_restore_needed=0;
 
+/* Check if '$' appears outside of single-quoted segments.
+ * Used to determine if variable expansion is needed in a word. */
+static int dollar_outside_squotes(const char *s){
+    int in_sq = 0;
+    for(; *s; s++){
+        if(*s == '\'') { in_sq = !in_sq; continue; }
+        if(*s == '\\' && !in_sq && *(s+1)) { s++; continue; }
+        if(*s == '$' && !in_sq) return 1;
+    }
+    return 0;
+}
+
+/* Unescape a word value handling mixed quoting (e.g. 'It'\''s' → It's).
+ * Returns a malloc'd string. Sets *has_dollar if expansion is needed. */
+static char *unescape_mixed_quotes(const char *word, int *has_dollar){
+    int maxlen = (int)strlen(word) * 2 + 16;
+    char *unescaped = malloc(maxlen);
+    int ui = 0;
+    *has_dollar = 0;
+    const char *p = word;
+    while(*p && ui < maxlen - 2){
+        if(*p == '\''){
+            /* single-quoted segment: literal, no expansion */
+            p++;
+            while(*p && *p != '\'' && ui < maxlen - 2){
+                unescaped[ui++] = *p++;
+            }
+            if(*p == '\'') p++;
+        } else if(*p == '"'){
+            /* double-quoted segment: variable expansion applies */
+            p++;
+            while(*p && *p != '"' && ui < maxlen - 2){
+                if(*p == '\\' && *(p+1)){
+                    char next = *(p+1);
+                    if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n'){
+                        unescaped[ui++] = next;
+                        p += 2;
+                    } else {
+                        unescaped[ui++] = *p++;
+                    }
+                } else if(*p == '$'){
+                    *has_dollar = 1;
+                    unescaped[ui++] = *p++;
+                } else {
+                    unescaped[ui++] = *p++;
+                }
+            }
+            if(*p == '"') p++;
+        } else if(*p == '\\' && *(p+1)){
+            /* escaped character outside quotes → literal */
+            unescaped[ui++] = *(p+1);
+            p += 2;
+        } else if(*p == '$'){
+            *has_dollar = 1;
+            unescaped[ui++] = *p++;
+        } else {
+            unescaped[ui++] = *p++;
+        }
+    }
+    unescaped[ui] = 0;
+    return unescaped;
+}
+
 /* Emit a word as a C string expression. Returns heap string naming a C lvalue/expression. */
 char *emit_word(FILE *out, const char *word){
     if(!word) return xstrdup("\"\"");
@@ -1005,7 +1068,54 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     }
     if(!strcmp(cmd,"unset")){
         for(int i=1;i<ac;i++){
-            fprintf(out,"    unsetenv(\"%s\"); %s[0]='\\0';\n",argv[i],safe_cname(argv[i]));
+            const char *arg=argv[i];
+            /* Strip surrounding single/double quotes (e.g. unset 'arr[2]') */
+            char unquoted[256];
+            size_t alen=strlen(arg);
+            if(alen>=2 && ((arg[0]=='\''&&arg[alen-1]=='\'') || (arg[0]=='"'&&arg[alen-1]=='"'))){
+                size_t l=alen-2;
+                if(l<sizeof(unquoted)){ memcpy(unquoted,arg+1,l); unquoted[l]=0; arg=unquoted; }
+            }
+            /* Check for array element: arr[index] */
+            const char *lb=strchr(arg,'[');
+            if(lb && arg[0]!='-' && lb>arg){
+                const char *rb=strrchr(arg,']');
+                if(rb && rb>lb){
+                    /* Extract array name and index */
+                    char aname[128]; int al=(int)(lb-arg);
+                    if(al>=127) al=127;
+                    memcpy(aname,arg,al); aname[al]=0;
+                    char aidx[256]; int il=(int)(rb-lb-1);
+                    if(il>=255) il=255;
+                    memcpy(aidx,lb+1,il); aidx[il]=0;
+                    const char *cn=safe_cname(aname);
+                    add_var(aname,V_ARRAY);
+                    /* Check if index is numeric or variable */
+                    int is_num=1;
+                    for(const char *q=aidx;*q;q++){ if(!isdigit((unsigned char)*q)){ is_num=0; break; } }
+                    if(is_num && aidx[0]){
+                        fprintf(out,"    { int __ui=atoi(\"%s\"); if(__ui>=0 && __ui<256) { __arr_%s[__ui]=NULL; } }\n",aidx,cn);
+                    } else if(aidx[0]=='$'){
+                        /* Variable index — use runtime evaluation */
+                        char *e=translate_expr(aidx);
+                        VarKind vk=get_var_kind(aidx+1);
+                        if(vk==V_STR)
+                            fprintf(out,"    { int __ui=atoi(%s); if(__ui>=0 && __ui<256) { __arr_%s[__ui]=NULL; } }\n",e,cn);
+                        else
+                            fprintf(out,"    { int __ui=%s; if(__ui>=0 && __ui<256) { __arr_%s[__ui]=NULL; } }\n",e,cn);
+                        free(e);
+                    } else {
+                        /* String key — use assoc set with empty (assoc arrays don't support unset easily) */
+                        fprintf(out,"    __sh_assoc_set(__arr_%s,\"%s\",\"\");\n",cn,aidx);
+                    }
+                    /* Re-pack array to remove NULL holes for ${#arr[@]}.
+                     * Must iterate all 256 slots, not stop at first NULL,
+                     * because unset creates holes in the middle. */
+                    fprintf(out,"    { int __pi=0,__pj=0; for(;__pi<256;__pi++){ if(__arr_%s[__pi]){ if(__pi!=__pj) __arr_%s[__pj]=__arr_%s[__pi]; __pj++; } } __arr_%s[__pj]=NULL; }\n",cn,cn,cn,cn);
+                }
+            } else {
+                fprintf(out,"    unsetenv(\"%s\"); %s[0]='\\0';\n",arg,safe_cname(arg));
+            }
         }
         return;
     }
@@ -1060,6 +1170,10 @@ void emit_command(FILE *out, char **argv, int ac, int id){
                     fprintf(out,"    strncpy(__sh_arg%d,%s,sizeof(__sh_arg%d)-1);\n",n,argv[j],n);
                 }
                 fprintf(out,"    __sh_argc=%d;\n",n);
+                /* Update __sh_pos_args so $@/$* reflect the new values */
+                for(int j=1;j<=n && j<=9;j++)
+                    fprintf(out,"    __sh_pos_args[%d]=__sh_arg%d;\n",j-1,j);
+                fprintf(out,"    __sh_args=__sh_pos_args;\n");
                 break;
             }
         }
@@ -1903,7 +2017,7 @@ void emit_node(FILE *out, Node *n){
                     fprintf(out,"    snprintf(%s,sizeof(%s),\"%%s\",\"%s\");\n",
                             safe_cname(n->lhs),safe_cname(n->lhs),rhs);
                 }
-            } else if(strchr(rhs,'$')){
+            } else if(dollar_outside_squotes(rhs)){
                 ExpandResult er; expand_string(rhs,&er);
                 add_var(n->lhs,V_STR);
                 fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",
@@ -1912,42 +2026,18 @@ void emit_node(FILE *out, Node *n){
                 fprintf(out,");\n");
                 expand_free(&er);
             } else {
+                /* Literal string (no variable expansion needed).
+                 * Use full mixed-quote unescape to handle cases like
+                 * 'It'\''s' (→ It's) and 'literal $var' (→ literal $var) */
                 add_var(n->lhs,V_STR);
-                const char *val=rhs;
-                char tmp[2048];
-                if((val[0]=='"'||val[0]=='\'')&&strlen(val)>=2){
-                    char q=val[0];
-                    const char *vp=val+1;
-                    int ti=0;
-                    while(*vp && *vp!=q && ti<(int)sizeof(tmp)-1){
-                        if(q=='"' && *vp=='\\' && *(vp+1)){
-                            char next=*(vp+1);
-                            if(next=='$'||next=='"'||next=='\\'||next=='`'||next=='\n') vp++;
-                        }
-                        tmp[ti++]=*vp++;
-                    }
-                    tmp[ti]=0;
-                    /* Scatter-gather protection if obfuscate mode */
-                    extern int g_obfuscate;
-                    if(g_obfuscate && strlen(tmp) >= 6){
-                        emit_scatter_string(out, safe_cname(n->lhs), tmp, 65536);
-                    } else {
-                    char *esc=c_escape_literal(tmp);
-                    fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
-                            safe_cname(n->lhs),esc,safe_cname(n->lhs));
-                    free(esc);
-                    }
-                    /* BUG-12 fix: sync IFS and other special vars to environment */
-                    if(!strcmp(n->lhs,"IFS")){
-                        char *esc=c_escape_literal(tmp);
-                        fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
-                        free(esc);
-                    }
+                int hd = 0;
+                char *unescaped = unescape_mixed_quotes(rhs, &hd);
+                const char *val = unescaped;
+                /* Scatter-gather protection if obfuscate mode */
+                extern int g_obfuscate;
+                if(g_obfuscate && strlen(val) >= 6){
+                    emit_scatter_string(out, safe_cname(n->lhs), val, 65536);
                 } else {
-                    extern int g_obfuscate;
-                    if(g_obfuscate && strlen(val) >= 6){
-                        emit_scatter_string(out, safe_cname(n->lhs), val, 65536);
-                    } else {
                     char *esc=c_escape_literal(val);
                     fprintf(out,"    strncpy(%s,\"%s\",sizeof(%s)-1);\n",
                             safe_cname(n->lhs),esc,safe_cname(n->lhs));
@@ -1955,8 +2045,8 @@ void emit_node(FILE *out, Node *n){
                     if(!strcmp(n->lhs,"IFS"))
                         fprintf(out,"    setenv(\"IFS\",\"%s\",1);\n",esc);
                     free(esc);
-                    }
                 }
+                free(unescaped);
             }
         }
         break;
@@ -2254,13 +2344,15 @@ void emit_node(FILE *out, Node *n){
             /* Check if any list item contains glob chars */
             int has_glob=0;
             for(int i=0;i<n->for_len;i++){
-                /* Check for glob chars, but skip ${...} expressions */
+                /* Check for glob chars, but skip ${...} expressions and double-quoted strings */
                 const char *g=n->for_list[i];
                 int in_dollar_brace=0;
+                int in_dquote=0;
                 for(;*g;g++){
+                    if(*g=='"'){ in_dquote=!in_dquote; continue; }
                     if(*g=='$'&&g[1]=='{'){ in_dollar_brace=1; g++; continue; }
                     if(in_dollar_brace&&*g=='}'){ in_dollar_brace=0; continue; }
-                    if(in_dollar_brace) continue;
+                    if(in_dollar_brace||in_dquote) continue;
                     if(*g=='*'||*g=='?'||(*g=='['&&g[1]!='A'&&g[1]!='a')){ has_glob=1; break; }
                 }
                 if(has_glob) break;
@@ -2274,8 +2366,12 @@ void emit_node(FILE *out, Node *n){
                     free(esc);
                 }
                 fprintf(out,"    __fl%d[__nfl%d]=NULL;\n",n->lineno,n->lineno);
-            } else if(n->for_len==1 && n->for_list[0][0]=='$' && strstr(n->for_list[0],"${")){
-                /* ${...} expansion (e.g. ${!arr[@]}, ${arr[@]}) — expand to string then split */
+            } else if(n->for_len==1 && (
+                strstr(n->for_list[0],"${") ||
+                strstr(n->for_list[0],"$@") ||
+                strstr(n->for_list[0],"$*")
+            )){
+                /* ${...}, $@, $*, "$@", "$*" — expand to string then split */
                 char *w=emit_word(out,n->for_list[0]);
                 fprintf(out,"    char __fl%d_buf[8192]; snprintf(__fl%d_buf,sizeof(__fl%d_buf),\"%%s\",%s);\n",
                     n->lineno,n->lineno,n->lineno,w);

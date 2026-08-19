@@ -373,6 +373,13 @@ static void *transpile_thread(void *arg){
     fprintf(fout,"    __sh_args = _argv + 1;\n");
     for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
+    /* Build __sh_pos_args so $@/$# work after set -- */
+    fprintf(fout,"    __sh_pos_args[0]=__sh_arg1; __sh_pos_args[1]=__sh_arg2;\n");
+    fprintf(fout,"    __sh_pos_args[2]=__sh_arg3; __sh_pos_args[3]=__sh_arg4;\n");
+    fprintf(fout,"    __sh_pos_args[4]=__sh_arg5; __sh_pos_args[5]=__sh_arg6;\n");
+    fprintf(fout,"    __sh_pos_args[6]=__sh_arg7; __sh_pos_args[7]=__sh_arg8;\n");
+    fprintf(fout,"    __sh_pos_args[8]=__sh_arg9; __sh_pos_args[9]=__sh_arg0;\n");
+    fprintf(fout,"    if(__sh_argc<=9) __sh_args=__sh_pos_args;\n");
     /* Set script name for error messages (bash uses $0 = script path) */
     /* Embed the original source .sh filename at compile time so runtime
      * error messages match bash's $0 behavior (e.g. division by zero,

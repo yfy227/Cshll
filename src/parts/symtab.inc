@@ -110,16 +110,53 @@ const char *safe_cname(const char *name){
 VarInfo var_table[MAX_VARS];
 int var_count = 0;
 
+/* ── Hash table for O(1) variable lookup ── */
+#define VAR_HASH_SIZE 65536  /* power of 2, mask with VAR_HASH_SIZE-1 */
+#define VAR_HASH_MASK (VAR_HASH_SIZE - 1)
+static int var_hash_buckets[VAR_HASH_SIZE]; /* index into var_table, -1 = empty */
+static int var_hash_next[VAR_HASH_SIZE];   /* chaining for collisions */
+
+static unsigned int var_hash(const char *name){
+    /* FNV-1a hash — fast, good distribution for short strings */
+    unsigned int h = 2166136261u;
+    while(*name){
+        h ^= (unsigned char)*name++;
+        h *= 16777619u;
+    }
+    return h & VAR_HASH_MASK;
+}
+
+static void var_hash_init(void){
+    memset(var_hash_buckets, -1, sizeof(var_hash_buckets));
+}
+
+static int var_hash_find(const char *name){
+    unsigned int h = var_hash(name);
+    int idx = var_hash_buckets[h];
+    while(idx >= 0){
+        if(strcmp(var_table[idx].name, name) == 0) return idx;
+        idx = var_hash_next[idx];
+    }
+    return -1;
+}
+
+static void var_hash_insert(int idx){
+    unsigned int h = var_hash(var_table[idx].name);
+    var_hash_next[idx] = var_hash_buckets[h];
+    var_hash_buckets[h] = idx;
+}
+
 void add_var(const char *name, VarKind k){
+    static int hash_initialized = 0;
+    if(!hash_initialized){ var_hash_init(); hash_initialized = 1; }
     if(!name||!*name) return;
-    for(int i=0;i<var_count;i++){
-        if(strcmp(var_table[i].name,name)==0){
-            if(k==V_ASSOC) var_table[i].kind=V_ASSOC;
-            else if(k==V_ARRAY && var_table[i].kind!=V_ASSOC) var_table[i].kind=V_ARRAY;
-            else if(k==V_INT) var_table[i].kind=V_INT;
-            else if(k==V_STR && var_table[i].kind==V_INT) var_table[i].kind=V_STR; /* += upgrades to string */
-            return;
-        }
+    int idx = var_hash_find(name);
+    if(idx >= 0){
+        if(k==V_ASSOC) var_table[idx].kind=V_ASSOC;
+        else if(k==V_ARRAY && var_table[idx].kind!=V_ASSOC) var_table[idx].kind=V_ARRAY;
+        else if(k==V_INT) var_table[idx].kind=V_INT;
+        else if(k==V_STR && var_table[idx].kind==V_INT) var_table[idx].kind=V_STR;
+        return;
     }
     if(var_count>=MAX_VARS) return;
     strncpy(var_table[var_count].name,name,127);
@@ -127,33 +164,31 @@ void add_var(const char *name, VarKind k){
     var_table[var_count].kind=k;
     var_table[var_count].is_local=0;
     var_table[var_count].is_decl_int=0;
+    var_hash_insert(var_count);
     var_count++;
 }
 VarKind get_var_kind(const char *name){
     if(!name) return V_STR;
-    for(int i=0;i<var_count;i++)
-        if(strcmp(var_table[i].name,name)==0) return var_table[i].kind;
-    return V_STR;
+    int idx = var_hash_find(name);
+    return idx >= 0 ? var_table[idx].kind : V_STR;
 }
 int is_known_var(const char *name){
     if(!name) return 0;
-    for(int i=0;i<var_count;i++)
-        if(strcmp(var_table[i].name,name)==0) return 1;
-    return 0;
+    return var_hash_find(name) >= 0;
 }
 int is_declared_int(const char *name){
     if(!name) return 0;
-    for(int i=0;i<var_count;i++)
-        if(strcmp(var_table[i].name,name)==0) return var_table[i].is_decl_int;
-    return 0;
+    int idx = var_hash_find(name);
+    return idx >= 0 ? var_table[idx].is_decl_int : 0;
 }
 void set_declared_int(const char *name){
     if(!name||!*name) return;
-    for(int i=0;i<var_count;i++){
-        if(strcmp(var_table[i].name,name)==0){
-            var_table[i].is_decl_int=1;
-            return;
-        }
+    static int hash_initialized = 0;
+    if(!hash_initialized){ var_hash_init(); hash_initialized = 1; }
+    int idx = var_hash_find(name);
+    if(idx >= 0){
+        var_table[idx].is_decl_int=1;
+        return;
     }
     /* not found — create as V_INT with decl_int flag */
     if(var_count>=MAX_VARS) return;
@@ -162,6 +197,7 @@ void set_declared_int(const char *name){
     var_table[var_count].kind=V_INT;
     var_table[var_count].is_local=0;
     var_table[var_count].is_decl_int=1;
+    var_hash_insert(var_count);
     var_count++;
 }
 const char *var_c_expr(const char *name){
@@ -171,17 +207,49 @@ const char *var_c_expr(const char *name){
     return buf;
 }
 
-/* Function table */
+/* Function table — with hash index for O(1) lookup */
 char *func_table[MAX_FUNCS];
 int func_count = 0;
+#define FUNC_HASH_SIZE 4096
+#define FUNC_HASH_MASK (FUNC_HASH_SIZE - 1)
+static int func_hash_buckets[FUNC_HASH_SIZE];
+static int func_hash_next[MAX_FUNCS];
+static int func_hash_initialized = 0;
+
+static unsigned int func_hash(const char *name){
+    unsigned int h = 2166136261u;
+    while(*name){ h ^= (unsigned char)*name++; h *= 16777619u; }
+    return h & FUNC_HASH_MASK;
+}
+
 void register_func(const char *name){
     if(!name||!*name) return;
-    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return;
-    if(func_count<MAX_FUNCS) func_table[func_count++]=xstrdup(name);
+    if(!func_hash_initialized){
+        memset(func_hash_buckets, -1, sizeof(func_hash_buckets));
+        func_hash_initialized = 1;
+    }
+    unsigned int h = func_hash(name);
+    int idx = func_hash_buckets[h];
+    while(idx >= 0){
+        if(strcmp(func_table[idx],name)==0) return;
+        idx = func_hash_next[idx];
+    }
+    if(func_count<MAX_FUNCS){
+        func_table[func_count]=xstrdup(name);
+        func_hash_next[func_count] = func_hash_buckets[h];
+        func_hash_buckets[h] = func_count;
+        func_count++;
+    }
 }
 int is_user_func(const char *name){
     if(!name||!*name) return 0;
-    for(int i=0;i<func_count;i++) if(strcmp(func_table[i],name)==0) return 1;
+    if(!func_hash_initialized) return 0;
+    unsigned int h = func_hash(name);
+    int idx = func_hash_buckets[h];
+    while(idx >= 0){
+        if(strcmp(func_table[idx],name)==0) return 1;
+        idx = func_hash_next[idx];
+    }
     return 0;
 }
 
