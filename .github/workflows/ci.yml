@@ -1,0 +1,58 @@
+name: Cshll CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc python3
+
+      - name: Build shell2c
+        run: make clean && make
+
+      - name: Run test_stress (S01-S50)
+        run: bash tests/test_stress.sh
+
+      - name: Run test_stress2 (S51-S100)
+        run: bash tests/test_stress2.sh
+
+      - name: Run test_stress3 (S101-S150)
+        run: bash tests/test_stress3.sh
+
+      - name: Run test_deep_audit (D001-D050)
+        run: bash tests/test_deep_audit.sh
+
+      - name: Run boundary tests
+        run: |
+          cd tests/boundary
+          for t in b1_empty_special.sh b3_arith_boundary.sh b4_array_boundary.sh b5_control_flow.sh; do
+            bash "$t" > /tmp/bash_$t.out 2>&1
+            ../../shell2c "$t" /tmp/${t%.sh}.c 2>/dev/null
+            gcc -O2 -o /tmp/${t%.sh} /tmp/${t%.sh}.c 2>/dev/null
+            /tmp/${t%.sh} > /tmp/s2c_$t.out 2>&1
+            diff /tmp/bash_$t.out /tmp/s2c_$t.out || exit 1
+          done
+
+      - name: LLVM-VM security check
+        run: |
+          cat > /tmp/secret_test.sh << 'SCRIPT'
+          echo "test ok"
+          x=$((1+2))
+          echo "x=$x"
+          SCRIPT
+          ./shell2c /tmp/secret_test.sh /tmp/secret_test.c --llvm-vm 2>/dev/null
+          gcc -O2 -o /tmp/secret_test /tmp/secret_test.c 2>/dev/null
+          /tmp/secret_test > /tmp/vm_out.txt 2>&1
+          grep -q "x=3" /tmp/vm_out.txt || exit 1
+          strip /tmp/secret_test
+          strings /tmp/secret_test | grep -q "test ok" && exit 1 || true

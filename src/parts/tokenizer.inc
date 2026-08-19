@@ -279,7 +279,7 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
         /* extract prefix, body, suffix */
         char prefix[512]; int plen=(int)(bp-t);
         memcpy(prefix,t,plen); prefix[plen]=0;
-        char suffix[512]; strcpy(suffix,ep+1);
+        char suffix[512]; strncpy(suffix,ep+1,sizeof(suffix)-1); suffix[sizeof(suffix)-1]=0;
         char body[512]; int blen=(int)(ep-bp-1);
         memcpy(body,bp+1,blen); body[blen]=0;
         /* check for range: {1..10} or {a..z} */

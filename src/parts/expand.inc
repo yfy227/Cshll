@@ -347,7 +347,8 @@ void expand_string(const char *s, ExpandResult *er){
                                 char div_var[128]; int dvi=0;
                                 const char *dp=np;
                                 while(*dp && (isalnum((unsigned char)*dp)||*dp=='_')){
-                                    if(dvi<127) div_var[dvi++]=*dp; dp++;
+                                    if(dvi<127) div_var[dvi++]=*dp;
+                                    dp++;
                                 }
                                 div_var[dvi]=0;
                                 /* Look back for dividend in expr */

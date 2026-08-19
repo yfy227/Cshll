@@ -937,7 +937,7 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         /* Set positional parameters $1, $2, ... via setenv */
         int nargs = n->argc - 1;
         for(int i = 1; i < n->argc; i++){
-            char pname[4]; snprintf(pname, sizeof(pname), "%d", i);
+            char pname[12]; snprintf(pname, sizeof(pname), "%d", i);
             vmc_push_str(vs, pname);
             vmc_compile_word(vs, n->argv[i]);
             vm_buf_emit(vs->bc, OP_SETENV);

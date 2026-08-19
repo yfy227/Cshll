@@ -1502,13 +1502,26 @@ def split_basic_blocks(c_source: str, seed: int) -> str:
     lines = c_source.split('\n')
     result_lines = []
     label_counter = 0
+    in_struct = False  # track if inside struct/enum/union/typedef body
+    struct_brace_depth = 0  # brace depth at struct opening
     
     for line in lines:
         result_lines.append(line)
         
         stripped = line.strip()
         
+        # Track struct/enum/union/typedef body entry
+        if re.search(r'\b(struct|enum|union)\b.*\{', stripped) or (re.search(r'\btypedef\b', stripped) and '{' in stripped):
+            in_struct = True
+            struct_brace_depth = sum(1 for c in line if c == '{') - sum(1 for c in line if c == '}')
+        elif in_struct:
+            struct_brace_depth += sum(1 for c in line if c == '{') - sum(1 for c in line if c == '}')
+            if struct_brace_depth <= 0:
+                in_struct = False
+                struct_brace_depth = 0
+        
         # Only split inside function bodies (indented code)
+        # Skip if inside struct/enum/union body
         if (line.startswith('    ') and 
             stripped.endswith(';') and
             not stripped.startswith('#') and
@@ -1526,6 +1539,7 @@ def split_basic_blocks(c_source: str, seed: int) -> str:
             not stripped.startswith('while') and
             not stripped.startswith('else') and
             not stripped.startswith('goto') and
+            not in_struct and
             'for(' not in stripped and
             'while(' not in stripped and
             'if(' not in stripped and
