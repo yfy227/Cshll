@@ -182,8 +182,10 @@ static void *transpile_thread(void *arg){
         if(!strcmp(argv[i],"--vm")) do_vm=1;
         if(!strcmp(argv[i],"--llvm-vm")) do_llvm_vm=1;
     }
-    /* VM mode implies obfuscate; LLVM-VM is standalone protection */
-    if(do_vm) do_obfuscate = 1;
+    /* VM mode implies obfuscate; LLVM-VM also needs obfuscate for name mangling
+     * and string encryption so that secrets (variable names, string literals)
+     * are not visible in the binary via nm/strings */
+    if(do_vm || do_llvm_vm) do_obfuscate = 1;
 
     /* Initialize name mangler */
     mangle_init(do_obfuscate);
@@ -372,14 +374,25 @@ static void *transpile_thread(void *arg){
     for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
     /* Set script name for error messages (bash uses $0 = script path) */
-    /* Strip leading "./" so error messages match bash's $0 */
-    fprintf(fout,"    strncpy(__sh_script_name, _argv[0], 65530);\n");
-    fprintf(fout,"    { char*_sp=__sh_script_name; while(_sp[0]=='.'&&_sp[1]=='/') _sp+=2; if(_sp!=__sh_script_name) memmove(__sh_script_name,_sp,strlen(_sp)+1); }\n");
-    fprintf(fout,"    { int _snl=(int)strlen(__sh_script_name); if(_snl>0 && _snl<65530){ if(__sh_script_name[_snl-3]!='.' || __sh_script_name[_snl-2]!='s' || __sh_script_name[_snl-1]!='h'){ __sh_script_name[_snl]='.'; __sh_script_name[_snl+1]='s'; __sh_script_name[_snl+2]='h'; __sh_script_name[_snl+3]=0; } } }\n");
+    /* Embed the original source .sh filename at compile time so runtime
+     * error messages match bash's $0 behavior (e.g. division by zero,
+     * bad array subscript, command not found). */
+    {
+        const char *_src = argv[1];  /* original .sh path from shell2c argv */
+        /* Strip leading "./" to match bash's $0 normalization */
+        while(_src[0]=='.'&&_src[1]=='/') _src += 2;
+        fprintf(fout,"    strncpy(__sh_script_name, \"");
+        for(const char *_q=_src; *_q; _q++){
+            if(*_q=='\\'||*_q=='"') fprintf(fout,"\\");
+            fprintf(fout,"%c",*_q);
+        }
+        fprintf(fout,"\", 65530);\n");
+    }
     fprintf(fout,"\n");
     emit_node(fout,script);
-    /* Inject dead code decoys if obfuscation is enabled */
-    if(do_obfuscate){
+    /* Inject dead code decoys if obfuscation is enabled (but not for LLVM-VM,
+     * which has its own noise injection in vm_protect.py — avoids _noise_ redefinition) */
+    if(do_obfuscate && !do_llvm_vm){
         emit_decoy_block(fout, 42);
         emit_decoy_block(fout, 137);
         emit_decoy_block(fout, 256);

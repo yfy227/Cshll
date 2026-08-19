@@ -83,7 +83,7 @@ def extract_functions(c_source: str) -> List[CFunction]:
             continue
         
         # Skip VM runtime functions
-        if name.startswith('__vm_') or name.startswith('_noise_'):
+        if name.startswith('__vm_') or name.startswith('_vm_noise_'):
             continue
         
         # Skip __sh_ runtime functions
@@ -1084,7 +1084,7 @@ def mangle_function_names(c_source: str, seed: int) -> str:
         # Skip reserved/system names
         if name in ('if', 'while', 'for', 'switch', 'else', 'do', 'return', 'main'):
             continue
-        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_vm_noise_'):
             continue
         if name.startswith('__b_'):
             continue
@@ -1334,7 +1334,7 @@ def inject_noise_functions(c_source: str, seed: int, count: int = 32) -> str:
         # Generate plausible-looking function with dead computation
         n_ops = random.randint(3, 8)
         body_lines = []
-        body_lines.append(f"static int __attribute__((unused)) _noise_{i}(void) {{")
+        body_lines.append(f"static int __attribute__((unused)) _vm_noise_{i}(void) {{")
         body_lines.append(f"    volatile int _r{i} = {random.randint(100, 9999)};")
         for j in range(1, n_ops):
             val = random.randint(0, 65535)
@@ -1346,7 +1346,7 @@ def inject_noise_functions(c_source: str, seed: int, count: int = 32) -> str:
         
         # Register in .init_array
         if i < 8:
-            body_lines.append(f"__attribute__((constructor({200 + i}))) static void _noise_init_{i}(void) {{ _noise_{i}(); }}")
+            body_lines.append(f"__attribute__((constructor({200 + i}))) static void _vm_noise_init_{i}(void) {{ _vm_noise_{i}(); }}")
         
         noise_funcs.append('\n'.join(body_lines))
     
@@ -1381,7 +1381,7 @@ def indirect_global_variables(c_source: str, seed: int) -> str:
     for m in var_pattern.finditer(c_source):
         vtype = m.group(1)
         name = m.group(2)
-        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_vm_noise_'):
             continue
         if name.startswith('__b_'):
             continue
@@ -1580,7 +1580,7 @@ def indirect_function_calls(c_source: str, seed: int) -> str:
     for m in func_pattern.finditer(c_source):
         name = m.group(1)
         # Skip VM/runtime functions but allow _Q (mangled user functions)
-        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_noise_'):
+        if name.startswith('__sh_') or name.startswith('__vm_') or name.startswith('_vm_noise_'):
             continue
         if name.startswith('__b_'):
             continue
