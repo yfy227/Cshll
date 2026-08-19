@@ -372,7 +372,9 @@ static void *transpile_thread(void *arg){
     for(int i=0;i<=9;i++)
         fprintf(fout,"    if (_argc > %d) strncpy(__sh_arg%d, _argv[%d], 4095);\n",i,i,i);
     /* Set script name for error messages (bash uses $0 = script path) */
+    /* Strip leading "./" so error messages match bash's $0 */
     fprintf(fout,"    strncpy(__sh_script_name, _argv[0], 65530);\n");
+    fprintf(fout,"    { char*_sp=__sh_script_name; while(_sp[0]=='.'&&_sp[1]=='/') _sp+=2; if(_sp!=__sh_script_name) memmove(__sh_script_name,_sp,strlen(_sp)+1); }\n");
     fprintf(fout,"    { int _snl=(int)strlen(__sh_script_name); if(_snl>0 && _snl<65530){ if(__sh_script_name[_snl-3]!='.' || __sh_script_name[_snl-2]!='s' || __sh_script_name[_snl-1]!='h'){ __sh_script_name[_snl]='.'; __sh_script_name[_snl+1]='s'; __sh_script_name[_snl+2]='h'; __sh_script_name[_snl+3]=0; } } }\n");
     fprintf(fout,"\n");
     emit_node(fout,script);

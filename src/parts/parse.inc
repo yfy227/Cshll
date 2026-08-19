@@ -911,8 +911,36 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 add_var(nd->lhs,V_ARRAY);
             } else {
                 /* Check for VAR=val cmd args pattern (e.g., IFS=: read -ra p) */
-                /* If rhs is non-empty and there are more tokens, it's a prefix assignment */
-                if(rhs[0] && ntoks>1 && strncmp(rhs,"$((",3)!=0 && strncmp(rhs,"$(",2)!=0 && rhs[0]!='"'){
+                /* Also handle multiple assignments: a=1 b=2 c=3 */
+                if(rhs[0] && ntoks>1 && strncmp(rhs,"$((",3)!=0 && strncmp(rhs,"$(",2)!=0){
+                    /* Check if remaining tokens are assignments (multi-assign: a=1 b=2) */
+                    int is_multi_assign=1;
+                    for(int i=1;i<ntoks;i++){
+                        if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
+                        if(!is_assignment(toks[i])){ is_multi_assign=0; break; }
+                    }
+                    if(is_multi_assign){
+                        /* Process each assignment sequentially */
+                        nd->rhs=xstrdup(rhs);
+                        if(strncmp(rhs,"$((",3)==0) add_var(nd->lhs,V_INT);
+                        else if(strncmp(rhs,"$(",2)==0) add_var(nd->lhs,V_STR);
+                        else{
+                            int inum=1; const char *r2=rhs;
+                            if(*r2=='-'||*r2=='+')r2++;
+                            if(!*r2)inum=0;
+                            while(*r2){if(!isdigit((unsigned char)*r2)){inum=0;break;}r2++;}
+                            if(inum&&rhs[0]) add_var(nd->lhs,V_INT);
+                            else add_var(nd->lhs,V_STR);
+                        }
+                        parser_append(nd);
+                        /* Dispatch remaining assignments one by one */
+                        for(int i=1;i<ntoks;i++){
+                            if(!strcmp(toks[i],";")||!strcmp(toks[i],"then")||!strcmp(toks[i],"do")) break;
+                            /* Recursively dispatch each assignment */
+                            dispatch_segment(toks+i, 1, lineno);
+                        }
+                        return;
+                    }
                     /* VAR=val is just rhs; rest (toks[1..]) is a command */
                     nd->rhs=xstrdup(rhs);
                     /* Register variable type */

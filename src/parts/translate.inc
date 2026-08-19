@@ -370,19 +370,26 @@ char *translate_brace_expansion(const char *body){
                  cn,old,newp,global,anchor_start,anchor_end);
         return xstrdup(r);
     }
-    /* ${var^^}  ${var,,} — case conversion */
+    /* ${var^^}  ${var,,} — case conversion (all chars) */
+    /* ${var^}   ${var,}  — case conversion (first char only) */
     if(*p=='^'){
         int all=(*(p+1)=='^'); if(all) p++;
         p++; if(*p=='}') p++;
         char r[256];
-        snprintf(r,sizeof(r),"__sh_upper(%s)",safe_cname(name));
+        if(all)
+            snprintf(r,sizeof(r),"__sh_upper(%s)",safe_cname(name));
+        else
+            snprintf(r,sizeof(r),"__sh_upper_first(%s)",safe_cname(name));
         return xstrdup(r);
     }
     if(*p==','){
         int all=(*(p+1)==','); if(all) p++;
         p++; if(*p=='}') p++;
         char r[256];
-        snprintf(r,sizeof(r),"__sh_lower(%s)",safe_cname(name));
+        if(all)
+            snprintf(r,sizeof(r),"__sh_lower(%s)",safe_cname(name));
+        else
+            snprintf(r,sizeof(r),"__sh_lower_first(%s)",safe_cname(name));
         return xstrdup(r);
     }
     /* plain ${var} */
