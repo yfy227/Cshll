@@ -497,7 +497,7 @@ static void *transpile_thread(void *arg){
 /* Include the live runtime (same code as emitted into output C files) */
 #include "src/s2c_runtime_live.h"
 
-static void init_terminal_env(void){
+static void __attribute__((unused)) init_terminal_env(void){
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
     setenv("SHELL","/bin/sh",1);
@@ -635,7 +635,7 @@ static int try_builtin(int argc, char **argv){
 }
 
 /* Execute a command line with native pipe+redirect support */
-static int execute_line(char *line){
+static int __attribute__((unused)) execute_line(char *line){
     int last_rc=0;
     /* Find pipe | (not ||) */
     char *pipe_pos=NULL;
@@ -779,7 +779,7 @@ int shell2c_all_mode(int argc, char **argv){
 "              if(a<=b&&b-a<100000){\n"
 "                for(int n=a;n<=b&&di<dstsz-4;n++){\n"
 "                  if(n>a){ dst[di++]=' '; }\n"
-"                  di+=snprintf(dst+di,dstsz-di,\"%d\",n);\n"
+"                  di+=snprintf(dst+di,dstsz-di,\"%%d\",n);\n"
 "                }\n"
 "                s=end+1; continue;\n"
 "              }\n"

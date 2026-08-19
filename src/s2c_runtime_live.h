@@ -2,6 +2,13 @@
 #ifndef S2C_RUNTIME_LIVE_H
 #define S2C_RUNTIME_LIVE_H
 
+/* Runtime functions are templates — not all are used in every script.
+ * Suppress unused-function warnings for the template library. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#pragma GCC diagnostic ignored "-Wunused-but-set-variable"
+
 /* ---- shell2c runtime (deep optimization) ---- */
 #include <stdio.h>
 #include <stdlib.h>
@@ -798,5 +805,6 @@ static void __attribute__((unused)) __b_help(void){
 }
 /* ---- end runtime ---- */
 
+#pragma GCC diagnostic pop
 
 #endif

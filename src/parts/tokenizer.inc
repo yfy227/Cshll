@@ -293,11 +293,11 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
                 if(isdigit((unsigned char)start[0]) && isdigit((unsigned char)end[0])){
                     int s=atoi(start), e=atoi(end);
                     if(s<=e){ for(int v=s;v<=e&&no<1024;v++){
-                        char buf[600]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
+                        char buf[1200]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
                         out[no++]=pool_dup(buf,(int)strlen(buf));
                     } continue; }
                     else { for(int v=s;v>=e&&no<1024;v--){
-                        char buf[600]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
+                        char buf[1200]; snprintf(buf,sizeof(buf),"%s%d%s",prefix,v,suffix);
                         out[no++]=pool_dup(buf,(int)strlen(buf));
                     } continue; }
                 }
@@ -305,7 +305,7 @@ int expand_braces(char **toks, int ntoks, int maxtoks){
                 if(strlen(start)==1 && strlen(end)==1){
                     char s=start[0], e=end[0];
                     if(s<=e){ for(char c=s;c<=e&&no<1024;c++){
-                        char buf[600]; snprintf(buf,sizeof(buf),"%s%c%s",prefix,c,suffix);
+                        char buf[1200]; snprintf(buf,sizeof(buf),"%s%c%s",prefix,c,suffix);
                         out[no++]=pool_dup(buf,(int)strlen(buf));
                     } continue; }
                 }

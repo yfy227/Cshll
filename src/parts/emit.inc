@@ -56,7 +56,7 @@ static const char _SALSA20_HELPERS[] =
 "  }\n"
 "}\n";
 
-static int _salsa_emitted = 0;
+static int _salsa_emitted __attribute__((unused)) = 0;
 
 /* ── IdaTrap noise function generator (from devmprotect sample) ──
  * Emit N fake functions with plausible-looking code that does nothing.

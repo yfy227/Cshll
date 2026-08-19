@@ -20,7 +20,7 @@ char *translate_brace_expansion(const char *body){
         p++;
         while(*p && *p!='}' && *p!='[' && *p!=':' && *p!='/' && *p!='%' && *p!='^' && *p!=',') name[j++]=*p++;
         name[j]=0;
-        char r[1024];
+        char r[2048];
         /* ${#arr[@]} or ${#arr[*]} — array element count */
         if(*p=='['){
             p++; char idx[32]; int k=0;
@@ -47,7 +47,7 @@ char *translate_brace_expansion(const char *body){
         p++;
         while(*p && *p!='}') name[j++]=*p++;
         name[j]=0;
-        char r[1024];
+        char r[2048];
         if(!strcmp(name,"#")){
             /* ${!#} = last positional parameter */
             snprintf(r,sizeof(r),"__sh_indirect_args(__sh_argc,__sh_args)");
@@ -63,7 +63,7 @@ char *translate_brace_expansion(const char *body){
         p++; char idx[64]; int k=0;
         while(*p && *p!=']') idx[k++]=*p++;
         idx[k]=0; if(*p) p++;
-        char r[1024];
+        char r[2048];
         /* [@] or [*] — all elements */
         if(!strcmp(idx,"@")||!strcmp(idx,"*")){
             /* check for slice: ${arr[@]:offset:length} */
@@ -218,7 +218,7 @@ char *translate_brace_expansion(const char *body){
         char len[32]=""; 
         if(*p==':'){ p++; int l=0; while(*p&&*p!='}') len[l++]=*p++; len[l]=0; }
         if(*p=='}') p++;
-        char r[1024];
+        char r[2048];
         if(len[0])
             snprintf(r,sizeof(r),"__sh_substr(%s,%s,%s)",safe_cname(name),off,len);
         else
@@ -237,7 +237,7 @@ char *translate_brace_expansion(const char *body){
             p++;
         }
         pat[k]=0; if(*p) p++;
-        char r[1024];
+        char r[2048];
         /* Check if pattern contains ${...} — needs runtime evaluation */
         if(strstr(pat,"${")){
             /* Strip surrounding double quotes if present */
@@ -297,7 +297,7 @@ char *translate_brace_expansion(const char *body){
             p++;
         }
         pat[k]=0; if(*p) p++;
-        char r[1024];
+        char r[2048];
         /* Check if pattern contains ${...} — needs runtime evaluation */
         if(strstr(pat,"${")){
             char ipat[256]; strncpy(ipat,pat,sizeof(ipat)-1); ipat[sizeof(ipat)-1]=0;
@@ -354,7 +354,7 @@ char *translate_brace_expansion(const char *body){
         char newp[128]="";
         if(*p=='/'){ p++; int l=0; while(*p&&*p!='}') newp[l++]=*p++; newp[l]=0; }
         if(*p=='}') p++;
-        char r[1024];
+        char r[2048];
         const char *cn;
         char cnbuf[300];
         if(isdigit((unsigned char)name[0])){
@@ -1217,7 +1217,7 @@ char *translate_expr(const char *tok){
         if(!strcmp(name,"RANDOM")||!strcmp(name,"SECONDS")||!strcmp(name,"LINENO")||
            !strcmp(name,"BASHPID")||!strcmp(name,"SHLVL")||!strcmp(name,"HOSTTYPE")||
            !strcmp(name,"OSTYPE")||!strcmp(name,"MACHTYPE")){
-            char r[1024]; snprintf(r,sizeof(r),"__sh_special_var(\"%s\")",name);
+            char r[2048]; snprintf(r,sizeof(r),"__sh_special_var(\"%s\")",name);
             return xstrdup(r);
         }
         return xstrdup(var_c_expr(name));
