@@ -909,7 +909,16 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
                 obf_lo = key_lo ^ lo_mask
                 obf_hi = key_hi ^ hi_mask
                 rest = line[init_match.end():]
-                new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{obf_lo:04X}u,0x{obf_hi:04X}u));{rest}'
+                # Preserve array size if present (e.g. char buf[256] = "..." → char buf[256]; strcpy(buf, ...))
+                # If array size is empty (e.g. char buf[] = "..." → char buf[256]; strcpy(buf, ...))
+                size_match = re.search(r'\[([^\]]*)\]', prefix)
+                if size_match and size_match.group(1).strip() == '':
+                    # Empty array size — compute from string length + 1
+                    arr_size = len(content) + 1
+                    new_prefix = prefix[:size_match.start()] + f'[{arr_size}]' + prefix[size_match.end():]
+                    new_line = f'{new_prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{obf_lo:04X}u,0x{obf_hi:04X}u));{rest}'
+                else:
+                    new_line = f'{prefix[:-1]}; strcpy({varname}, __vm_dec_str("{hex_str}",0x{obf_lo:04X}u,0x{obf_hi:04X}u));{rest}'
                 result_lines.append(new_line)
                 continue
         
@@ -922,10 +931,19 @@ def encrypt_string_literals(c_source: str, key: int) -> str:
             if len(content) < 4:
                 return s
             
-            # Check context: is this a printf format string?
+            # Check context: is this inside a char literal? (e.g. '"', '\'')
+            # If the match is preceded by a single quote, it's a char literal, not a string
             start = m.start()
             before = line[:start].rstrip()
+            if before.endswith("'") or before.endswith("\\'"):
+                return s  # char literal like '"', don't encrypt
+            # Check if followed by single quote (e.g. '"' where " is the char)
+            after = line[m.end():]
+            if after.startswith("'"):
+                return s  # char literal, don't encrypt
             
+            # Check context: is this a printf format string?
+            # start and before already set above
             # Only skip %s/%d format strings for actual printf/fprintf/snprintf calls
             # __sh_fmt uses %s for shell variable substitution — should be encrypted
             is_printf_format = False
