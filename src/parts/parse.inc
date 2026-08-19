@@ -707,14 +707,14 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
 
         if(!strcmp(kw,"local")||!strcmp(kw,"declare")||!strcmp(kw,"typeset")){
             /* declare/typeset/local: parse flags and variable assignments */
-            int is_int=0, is_array=0, is_readonly=0; (void)is_readonly;
+            int is_int=0, is_array=0, is_assoc=0, is_readonly=0; (void)is_readonly;
             int start=1;
             /* parse flags */
             while(start<ntoks && toks[start][0]=='-' && toks[start][1]){
                 for(int fi=1;toks[start][fi];fi++){
                     if(toks[start][fi]=='i') is_int=1;
                     else if(toks[start][fi]=='a') is_array=1;
-                    else if(toks[start][fi]=='A') is_array=1;
+                    else if(toks[start][fi]=='A'){ is_assoc=1; is_array=1; }
                     else if(toks[start][fi]=='r') is_readonly=1;
                 }
                 start++;
@@ -766,7 +766,8 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 char *eq=strchr(nd->argv[j],'=');
                 if(eq){
                     *eq=0;
-                    if(is_array || (eq[1]=='('))
+                    if(is_assoc) add_var(nd->argv[j],V_ASSOC);
+                    else if(is_array || (eq[1]=='('))
                         add_var(nd->argv[j],V_ARRAY);
                     else if(is_int){
                         add_var(nd->argv[j],V_INT);
@@ -776,7 +777,8 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                         add_var(nd->argv[j],V_STR);
                     *eq='=';
                 } else {
-                    if(is_array) add_var(nd->argv[j],V_ARRAY);
+                    if(is_assoc) add_var(nd->argv[j],V_ASSOC);
+                    else if(is_array) add_var(nd->argv[j],V_ARRAY);
                     else if(is_int){
                         add_var(nd->argv[j],V_INT);
                         set_declared_int(nd->argv[j]);

@@ -8,7 +8,7 @@
 
 #include "s2c_common.h"
 
-typedef enum { V_INT, V_STR, V_ARRAY, V_UNKNOWN } VarKind;
+typedef enum { V_INT, V_STR, V_ARRAY, V_ASSOC, V_UNKNOWN } VarKind;
 typedef struct { char name[128]; VarKind kind; int is_local; int is_decl_int; } VarInfo;
 
 #define MAX_VARS 16384

@@ -128,9 +128,37 @@ char *translate_brace_expansion(const char *body){
              * use __sh_assoc_get helper function */
             int is_numeric=1;
             for(const char *q=idx;*q;q++){
-                if(!isdigit((unsigned char)*q) && *q!='+' && *q!='-' && *q!='$' && *q!='('){ is_numeric=0; break; }
+                if(!isdigit((unsigned char)*q) && *q!='+' && *q!='-' && *q!='$' && *q!='(' && *q!=')' && *q!='_' && !isalpha((unsigned char)*q)){ is_numeric=0; break; }
             }
+            /* Only treat as numeric if it's pure digits, or starts with $var/$(( ))
+             * and the array is NOT an associative array (declare -A) */
+            if(!(idx[0]=='$' || (idx[0]>='0'&&idx[0]<='9') || idx[0]=='-'||idx[0]=='+')) is_numeric=0;
+            if(is_numeric && idx[0]=='$' && get_var_kind(name)==V_ASSOC) is_numeric=0;
             if(is_numeric && idx[0]){
+                /* If idx starts with $, translate to C expression first */
+                if(idx[0]=='$'){
+                    char *e=translate_expr(idx);
+                    if(e && e[0]){
+                        /* Check for negative index */
+                        if(idx[0]=='-'||(idx[0]=='$'&&e[0]=='-')){
+                            snprintf(r,sizeof(r),
+                                "((__sh_arr_count(__arr_%s)+(%s)>=0)"
+                                "?(__arr_%s[__sh_arr_count(__arr_%s)+(%s)]?__arr_%s[__sh_arr_count(__arr_%s)+(%s)]:\"\")"
+                                ":(fprintf(stderr,\"%%s: line %%d: %s: bad array subscript\\n\","
+                                "__sh_script_name[0]?__sh_script_name:\"shell2c\",__sh_lineno),\"\"))",
+                                safe_cname(name),e,
+                                safe_cname(name),safe_cname(name),e,
+                                safe_cname(name),safe_cname(name),e,
+                                name);
+                        } else {
+                            snprintf(r,sizeof(r),"(__arr_%s[atoi(%s)]?__arr_%s[atoi(%s)]:\"\")",
+                                safe_cname(name),e,safe_cname(name),e);
+                        }
+                        free(e);
+                        return xstrdup(r);
+                    }
+                    if(e) free(e);
+                }
                 /* Check for negative index: ${arr[-1]} → arr[arr_count-1] */
                 if(idx[0]=='-' && isdigit((unsigned char)idx[1])){
                     /* Negative index with bounds check: if count+idx<0, "bad array subscript" */
@@ -389,10 +417,20 @@ char *translate_brace_expansion(const char *body){
         if(*p=='#'){ anchor_start=1; p++; }
         if(*p=='%'){ anchor_end=1; p++; }
         char old[128]; int k=0;
-        while(*p && *p!='/' && *p!='}') old[k++]=*p++;
+        while(*p && *p!='}' && k<(int)sizeof(old)-1){
+            if(*p=='\\' && *(p+1)=='/'){ old[k++]='/'; p+=2; continue; } /* \/ → / */
+            if(*p=='/' && k>0) break; /* unescaped / is separator */
+            if(*p=='\\' && *(p+1)){ old[k++]=*p++; old[k++]=*p++; continue; } /* keep other escapes */
+            if(*p=='/') break;
+            old[k++]=*p++;
+        }
         old[k]=0;
         char newp[128]="";
-        if(*p=='/'){ p++; int l=0; while(*p&&*p!='}') newp[l++]=*p++; newp[l]=0; }
+        if(*p=='/'){ p++; int l=0; while(*p&&*p!='}'&&l<(int)sizeof(newp)-1){
+            if(*p=='\\' && *(p+1)=='/'){ newp[l++]='/'; p+=2; continue; }
+            if(*p=='\\' && *(p+1)){ newp[l++]=*p++; newp[l++]=*p++; continue; }
+            newp[l++]=*p++;
+        } newp[l]=0; }
         if(*p=='}') p++;
         char r[2048];
         const char *cn;
@@ -406,8 +444,21 @@ char *translate_brace_expansion(const char *body){
             snprintf(cnbuf,sizeof(cnbuf),"(__sh_getenv(\"%s\"))",name);
             cn=cnbuf;
         }
+        /* Escape old and newp for C string literal */
+        char esc_old[256]; int eo=0;
+        for(int i=0;old[i]&&eo<(int)sizeof(esc_old)-2;i++){
+            if(old[i]=='"'||old[i]=='\\') esc_old[eo++]='\\';
+            esc_old[eo++]=old[i];
+        }
+        esc_old[eo]=0;
+        char esc_new[256]; int en=0;
+        for(int i=0;newp[i]&&en<(int)sizeof(esc_new)-2;i++){
+            if(newp[i]=='"'||newp[i]=='\\') esc_new[en++]='\\';
+            esc_new[en++]=newp[i];
+        }
+        esc_new[en]=0;
         snprintf(r,sizeof(r),"__sh_replace(%s,\"%s\",\"%s\",%d,%d,%d)",
-                 cn,old,newp,global,anchor_start,anchor_end);
+                 cn,esc_old,esc_new,global,anchor_start,anchor_end);
         return xstrdup(r);
     }
     /* ${var^^}  ${var,,} — case conversion (all chars) */
@@ -912,7 +963,7 @@ char *translate_expr(const char *tok){
                     VarKind vk=get_var_kind(nm);
                     const char *cn=safe_cname(nm);
                     /* Check for array access: var[$key] or var[N] */
-                    if(vk==V_ARRAY && *s=='['){
+                    if((vk==V_ARRAY || vk==V_ASSOC) && *s=='['){
                         s++; /* skip [ */
                         /* Read the index expression until ] */
                         char idxexpr[256]; int ii=0;
@@ -963,7 +1014,7 @@ char *translate_expr(const char *tok){
                 VarKind vk=get_var_kind(nm);
                 const char *cn=safe_cname(nm);
                 /* Check for array access: var[idx] or var[$key] */
-                if(vk==V_ARRAY && *s=='['){
+                if((vk==V_ARRAY || vk==V_ASSOC) && *s=='['){
                     s++; /* skip [ */
                     char idxexpr[256]; int ii=0;
                     int bd=1;

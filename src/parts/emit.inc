@@ -1974,7 +1974,7 @@ void emit_node(FILE *out, Node *n){
                     char *e=translate_num_operand(eq+1);
                     fprintf(out,"    %s=%s;\n",cn,e);
                     free(e);
-                } else if(vk==V_ARRAY || eq[1]=='('){
+                } else if(vk==V_ARRAY || vk==V_ASSOC || eq[1]=='('){
                     /* array assignment */
                     add_var(n->argv[i],V_ARRAY);
                     /* parse array elements */
@@ -2675,7 +2675,7 @@ void emit_functions(FILE *out, Node *n){
             const char *cn=safe_cname(locals[i]);
             if(vk==V_INT){
                 fprintf(out,"    int __save_%s=%s;\n",cn,cn);
-            } else if(vk==V_ARRAY){
+            } else if(vk==V_ARRAY || vk==V_ASSOC){
                 /* skip array save/restore for now */
             } else {
                 fprintf(out,"    char __save_%s[1024]; strncpy(__save_%s,%s,sizeof(__save_%s)-1);\n",cn,cn,cn,cn);
@@ -2688,7 +2688,7 @@ void emit_functions(FILE *out, Node *n){
             const char *cn=safe_cname(locals[i]);
             if(vk==V_INT){
                 fprintf(out,"    %s=__save_%s;\n",cn,cn);
-            } else if(vk==V_ARRAY){
+            } else if(vk==V_ARRAY || vk==V_ASSOC){
                 /* skip */
             } else {
                 fprintf(out,"    strncpy(%s,__save_%s,sizeof(%s)-1);\n",cn,cn,cn);

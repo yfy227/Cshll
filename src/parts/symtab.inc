@@ -114,7 +114,8 @@ void add_var(const char *name, VarKind k){
     if(!name||!*name) return;
     for(int i=0;i<var_count;i++){
         if(strcmp(var_table[i].name,name)==0){
-            if(k==V_ARRAY) var_table[i].kind=V_ARRAY;
+            if(k==V_ASSOC) var_table[i].kind=V_ASSOC;
+            else if(k==V_ARRAY && var_table[i].kind!=V_ASSOC) var_table[i].kind=V_ARRAY;
             else if(k==V_INT) var_table[i].kind=V_INT;
             else if(k==V_STR && var_table[i].kind==V_INT) var_table[i].kind=V_STR; /* += upgrades to string */
             return;

@@ -275,6 +275,20 @@ char *translate_cond(const char *cond){
             else if(!strcmp(words[wi],"(")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,"("); wi++; }
             else if(!strcmp(words[wi],")")){ bi+=snprintf(buf+bi,sizeof(buf)-bi,")"); wi++; }
             else if(!strcmp(words[wi],"[")||!strcmp(words[wi],"]")){ wi++; /* skip brackets */ }
+            /* Skip stderr redirects: 2>/dev/null, 2>&1, 1>/dev/null, etc. */
+            else if(!strncmp(words[wi],"2>",2)||!strncmp(words[wi],"1>",2)||
+                     !strcmp(words[wi],">/dev/null")||!strcmp(words[wi],"2>&1")||
+                     !strcmp(words[wi],"2>&-")){ wi++; }
+            /* Also skip bare redirect tokens: 2 > /dev/null (tokenized separately) */
+            else if((!strcmp(words[wi],"2")||!strcmp(words[wi],"1"))&&
+                     wi+1<nw&&!strcmp(words[wi+1],">")&&
+                     wi+2<nw&&strstr(words[wi+2],"/dev/null")){
+                wi+=3; /* skip "2" ">" "/dev/null" */
+            }
+            else if(!strcmp(words[wi],">")&&wi+1<nw&&
+                     (strstr(words[wi+1],"/dev/null")||!strcmp(words[wi+1],"&1"))){
+                wi+=2; /* skip ">" "/dev/null" or ">" "&1" */
+            }
             else {
                 if(wi+2<nw && (
                     !strcmp(words[wi+1],"=")||!strcmp(words[wi+1],"==")||

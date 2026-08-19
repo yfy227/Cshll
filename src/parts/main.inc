@@ -342,7 +342,7 @@ static void *transpile_thread(void *arg){
         const char *cn=safe_cname(var_table[i].name);
         if(var_table[i].kind==V_INT)
             fprintf(fout,"static int %s=0;\n",cn);
-        else if(var_table[i].kind==V_ARRAY)
+        else if(var_table[i].kind==V_ARRAY || var_table[i].kind==V_ASSOC || var_table[i].kind==V_ASSOC)
             fprintf(fout,"static const char *__arr_%s[256]={NULL};\n",cn);
         else
             fprintf(fout,"static char %s[65536]=\"\";\n",cn);
