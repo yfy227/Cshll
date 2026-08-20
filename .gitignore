@@ -25,3 +25,7 @@ tests/test_syscmd
 tests/*_obf
 tests/*_vm
 tests/boundary/*.c
+
+# legacy artifacts
+shell2c_asan
+shell2c.c.bak
