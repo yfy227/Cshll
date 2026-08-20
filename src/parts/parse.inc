@@ -720,6 +720,15 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 parser_pop();
             return;
         }
+        if(!strcmp(kw,")")){
+            /* closer for a multi-line subshell opened by a bare "(" line */
+            if(blk_top&&blk_top->kind==BLK_SUBSHELL){
+                /* tokens after ) on the same line continue the outer flow */
+                if(ntoks>1) dispatch_segment(toks+1,ntoks-1,lineno);
+                parser_pop();
+            }
+            return;
+        }
         if(!strcmp(kw,"break")){parser_append(new_node(NODE_BREAK,lineno));return;}
         if(!strcmp(kw,"continue")){parser_append(new_node(NODE_CONTINUE,lineno));return;}
         if(!strcmp(kw,"return")){
@@ -1209,6 +1218,33 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 /* If there are tokens after ), handle them */
                 if(end+1<ntoks){
                     dispatch_segment(toks+end+1,ntoks-end-1,lineno);
+                }
+                return;
+            }
+            if(end==1) return; /* "()" — empty subshell, no-op */
+            if(end==-1){
+                /* Multi-line subshell opener: "( [tokens...]" — body
+                 * continues on following lines until a ")" closer line.
+                 * Mirrors the { group opener pattern. */
+                Node *nd=new_node(NODE_SUBSHELL,lineno);
+                Node **_pi=parse_insert;
+                parser_append(nd);
+                BlkFrame fr={BLK_SUBSHELL,nd,&nd->left,_pi};
+                parser_push(fr);
+                parse_insert=&nd->left;
+                if(ntoks>1){
+                    /* body may start on the opener line: split on ; */
+                    int __cs=1;
+                    while(__cs<ntoks){
+                        int __ce=ntoks; int __d=0;
+                        for(int i=__cs;i<ntoks;i++){
+                            if(!strcmp(toks[i],"(")||!strcmp(toks[i],"[[")) __d++;
+                            else if(!strcmp(toks[i],")")||!strcmp(toks[i],"]]")) __d--;
+                            else if(!__d && !strcmp(toks[i],";")){ __ce=i; break; }
+                        }
+                        if(__ce>__cs) dispatch_segment(toks+__cs, __ce-__cs, lineno);
+                        __cs=__ce+1;
+                    }
                 }
                 return;
             }

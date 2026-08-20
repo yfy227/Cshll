@@ -378,6 +378,17 @@ static int __sh_test_same(const char *a,const char *b){ struct stat sa,sb; if(st
 static int __sh_test_nt(const char *a,const char *b){ struct stat sa,sb; if(stat(a,&sa)!=0) return 0; if(stat(b,&sb)!=0) return 1; return sa.st_mtime>sb.st_mtime; }
 static int __sh_test_ot(const char *a,const char *b){ struct stat sa,sb; if(stat(a,&sa)!=0) return 0; if(stat(b,&sb)!=0) return 0; return sa.st_mtime<sb.st_mtime; }
 static int __sh_test_cmd(const char *cmd){ FILE *p=popen(cmd,"r"); if(!p) return 0; char buf[1024]; int got=0; while(fgets(buf,sizeof(buf),p)){ got=1; } pclose(p); return got; }
+/* Exit-status semantics for `if <command>` conditions (POSIX): the
+ * condition is true iff the command's exit status is 0. Unlike
+ * __sh_test_cmd (which checks "produced output"), this matches bash:
+ * `if grep -q pat file` is TRUE with no output; `if ! false` is TRUE.
+ * Output passes through to stdout, exactly as bash does. */
+static int __sh_cmd_status(const char *cmd){
+    int st=system(cmd);
+    if(st==-1) return 127;
+    if(WIFEXITED(st)) return WEXITSTATUS(st);
+    return 1; /* killed by signal */
+}
 static int __sh_regex(const char *s,const char *pat){ regex_t r; if(regcomp(&r,pat,REG_EXTENDED|REG_NOSUB)!=0) return 0; int rc=regexec(&r,s,0,NULL,0); regfree(&r); return rc==0; }
 
 /* ---- file builtins ---- */

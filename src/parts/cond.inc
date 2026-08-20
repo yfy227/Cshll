@@ -690,15 +690,23 @@ char *translate_cond(const char *cond){
             return buf;
         }
     }
-    /* command as condition — non-empty output = true */
+    /* external command as condition — POSIX exit-status semantics.
+     * `if cmd` is true iff cmd's exit status is 0 (NOT "produced
+     * output": `if grep -q` is true silently; `if ! false` is true).
+     * Handle leading ! (possibly repeated: !!, !!!) by negation. */
     {
+        int negate=0;
+        const char *fs=s;
+        while(*fs=='!'){ negate=!negate; fs++; while(*fs==' '||*fs=='\t') fs++; }
         char esc[2048]; int e=0;
-        for(const char *q=s;*q&&e<(int)sizeof(esc)-4;q++){
+        for(const char *q=fs;*q&&e<(int)sizeof(esc)-4;q++){
             if(*q=='"'||*q=='\\') esc[e++]='\\';
             esc[e++]=*q;
         }
         esc[e]=0;
-        snprintf(buf,sizeof(buf),"(__sh_test_cmd(\"%s\"))",esc);
+        /* Polarity: shell condition is true ⟺ status==0, i.e. C `!st`.
+         * An odd number of shell '!' negates it — cancelling the C '!'. */
+        snprintf(buf,sizeof(buf),"(%s__sh_cmd_status(\"%s\"))",negate?"":"!",esc);
         return buf;
     }
 }

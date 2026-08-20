@@ -116,3 +116,23 @@
 **测试结果：** 语法矩阵 23/23 PASS；全部回归 7/7；e2e 12/13（realworld 仅环境差异）
 
 **CI：** 语法矩阵接入 GitHub Actions
+
+---
+
+### 2026-08-21 05:10 — 第六轮审视（语法 gap 清零：条件语义 + 子 shell）
+
+**发现并修复的问题：**
+
+11. [P0-已修复] gap-021: `if <command>` 条件语义根本性错误——`__sh_test_cmd` 用 popen 检查"是否产生输出"而非退出状态
+    - 后果：`if grep -q pat file`（静默成功）判为假；`if ! false` 判为假
+    - 修复：新增运行时 `__sh_cmd_status()`（system() + WEXITSTATUS，输出透传同 bash）；cond.inc 兜底路径改用之，并支持重复 `!` 前缀（极性：shell 真 ⟺ status==0 ⟺ C `!st`，奇数个 `!` 恰好抵消）
+    - 语句级 `! cmd || ...` / `! cmd && ...` 同时验证通过
+
+12. [P1-已修复] gap-024: 多行子 shell `( ... )` 完全不支持——裸 `(` 行 fallthrough 成 system() 损坏调用 + 作用域泄漏
+    - 修复：parse.inc 新增多行 opener（BLK_SUBSHELL 帧 + 行内体按 `;` 分派）和 `)` closer（后随 token 回归外层流）；嵌套子 shell 亦通过（变量隔离语义正确）
+
+**新增语法用例：**
+- 026_negation_deep: `!` 五种形态（if 内/语句级/双重否定）
+- 027_subshell_nested: 嵌套子 shell 变量隔离 + cwd 锁定
+
+**测试结果：** 语法矩阵 27/27 PASS（gaps 目录清空）；回归 7/7；e2e 12/13（realworld 仅环境差异）；ASAN/LSan 新路径全清

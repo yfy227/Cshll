@@ -537,6 +537,8 @@ const char *RT_HEADER =
 "static int __sh_test_nt(const char *a,const char *b){ struct stat sa,sb; if(stat(a,&sa)!=0) return 0; if(stat(b,&sb)!=0) return 1; return sa.st_mtime>sb.st_mtime; }\n"
 "static int __sh_test_ot(const char *a,const char *b){ struct stat sa,sb; if(stat(a,&sa)!=0) return 0; if(stat(b,&sb)!=0) return 0; return sa.st_mtime<sb.st_mtime; }\n"
 "static int __sh_test_cmd(const char *cmd){ FILE *p=popen(cmd,\"r\"); if(!p) return 0; char buf[1024]; int got=0; while(fgets(buf,sizeof(buf),p)){ got=1; } pclose(p); return got; }\n"
+"/* Exit-status semantics for if <command> conditions (POSIX). */\n"
+"static int __sh_cmd_status(const char *cmd){ int st=system(cmd); if(st==-1) return 127; if(WIFEXITED(st)) return WEXITSTATUS(st); return 1; }\n"
 "static int __sh_regex(const char *s,const char *pat){ regex_t r; if(regcomp(&r,pat,REG_EXTENDED|REG_NOSUB)!=0) return 0; int rc=regexec(&r,s,0,NULL,0); regfree(&r); return rc==0; }\n"
 "\n"
 "/* ---- file builtins ---- */\n"
