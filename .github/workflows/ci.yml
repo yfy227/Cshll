@@ -26,6 +26,9 @@ jobs:
       - name: Run regression tests (REG-01..REG-07)
         run: bash tests/regression_2026_08.sh
 
+      - name: Run syntax coverage matrix (23 features)
+        run: bash tests/run_syntax_tests.sh
+
       - name: Run e2e diff tests
         run: |
           for t in tests/test1.sh tests/test2.sh tests/test3.sh tests/test4.sh \
