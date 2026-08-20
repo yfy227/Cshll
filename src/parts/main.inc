@@ -276,6 +276,9 @@ static void *transpile_thread(void *arg){
 
         printf("[OK] %s -> %s (VM mode)\n",argv[1],argv[2]);
         g_retcode = 0; /* ensure success return code */
+        /* NOTE: VM path intentionally does NOT free the AST here — the VM
+         * mangle/rewrite pass below may still reference node data. Freed
+         * at process exit (transpiler is a short-lived process). */
 
         /* Handle --makefile and --run */
         for(int i=3;i<argc;i++){
@@ -504,6 +507,14 @@ static void *transpile_thread(void *arg){
         }
     }
     g_retcode = 0;
+    /* Free the AST — establishes ownership: parser allocates, emitter
+     * borrows, we free. pending_pipe_cmd is either consumed (and freed
+     * at its emission site) or is a leftover from an aborted parse. */
+    free_node(script);
+    if(pending_pipe_cmd){
+        free_node(pending_pipe_cmd);
+        pending_pipe_cmd=NULL;
+    }
     return NULL;
 }
 

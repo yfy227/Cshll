@@ -302,6 +302,7 @@ char *translate_cond(const char *cond){
                 words[nw++]=w;
             }
             words[nw]=NULL;
+            free(cp); /* words[] hold independent copies of the tokens */
         }
         int wi=0; int bi=0;
         bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
@@ -365,6 +366,7 @@ char *translate_cond(const char *cond){
         }
         bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
         buf[bi]=0;
+        for(int i=0;i<nw;i++) free(words[i]); /* free token copies */
         return buf;
         } /* end if(has_close) */
     } /* end if([ ) */
@@ -416,6 +418,7 @@ char *translate_cond(const char *cond){
                 words[nw++]=w;
             }
             words[nw]=NULL;
+            free(cp); /* words[] hold independent copies of the tokens */
         }
         int wi=0; int bi=0;
         bi+=snprintf(buf+bi,sizeof(buf)-bi,"(");
@@ -527,6 +530,7 @@ char *translate_cond(const char *cond){
         }
         bi+=snprintf(buf+bi,sizeof(buf)-bi,")");
         buf[bi]=0; /* ensure null termination */
+        for(int i=0;i<nw;i++) free(words[i]); /* free token copies */
         return buf;
     }
     /* [ ... ] */

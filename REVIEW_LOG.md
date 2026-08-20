@@ -78,3 +78,24 @@
 - 回归测试扩充至 7 用例（REG-06 自引用追加、REG-07 2KB 长变量插值）
 
 **测试结果：** 7/7 回归 + 12/13 e2e（realworld 仅 $0/$$ 环境固有差异）
+
+---
+
+### 2026-08-21 04:00 — 第四轮审视（ASAN/LSan 系统性清零 + AST ownership 建立）
+
+**发现并修复的问题：**
+
+7. [P0-已修复] tokenizer.inc 栈缓冲区下溢读：`}` 分支读 `*(p-1)` 缺 `p>line` 守卫（`{` 分支有），行首 `}` 触发 ASAN stack-buffer-underflow（1 字节 UB 读）
+
+8. [P1-已修复] cond.inc translate_cond 两处泄漏：`cp=strdup(...)` 和 `words[]` token 数组（每词一 malloc）用后未释放——分词后立即 free(cp)，return 前释放全部 words
+
+9. [P1-已修复] parse.inc case 语句双重 strdup：`xstrdup(translate_expr(...))` 内层分配直接泄漏（ASAN: 6-byte direct leak）——先取值、复制、再释放内层
+
+10. [P0-已修复] AST 全树无 ownership（审核报告"谁负责 free"条目）：新增递归 `free_node()`（ast.inc），覆盖全部 Node 字段（argv/for_list/redirs 链/case 分支/子树/兄弟链）；transpile 正常路径结束时释放 script 根 + 残留 pending_pipe_cmd；emit 消费点释放 detached 管道节点。VM 路径保守不释放（vm bridge 可能保留节点引用，短命进程退出回收），注释说明
+
+**CI 升级（.github/workflows/ci.yml）：**
+- 回归测试 REG-01..07 接入
+- 12 个 e2e diff 测试接入（bash vs 转译产物逐脚本对比）
+- ASAN+UBSAN+LSan 构建 + 全测试脚本扫描接入
+
+**测试结果：** ASAN/LSan 13/13 clean（转译器侧零报告），回归 7/7，e2e 12/13（realworld 仅 $0/$$ 环境差异）

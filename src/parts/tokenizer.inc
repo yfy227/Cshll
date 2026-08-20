@@ -174,11 +174,12 @@ int tokenize(const char *line, char **toks, int maxtoks){
         if(*p==']'&&*(p+1)==']'){ toks[n++]=(char*)"]]"; p+=2; continue; }
         if(*p=='['){             toks[n++]=(char*)"[";  p++;  continue; }
         if(*p==']'){             toks[n++]=(char*)"]";  p++;  continue; }
-        /* { and } as standalone tokens when surrounded by whitespace or start/end */
+        /* { and } as standalone tokens when surrounded by whitespace or start/end.
+         * Note: '}' needs p>line guard — reading *(p-1) at buffer start is UB. */
         if(*p=='{' && (p==line || isspace((unsigned char)*(p-1))) && (isspace((unsigned char)*(p+1)) || *(p+1)==';' || *(p+1)==0)){
             toks[n++]=(char*)"{"; p++; continue;
         }
-        if(*p=='}' && (isspace((unsigned char)*(p-1)) || *(p-1)==';') && (isspace((unsigned char)*(p+1)) || *(p+1)==';' || *(p+1)==0)){
+        if(*p=='}' && p>line && (isspace((unsigned char)*(p-1)) || *(p-1)==';') && (isspace((unsigned char)*(p+1)) || *(p+1)==';' || *(p+1)==0)){
             toks[n++]=(char*)"}"; p++; continue;
         }
         if(*p=='('&&*(p+1)=='('){ toks[n++]=(char*)"(("; p+=2; continue; }

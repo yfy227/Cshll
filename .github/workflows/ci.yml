@@ -23,6 +23,21 @@ jobs:
       - name: Run test_stress (S01-S50)
         run: bash tests/test_stress.sh
 
+      - name: Run regression tests (REG-01..REG-07)
+        run: bash tests/regression_2026_08.sh
+
+      - name: Run e2e diff tests
+        run: |
+          for t in tests/test1.sh tests/test2.sh tests/test3.sh tests/test4.sh \
+                   tests/test5.sh tests/test6.sh tests/twopipe.sh tests/test_hd.sh \
+                   tests/test_newfeat.sh tests/test_compat.sh tests/test_complex.sh \
+                   tests/test_patterns.sh; do
+            ./shell2c "$t" "${t%.sh}.c" || exit 1
+            gcc -O2 -w -o "${t%.sh}" "${t%.sh}.c" || exit 1
+            diff <(bash "$t" 2>&1) <("./${t%.sh}" 2>&1) || { echo "FAILED: $t"; exit 1; }
+            echo "PASS: $t"
+          done
+
       - name: Run test_stress2 (S51-S100)
         run: bash tests/test_stress2.sh
 
@@ -31,6 +46,23 @@ jobs:
 
       - name: Run test_deep_audit (D001-D050)
         run: bash tests/test_deep_audit.sh
+
+      - name: Build with AddressSanitizer + LeakSanitizer (transpiler)
+        run: |
+          gcc -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer \
+              -Wall -Isrc -I. -o shell2c_asan \
+              shell2c.c src/s2c_obfuscate.c src/s2c_mangle.c \
+              src/s2c_vm_runtime.c src/s2c_vm_bridge.c -lpthread
+
+      - name: ASAN: run transpiler over all test scripts
+        run: |
+          for t in tests/test1.sh tests/test2.sh tests/test3.sh tests/test4.sh \
+                   tests/test5.sh tests/test6.sh tests/twopipe.sh tests/test_hd.sh \
+                   tests/test_newfeat.sh tests/test_compat.sh tests/test_complex.sh \
+                   tests/test_patterns.sh tests/regression_2026_08.sh; do
+            ASAN_OPTIONS=detect_leaks=1 ./shell2c_asan "$t" /tmp/asan_out.c || exit 1
+          done
+          echo "ASAN clean"
 
       - name: Run boundary tests
         run: |

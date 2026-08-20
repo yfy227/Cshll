@@ -2445,6 +2445,7 @@ void emit_node(FILE *out, Node *n){
             emit_node(out,pending_pipe_cmd);
             fprintf(out,"    fflush(stdout); _exit(0); }\n");
             fprintf(out,"    close(__ppfd[1]); int __psi=dup(0); dup2(__ppfd[0],0); close(__ppfd[0]); clearerr(stdin);\n");
+            free_node(pending_pipe_cmd); /* detached node: freed at emission */
             pending_pipe_cmd=NULL;
             pipe_restore_needed=1;
             /* fall through to normal while handling, but mark for restore */
