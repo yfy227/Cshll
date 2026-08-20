@@ -602,8 +602,17 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                         }
                     }
                 }
-                /* Check for unconsumed heredoc (<<HD was pre-scanned and removed) */
-                if(heredoc_peek()){
+                /* Check for heredoc redirect on THIS line (done <<HD).
+                 * The pre-scanner stores the body and strips the delimiter,
+                 * leaving a bare "<<" token. Only consume a heredoc if the
+                 * "done" line itself carries "<<". Using heredoc_peek() alone
+                 * would steal heredocs belonging to earlier commands whose
+                 * emission (and consumption) happens after parsing. */
+                int done_has_heredoc=0;
+                for(int i=1;i<ntoks;i++){
+                    if(!strcmp(toks[i],"<<")){ done_has_heredoc=1; break; }
+                }
+                if(done_has_heredoc && heredoc_peek()){
                     int hd_expand=1;
                     const char *hd_text=heredoc_consume(&hd_expand);
                     Redir *r=new_redir(0,NULL,0,-1,1,0,hd_text);

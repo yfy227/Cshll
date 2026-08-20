@@ -1,13 +1,27 @@
+# Build artifacts
+*.o
+*.a
+*.so
 shell2c
+shell2c_vm
+shell2c_dbg
+
+# Generated C output & compiled test binaries
 tests/*.c
 tests/test1
 tests/test2
 tests/test3
 tests/test4
+tests/test5
+tests/test6
 tests/twopipe
-*.o
-*.out
-__pycache__/
-tests/test_newfeat
-tests/test_realworld
-tests/test_stress
+tests/test_hd
+tests/test_rw
+tests/test_nf
+tests/test_compat
+tests/test_complex
+tests/test_patterns
+tests/test_syscmd
+tests/*_obf
+tests/*_vm
+tests/boundary/*.c

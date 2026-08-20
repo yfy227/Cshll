@@ -56,6 +56,43 @@ static char *quote_if_path(const char *c){
     return xstrdup(c);
 }
 
+/* Build a C expression of type char* for a shell word used as a function
+ * argument in __av[] arrays. Guarantees type correctness:
+ *  - "$..." words go through translate_expr (char* expansion)
+ *  - quoted words with $ inside go through translate_expr (__sh_fmt)
+ *  - single-quoted / bare words (incl. numbers) become escaped C literals
+ * This is unlike translate_operand/translate_expr, which intentionally
+ * return bare numeric literals for arithmetic contexts. */
+static char *av_arg_expr(const char *word){
+    int len = word ? (int)strlen(word) : 0;
+    if(!word || !len) return xstrdup("\"\"");
+    /* $-prefixed: full expansion via translate_expr (returns char* expr) */
+    if(word[0]=='$') return translate_expr(word);
+    /* double-quoted containing $: expansion needed */
+    if(len>=2 && word[0]=='"' && word[len-1]=='"' && strchr(word,'$'))
+        return translate_expr(word);
+    /* single-quoted: literal (strip quotes, escape, no expansion) */
+    /* double-quoted without $: literal (strip quotes, escape) */
+    /* bare word: literal (escape) */
+    const char *inner = word; int ilen = len;
+    if(len>=2 && ((word[0]=='"'&&word[len-1]=='"')||(word[0]=='\''&&word[len-1]=='\''))){
+        inner = word+1; ilen = len-2;
+    }
+    char *r = malloc(ilen*4+8); if(!r) return xstrdup("\"\"");
+    int q=0; r[q++]='"';
+    for(int i=0;i<ilen;i++){
+        char c=inner[i];
+        if(c=='"'||c=='\\'){ r[q++]='\\'; r[q++]=c; }
+        else if(c=='\n'){ r[q++]='\\'; r[q++]='n'; }
+        else if(c=='\t'){ r[q++]='\\'; r[q++]='t'; }
+        else if(c=='\r'){ r[q++]='\\'; r[q++]='r'; }
+        else if(isprint((unsigned char)c)||c&0x80){ r[q++]=c; }
+        else { q+=snprintf(r+q,8,"\\%03o",(unsigned char)c); }
+    }
+    r[q++]='"'; r[q]=0;
+    return r;
+}
+
 char *translate_test_unary(const char *op,const char *a1){
     static char buf[1024];
     /* For -n/-z with int variables, use numeric check instead of string */
@@ -468,8 +505,8 @@ char *translate_cond(const char *cond){
                         for(j=wi+1; j<nw; j++){
                             /* stop at && || ! */
                             if(!strcmp(words[j],"&&")||!strcmp(words[j],"||")||!strcmp(words[j],"!")) break;
-                            /* Use translate_expr to expand $var, ${...}, $((...)) etc. */
-                            char *e=translate_expr(words[j]);
+                            /* Use av_arg_expr: guarantees char* type for __av[] */
+                            char *e=av_arg_expr(words[j]);
                             fai+=snprintf(fargs+fai,sizeof(fargs)-fai,"%s,",e);
                             free(e);
                             fnargs++;
@@ -635,7 +672,7 @@ char *translate_cond(const char *cond){
                 else if(*p=='\''){ p++; while(*p && *p!='\'' && al<(int)sizeof(arg)-1) arg[al++]=*p++; if(*p=='\'')p++; }
                 else { while(*p && *p!=' ' && *p!='\t' && al<(int)sizeof(arg)-1) arg[al++]=*p++; }
                 arg[al]=0;
-                { char *e=translate_expr(arg);
+                { char *e=av_arg_expr(arg);
                   ai+=snprintf(args+ai,sizeof(args)-ai,"%s,",e);
                   free(e);
                 }

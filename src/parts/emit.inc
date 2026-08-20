@@ -399,7 +399,9 @@ char *emit_word(FILE *out, const char *word){
 }
 
 /* Emit redirects: returns number of saved-fd statements emitted.
- * Each saved fd is named __sfd_<id>_<fd>. Caller must emit restore after. */
+ * Each saved fd is named __sfd_<id>_<idx>. Caller must emit restore after.
+ * Uses per-entry index (not fd) to avoid variable name collisions when
+ * multiple redirects target the same fd (e.g. heredoc + process subst). */
 int __redir_counter = 0;
 
 int emit_redirs_save(FILE *out, Redir *r, int id){
@@ -407,11 +409,22 @@ int emit_redirs_save(FILE *out, Redir *r, int id){
     int myid = __redir_counter++;
     int count=0;
     for(Redir *p=r;p;p=p->next){
-        fprintf(out,"    int __sfd_%d_%d=dup(%d);\n",myid,p->fd,p->fd);
+        fprintf(out,"    int __sfd_%d_%d=dup(%d);\n",myid,count,p->fd);
+        p->fd_high = count; /* store per-entry index for restore */
         count++;
     }
-    /* stash myid in the first redir's fd_high for restore to find */
-    if(r) r->fd_high = myid;
+    if(r) r->fd_high = myid; /* store counter id in first entry */
+    /* But we also need the per-entry index. Store myid in fd_high of
+     * each entry's upper bits, and index in lower bits. Simpler: use
+     * a parallel approach — store myid in a field on first entry only. */
+    /* Actually, let's use a simpler scheme: store myid<<16|idx in fd_high */
+    {
+        int idx = 0;
+        for(Redir *p=r;p;p=p->next){
+            p->fd_high = (myid << 16) | idx;
+            idx++;
+        }
+    }
     return count;
 }
 
@@ -473,14 +486,16 @@ void emit_redirs_apply(FILE *out, Redir *r, int id){
 
 void emit_redirs_restore(FILE *out, Redir *r, int id){
     (void)id;
-    int myid = r ? r->fd_high : 0;
     /* restore in reverse order */
     Redir *stack[32]; int sp=0;
     for(Redir *p=r;p&&sp<32;p=p->next) stack[sp++]=p;
     for(int i=sp-1;i>=0;i--){
+        int packed = stack[i]->fd_high;
+        int myid = packed >> 16;
+        int idx = packed & 0xFFFF;
         fprintf(out,"    fflush(%s); dup2(__sfd_%d_%d,%d); close(__sfd_%d_%d);\n",
                 stack[i]->fd==1?"stdout":(stack[i]->fd==2?"stderr":"NULL"),
-                myid,stack[i]->fd,stack[i]->fd, myid,stack[i]->fd);
+                myid,idx,stack[i]->fd, myid,idx);
     }
 }
 
