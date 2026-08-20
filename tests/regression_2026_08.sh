@@ -86,10 +86,31 @@ done < <(echo "a b"; echo "c d")
 echo "end"
 SCRIPT
 
+# REG-06: variable self-append must not truncate (snprintf overlap UB)
+cat > "$WORK/reg06.sh" << 'SCRIPT'
+#!/bin/bash
+BIG=""
+for i in 1 2 3 4 5; do
+  BIG="$BIG padding-block-$i-abcdefghij"
+done
+echo "len: ${#BIG}"
+echo "tail: ${BIG: -12}"
+SCRIPT
+
+# REG-07: long variable interpolation must not truncate at 1024
+cat > "$WORK/reg07.sh" << 'SCRIPT'
+#!/bin/bash
+LONG="$(printf 'x%.0s' $(seq 1 2000))"
+echo "size: ${#LONG}"
+echo "head: ${LONG:0:10}"
+SCRIPT
+
 check "REG-01 heredoc+unregistered var no hang" "$WORK/reg01.sh"
 check "REG-02 dual fd0 redirects no redefinition" "$WORK/reg02.sh"
 check "REG-03 typed function args in conditions" "$WORK/reg03.sh"
 check "REG-04 heredoc ordering" "$WORK/reg04.sh"
 check "REG-05 proc subst shell syntax" "$WORK/reg05.sh"
+check "REG-06 self-append no truncation" "$WORK/reg06.sh"
+check "REG-07 2KB var interpolation" "$WORK/reg07.sh"
 
 if [ $FAIL -eq 0 ]; then echo "ALL REGRESSION TESTS PASSED"; else echo "REGRESSION DETECTED"; exit 1; fi

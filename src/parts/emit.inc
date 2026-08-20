@@ -377,11 +377,14 @@ char *emit_word(FILE *out, const char *word){
         free(esc);
         return r;
     }
-    /* Has $ — use expand_string for variable expansion */
+    /* Has $ — use expand_string for variable expansion.
+     * P0 fix: use heap __sh_fmt_dyn instead of fixed char[1024] —
+     * prevents silent truncation when interpolated variables exceed
+     * 1023 bytes (e.g. large file contents in a variable). */
     ExpandResult er; expand_string(unescaped,&er);
     int id=tmp_id++;
     /* Escape newlines/tabs in fmt for C string literal */
-    fprintf(out,"    char __tw_%d[1024]; snprintf(__tw_%d, sizeof(__tw_%d), \"",id,id,id);
+    fprintf(out,"    const char *__tw_%d=__sh_fmt_dyn(\"",id);
     for(const char *c=er.fmt;*c;c++){
         if(*c=='\n') fprintf(out,"\\n");
         else if(*c=='\t') fprintf(out,"\\t");
@@ -1966,11 +1969,11 @@ void emit_node(FILE *out, Node *n){
                     /* Unquoted variable expansion — word-split at runtime */
                     ExpandResult er; expand_string(items[i],&er);
                     int id=tmp_id++;
-                    fprintf(out,"    { char __tw_%d[65536]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    fprintf(out,"    { const char *__tw_%d=__sh_fmt_dyn(\"%s\"",id,er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                     fprintf(out,");\n");
                     expand_free(&er);
-                    fprintf(out,"    char *__sp=__tw_%d;\n",id);
+                    fprintf(out,"    char *__sp=(char*)__tw_%d;\n",id);
                     /* BUG-12 fix: use IFS for word splitting */
                     fprintf(out,"    const char *__ifs=getenv(\"IFS\"); if(!__ifs)__ifs=\" \\t\\n\";\n");
                     fprintf(out,"    while(*__sp){ while(*__sp&&strchr(__ifs,*__sp))__sp++; if(!*__sp)break;\n");
@@ -1981,7 +1984,7 @@ void emit_node(FILE *out, Node *n){
                     /* Quoted or mixed item with $ — expand as single element */
                     ExpandResult er; expand_string(items[i],&er);
                     int id=tmp_id++;
-                    fprintf(out,"    char __tw_%d[65536]; snprintf(__tw_%d,sizeof(__tw_%d),\"%s\"",id,id,id,er.fmt);
+                    fprintf(out,"    const char *__tw_%d=__sh_fmt_dyn(\"%s\"",id,er.fmt);
                     for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
                     fprintf(out,");\n");
                     expand_free(&er);
@@ -2035,10 +2038,13 @@ void emit_node(FILE *out, Node *n){
             } else if(dollar_outside_squotes(rhs)){
                 ExpandResult er; expand_string(rhs,&er);
                 add_var(n->lhs,V_STR);
-                fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",
-                        safe_cname(n->lhs),safe_cname(n->lhs),er.fmt);
+                /* Route through dynamic pool temp: snprintf(dest,...,dest,...)
+                 * with overlapping src/dest is UB (self-append BIG="$BIG x"). */
+                fprintf(out,"    { const char *__t=__sh_fmt_dyn(\"%s\"",
+                        er.fmt);
                 for(int i=0;i<er.nargs;i++) fprintf(out,",%s",er.args[i]);
-                fprintf(out,");\n");
+                fprintf(out,"); strncpy(%s,__t,sizeof(%s)-1); %s[sizeof(%s)-1]=0; }\n",
+                        safe_cname(n->lhs),safe_cname(n->lhs),safe_cname(n->lhs),safe_cname(n->lhs));
                 expand_free(&er);
             } else {
                 /* Literal string (no variable expansion needed).
@@ -2128,11 +2134,11 @@ void emit_node(FILE *out, Node *n){
                         }
                         inner[il]=0;
                         if(strchr(inner,'$')){
-                            /* expand variables */
+                            /* expand variables (pool temp avoids overlap UB) */
                             ExpandResult er; expand_string(inner,&er);
-                            fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",cn,cn,er.fmt);
+                            fprintf(out,"    { const char *__t=__sh_fmt_dyn(\"%s\"",er.fmt);
                             for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
-                            fprintf(out,");\n");
+                            fprintf(out,"); strncpy(%s,__t,sizeof(%s)-1); %s[sizeof(%s)-1]=0; }\n",cn,cn,cn,cn);
                             expand_free(&er);
                         } else {
                             char *esc=c_escape_literal(inner);
@@ -2141,9 +2147,9 @@ void emit_node(FILE *out, Node *n){
                         }
                     } else if(strchr(val,'$')){
                         ExpandResult er; expand_string(val,&er);
-                        fprintf(out,"    snprintf(%s,sizeof(%s),\"%s\"",cn,cn,er.fmt);
+                        fprintf(out,"    { const char *__t=__sh_fmt_dyn(\"%s\"",er.fmt);
                         for(int ai=0;ai<er.nargs;ai++) fprintf(out,",%s",er.args[ai]);
-                        fprintf(out,");\n");
+                        fprintf(out,"); strncpy(%s,__t,sizeof(%s)-1); %s[sizeof(%s)-1]=0; }\n",cn,cn,cn,cn);
                         expand_free(&er);
                     } else {
                         char *esc=c_escape_literal(val);
