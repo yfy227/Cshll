@@ -29,3 +29,5 @@ tests/boundary/*.c
 # legacy artifacts
 shell2c_asan
 shell2c.c.bak
+tests/test_realworld
+tests/test_stress
