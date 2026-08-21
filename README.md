@@ -8,7 +8,9 @@
 
 ## 项目简介
 
-**Cshll** 是一个深度多层的 Shell-to-C 转译器。它读取 POSIX 风格的 shell 脚本（bash/sh 方言），输出一个自包含的 C 源文件。编译后即可作为原生二进制运行——无需 shell 运行时。
+**Cshll** 是一个深度多层的 Shell-to-C 转译器。它读取 POSIX 风格的 shell 脚本（bash/sh 方言），输出一个 C 源文件。编译后作为原生二进制运行。
+
+> **运行时依赖的诚实说明**：仅当脚本只使用 117+ 原生内置命令时，产物才是完全自包含的（无 shell 依赖）。任何外部命令（`curl`/`git`/`tar`/`grep` 高级选项等）仍通过 `system()`/`popen()` 回退到系统 shell 执行——转译收益体现在控制流、变量、算术与内置命令的原生化，而非消除全部外部依赖。详见「已知限制」。
 
 ---
 
@@ -327,17 +329,19 @@ int main(int _argc, char **_argv) {
 }
 ```
 
-### 性能优化
+### 生成代码的分配行为
 
-生成的 C 代码经过以下优化：
+以下描述生成代码在**内存分配行为**上的设计选择（非端到端性能基准——本项目尚未建立可复现的 benchmark 环境，不做任何性能百分比声称）：
 
-| 优化项              | 优化前                          | 优化后                          | 提升   |
-|---------------------|---------------------------------|---------------------------------|--------|
-| for 循环            | malloc + N×strdup + N×free     | 栈分配数组，零堆操作            | -100%  |
-| 函数调用 (≤8参数)   | malloc + N×strdup + free       | 栈分配数组                      | -100%  |
-| 临时缓冲区          | 4096 字节                       | 1024 字节                       | -75%   |
-| echo 字面量         | fputs + putchar('\n')          | `__sh_puts()` 单次调用          | -50%   |
-| 数组清理            | for + free 循环                 | `__sh_arr_free()` 单次调用      | -67%   |
+| 场景              | 分配策略                                        |
+|-------------------|-------------------------------------------------|
+| for 循环字面列表  | 栈分配 `const char*` 数组，零堆操作              |
+| 函数调用 (≤8参数) | 栈数组，无 malloc/strdup/free                    |
+| 变量插值临时值    | `__sh_fmt_dyn()` 动态池：8 槽旋转 + 按需增长，无截断 |
+| echo 字面量       | `__sh_puts()` 单次调用                           |
+| 数组清理          | `__sh_arr_free()` 单次调用                       |
+
+> 计划：建立标准化的 benchmark 套件（对照 bash/dash/已转译二进制，固定负载与数据集）之后再补充量化数据。
 
 ---
 
@@ -358,32 +362,26 @@ done
 
 ### 测试覆盖
 
-| 测试文件           | 覆盖内容                                           |
-|--------------------|----------------------------------------------------|
-| `test1.sh`         | 基础特性：变量、算术、if/for/while、case、函数     |
-| `test2.sh`         | 重定向、管道、算术运算符、复合条件                 |
-| `test3.sh`         | break/continue、here-string、case 模式、字符串比较 |
-| `test4.sh`         | 边缘情况：嵌套 if、3 级管道、三元运算、while true  |
-| `test5.sh`         | 数组、参数展开、前缀/后缀删除                      |
-| `test6.sh`         | 字符串替换、嵌套命令替换、管道链、文件 I/O         |
-| `test_compat.sh`   | declare、数组操作、字符串操作、函数、递归           |
-| `test_complex.sh`  | 复杂真实脚本：字符串链、关联数组、case 模式         |
-| `test_patterns.sh` | 常见 shell 模式：引号、条件赋值、测试运算符         |
-| `test_realworld.sh`| 真实世界特性：反引号、heredoc、进程替换、正则      |
-| `test_newfeat.sh`  | 新特性：花括号展开、进程替换、`(( ))`、幂运算       |
-| `test_hd.sh`       | Heredoc 详细测试                                   |
-| `twopipe.sh`       | 连续管道测试                                       |
+| 测试套件               | 覆盖内容                                           | 运行方式 |
+|------------------------|----------------------------------------------------|----------|
+| `test1..6.sh` 等 e2e   | 13 个脚本 vs bash 逐字节 diff                      | `make test` |
+| `tests/syntax/`        | 语法覆盖矩阵：27 个特性各一最小用例（内联期望输出） | `bash tests/run_syntax_tests.sh` |
+| `tests/regression_2026_08.sh` | 缺陷回归：REG-01..07（本轮修复的每个 bug 一用例） | `bash tests/regression_2026_08.sh` |
+| CI (GitHub Actions)    | 上述全部 + ASAN/UBSAN/LSan 转译器全语料扫描        | 自动 |
+
+> 回归纪律：每个缺陷修复必须附带 REG-NN 回归用例；语法矩阵新增特性必须先验证 bash 行为再写期望输出（期望值以 bash 实测为准，不凭记忆）。
 
 ---
 
-## 构建从源码
+## 从源码构建
 
 ```bash
-# 使用 Makefile（推荐）
+# 默认：模块化构建（11 个编译器模块 + 4 个支持模块）
 make
 
-# 或手动编译（需要所有模块）
-gcc -O2 -Wall -o shell2c shell2c.c src/s2c_obfuscate.c src/s2c_mangle.c
+# 交叉验证：单文件 amalgamation 构建
+# （输出与模块化构建逐字节一致，用作构建级回归对照）
+make shell2c_amalg
 ```
 
 无外部依赖——仅标准 C 库和 POSIX 头文件。
@@ -394,34 +392,34 @@ gcc -O2 -Wall -o shell2c shell2c.c src/s2c_obfuscate.c src/s2c_mangle.c
 
 ```
 Cshll/
-├── shell2c.c          # 转译器（单文件，~6000 行）
-├── src/               # 模块化源码
-│   ├── s2c_common.h   # 共享类型与工具
-│   ├── s2c_symtab.h   # 符号表与函数注册
-│   ├── s2c_ast.h      # AST 节点类型
-│   ├── s2c_emit.h     # 代码发射器接口
-│   ├── s2c_parse.h    # 解析器接口
-│   ├── s2c_obfuscate.c # 代码混淆运行时
-│   ├── s2c_obfuscate.h
-│   ├── s2c_mangle.c   # 名称混淆
-│   └── s2c_mangle.h
-├── README.md          # 本文件
-├── Makefile           # 构建和测试
-├── .gitignore
+├── Makefile               # 模块化构建 + 测试目标
+├── shell2c.c              # amalgamation 入口（#include 拼装 src/parts/*.inc）
+├── LICENSE                # MIT 许可证
+├── src/
+│   ├── s2c_all.h          # 编译器内部总头文件（单一 include 点）
+│   ├── s2c_common.h       # 共享类型与工具
+│   ├── s2c_symtab.h/.c    # 符号表：变量/函数/heredoc 表
+│   ├── s2c_ast.h/.c       # AST 构造 + free_node 递归释放
+│   ├── s2c_emit.h/.c      # C 代码发射器
+│   ├── s2c_parse.h/.c     # 解析器（块帧栈）
+│   ├── tokenizer.c        # 词法分析
+│   ├── translate.c        # 表达式翻译
+│   ├── expand.c           # 字符串展开
+│   ├── cond.c             # 条件翻译
+│   ├── vm_compiler.c      # VM 字节码/算术编译
+│   ├── runtime_data.c     # RT_HEADER 运行时字符串
+│   ├── s2c_main.c         # 预扫描 + CLI + 线程
+│   ├── s2c_obfuscate.c/.h # 代码混淆运行时
+│   ├── s2c_mangle.c/.h    # 名称混淆
+│   ├── s2c_vm_*.c/.h      # VM 运行时/编译器/桥接
+│   └── parts/             # amalgamation 分片（shell2c.c 的源）
 └── tests/
-    ├── test1.sh       # 基础特性测试
-    ├── test2.sh       # 综合特性测试
-    ├── test3.sh       # break/continue、here-string
-    ├── test4.sh       # 边缘情况
-    ├── test5.sh       # 数组、参数展开
-    ├── test6.sh       # 字符串替换、管道链
-    ├── test_compat.sh # 兼容性测试
-    ├── test_complex.sh# 复杂真实脚本
-    ├── test_patterns.sh# 常见模式
-    ├── test_realworld.sh# 真实世界特性
-    ├── test_newfeat.sh # 新特性
-    ├── test_hd.sh     # Heredoc 测试
-    └── twopipe.sh     # 连续管道测试
+    ├── test1..6.sh        # 端到端 diff 测试（vs bash）
+    ├── test_*.sh          # 特性/兼容/真实世界测试
+    ├── syntax/            # 语法覆盖矩阵（27 特性，含内联期望输出）
+    │   └── gaps/          # 已知语法缺口（隔离，不阻塞基线）
+    ├── regression_2026_08.sh  # 缺陷回归套件（REG-01..07）
+    └── run_syntax_tests.sh    # 语法矩阵运行器
 ```
 
 ---
@@ -440,6 +438,8 @@ Cshll/
 ## VM 虚拟机保护模式（`--vm`）
 
 Cshll 内置自定义栈式虚拟机，可将脚本编译为字节码嵌入 C 二进制中运行。
+
+> **定位说明**：VM 模式的目标是**脚本保护/防逆向**（字节码加密 + 控制流平坦化 + 反分析设计），不是性能优化。它适合需要隐藏脚本逻辑的场景；普通转译（默认模式）生成可读性更好的 C 代码。VM 路径与转译路径是两套执行模型，复杂脚本在两条路径下的行为一致性仍在收敛中。
 
 ### 架构
 
@@ -496,7 +496,7 @@ gcc -O2 -Wall -o script script.c -ldl
 
 ## 许可证
 
-MIT — 见源文件头。
+MIT — 见仓库根目录的 [LICENSE](LICENSE) 文件。
 
 ---
 
