@@ -705,6 +705,21 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                 segment_count++;
             }
+            /* $$ — process PID (OP_GETPID pushes PID string) */
+            else if(*p == '$'){
+                p++;
+                vm_buf_emit(vs->bc, OP_GETPID);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
+            /* $? — last exit status (VM runtime setenv's "?" after cmds) */
+            else if(*p == '?'){
+                p++;
+                vmc_push_str(vs, "?");
+                vm_buf_emit(vs->bc, OP_GETENV);
+                if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                segment_count++;
+            }
             /* $@ — all positional params (space-joined) */
             else if(*p == '@'){
                 p++;
@@ -947,13 +962,31 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         return;
     }
 
-    /* echo / printf: push args with variable expansion, print */
-    if(strcmp(cmd, "echo") == 0){
+    /* echo / printf: push args with variable expansion, print.
+     * NOTE: the fast PRINT path can't honor output redirection — if the
+     * argv carries any redirect operator, fall through to the generic
+     * EXEC_CMD handler so system()/sh applies it (VM-vs-bash parity). */
+    int has_redirect = 0;
+    for(int i = 1; i < n->argc; i++){
+        const char *a = n->argv[i];
+        if((a[0] == '>' || a[0] == '<') ||
+           (a[0] == '2' && a[1] == '>') ||
+           !strncmp(a, ">&", 2) || !strncmp(a, ">>", 2)){
+            has_redirect = 1; break;
+        }
+    }
+    if(!has_redirect && strcmp(cmd, "echo") == 0){
         int has_newline = 1;
         int start = 1;
+        int interpret_escapes = 0;
         /* Check for -n flag (no newline) */
         if(n->argc > 1 && strcmp(n->argv[1], "-n") == 0){
             has_newline = 0;
+            start = 2;
+        }
+        /* Check for -e flag (interpret backslash escapes) */
+        else if(n->argc > 1 && strcmp(n->argv[1], "-e") == 0){
+            interpret_escapes = 1;
             start = 2;
         }
         int printed = 0;
@@ -982,7 +1015,25 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
                 vmc_push_str(vs, " ");
                 vm_buf_emit(vs->bc, OP_PRINT);
             }
-            vmc_compile_word(vs, arg);
+            if(interpret_escapes){
+                /* echo -e: interpret \n \t \r \\ in the source text
+                 * before variable compilation (bash echo -e semantics) */
+                char ebuf[4096]; int eb = 0;
+                for(const char *q = arg; *q && eb < (int)sizeof(ebuf)-1; q++){
+                    if(q[0] == '\\' && q[1]){
+                        char c = q[1];
+                        if(c == 'n'){ ebuf[eb++] = '\n'; q++; }
+                        else if(c == 't'){ ebuf[eb++] = '\t'; q++; }
+                        else if(c == 'r'){ ebuf[eb++] = '\r'; q++; }
+                        else if(c == '\\'){ ebuf[eb++] = '\\'; q++; }
+                        else ebuf[eb++] = *q;
+                    } else ebuf[eb++] = *q;
+                }
+                ebuf[eb] = 0;
+                vmc_compile_word(vs, ebuf);
+            } else {
+                vmc_compile_word(vs, arg);
+            }
             vm_buf_emit(vs->bc, OP_PRINT);
             printed = 1;
         }
@@ -1031,7 +1082,7 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     }
 
     /* printf: handle -v var format args */
-    if(strcmp(cmd, "printf") == 0 && n->argc >= 2){
+    if(!has_redirect && strcmp(cmd, "printf") == 0 && n->argc >= 2){
         /* Check for -v var */
         if(strcmp(n->argv[1], "-v") == 0 && n->argc >= 4){
             /* printf -v var format args... → build format string, setenv var */
@@ -1423,11 +1474,32 @@ static void vmc_compile_case(VmCompilerState *vs, Node *n){
 }
 
 /* Compile a pipe (NODE_PIPE) */
-/* Build command string from a NODE_CMD */
+/* Build command string from a NODE_CMD.
+ * echo is rewritten to printf for /bin/sh (dash) portability:
+ * dash's echo has no -e/-n flags and interprets backslashes natively,
+ * which diverges from bash. printf %b/%s are POSIX-portable. */
 static void vmc_build_cmdstr(char *buf, int bufsize, Node *n){
     int ci = 0;
-    for(int i = 0; i < n->argc && ci < bufsize - 1; i++){
-        if(i > 0) buf[ci++] = ' ';
+    int is_echo = (n->argc > 0 && !strcmp(n->argv[0], "echo"));
+    int start = 1;
+    const char *fmt = NULL; /* printf format replacing echo */
+    if(is_echo && n->argc > 1){
+        if(!strcmp(n->argv[1], "-e")){ fmt = "%b\\n"; start = 2; }        /* interpret escapes */
+        else if(!strcmp(n->argv[1], "-n")){ fmt = "%s"; start = 2; }      /* no newline */
+    }
+    if(is_echo && fmt){
+        const char *q = "printf"; int ql = 6;
+        if(ci + ql < bufsize - 1){ memcpy(buf+ci, q, ql); ci += ql; }
+        buf[ci++] = ' ';
+        buf[ci++] = '\''; /* single-quote the format: printf '%b\n' */
+        for(const char *f = fmt; *f && ci < bufsize - 2; f++) buf[ci++] = *f;
+        buf[ci++] = '\'';
+    } else {
+        const char *q = n->argv[0]; int ql = strlen(q);
+        if(ci + ql < bufsize - 1){ memcpy(buf+ci, q, ql); ci += ql; }
+    }
+    for(int i = start; i < n->argc && ci < bufsize - 2; i++){
+        buf[ci++] = ' ';
         int al = strlen(n->argv[i]);
         if(ci + al < bufsize - 1){ memcpy(buf+ci, n->argv[i], al); ci += al; }
     }
@@ -1457,10 +1529,13 @@ static void vmc_compile_pipe(VmCompilerState *vs, Node *n){
     vmc_build_pipestr(pipestr, sizeof(pipestr), n);
     
     if(strlen(pipestr) > 0){
-        /* Use popen to execute the full pipeline, print output to stdout */
+        /* Execute via system(): output flows DIRECTLY to stdout —
+         * no capture/re-print, so trailing newlines survive exactly
+         * as bash produces them (EXEC_CAP+PRINT stripped them, which
+         * merged consecutive outputs into one line). */
         vmc_push_str(vs, pipestr);
-        vm_buf_emit(vs->bc, OP_EXEC_CAP);
-        vm_buf_emit(vs->bc, OP_PRINT); /* print captured output */
+        vm_buf_emit(vs->bc, OP_EXEC_CMD);
+        vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
     }
 }
 

@@ -138,6 +138,7 @@ typedef enum {
     OP_TO_INT    = 0x80,  /* string to int (atoi) */
     OP_TO_STR    = 0x81,  /* int to string */
     OP_TYPEOF    = 0x82,  /* push type tag */
+    OP_GETPID    = 0x83,  /* push process PID as string ($$ expansion) */
 
     /* 0xC0-0xCF: File I/O */
     OP_OPEN       = 0xC0,  /* open file */
