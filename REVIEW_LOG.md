@@ -175,3 +175,25 @@
 - 测试期望值必须 bash 实测生成（禁止凭记忆）
 - 任何重构要么完成并用输出等价性证明，要么回滚
 - 验证统计用精确模式（"warning:"/"error:"），避免把命令行标志误计为诊断
+
+---
+
+### 2026-08-22 04:30 — 第八轮审视（read -p 支持 + && 链管道解析修复）
+
+**用户指令**：优先实现 read -p，再修其他 bug。
+
+16. [P1-完成] `read -p` 提示符支持（此前 -p 和提示串被解析器直接丢弃，静默降级为裸 fgets）
+    - emit.c：组合短标志解析（-r/-p/-s/-a 及 -rp/-pr/-rs 混合）；-p 提示符经 emit_word 展开（支持 $var 插值）后输出到 stderr，且仅当 stdin 是终端时显示（bash 精确语义：fputs+fflush(stderr)+isatty(0) 守卫）；-s 静默模式用 termios 关闭 ECHO，读毕恢复并补换行
+    - parse.c make_cmd：同样的组合标志解析；无变量目标时注册 REPLY（修复 `read -p "x"` 编译错误）；while-read 条件路径同步跳过 -p 的参数（此前提示串会被当变量注册）
+    - 验证：pipe 下零提示符泄漏、pty 下提示符正确显示（与 bash 同场景逐字节一致）、-s 密码不回显、REPLY/$((age+1))/${#pw} 全部正确
+    - 测试期望值教训复发一次：028 用例先凭想象写了期望值失败，立即用 bash 实测（EOF stdin → `got:   REPLY= pwlen=0`）修正
+
+17. [P1-已修复] REG-12: `&&` 链中管道被吞（两条执行路径共有）
+    - 根因：parse.c 的 && 分支对左侧直接 make_cmd(toks,ai,...)，`echo hi | grep hi && echo matched` 把 `|` 和 `grep hi` 当成 echo 的字面参数
+    - 修复：镜像 || 路径的正确模式——先 parser_append(NODE_AND)，再 parse_insert=&nd->left 递归 dispatch 左侧（无管道时自然落回 make_cmd）
+    - 语义正确性：管道优先级高于 &&（`a | b && c` = `(a|b) && c`），递归 dispatch 天然满足
+    - 该修复同时解锁 REG-08（VM $$/$? 用例曾因含 `| ... &&` 结构而失败）
+
+**测试基线更新**：语法矩阵 28/28（新增 028_read_prompt）；回归 12/12（新增 REG-11/12）；e2e 12/12；双构建输出逐字节一致；VM 抽样 3/6（无回归，剩余缺口已记录：$(func) 赋值捕获、case 多模式 |）
+
+**VM 一致性批次（上轮验证、本轮一并提交）**：$$（OP_GETPID 0x83 + dlsym）、$?（EXEC_CMD/EXEC_PIPE 导出 "?"）、echo/printf 重定向回退 EXEC_CMD、管道直通（EXEC_CAP 捕获改 EXEC_CMD，尾随换行存活）、dash 下 echo -e/-n 重写为 printf

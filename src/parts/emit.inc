@@ -1323,15 +1323,21 @@ void emit_command(FILE *out, char **argv, int ac, int id){
     if(!strcmp(cmd,"read")){
         const char *vars[8]; int nv=0;
         int read_array=0;
+        const char *prompt=NULL;
+        int silent=0;
         for(int i=1;i<ac;i++){
-            if(!strcmp(argv[i],"-r")) continue;
-            if(!strcmp(argv[i],"-p")){
-                /* -p PROMPT: skip the prompt string */
-                if(i+1<ac) i++; /* skip prompt argument */
-                continue;
-            }
-            if(argv[i][0]=='-'){
-                for(const char *fc=argv[i];*fc;fc++) if(*fc=='a') read_array=1;
+            if(argv[i][0]=='-' && argv[i][1] && argv[i][1]!='-'){
+                /* single or combined short flags: -r, -p PROMPT, -s, -a,
+                 * and combinations like -rp / -pr / -rs. */
+                int prompt_seen=0;
+                for(const char *fc=argv[i]+1;*fc;fc++){
+                    if(*fc=='r') continue;            /* raw: fgets is already raw */
+                    else if(*fc=='a') read_array=1;
+                    else if(*fc=='s') silent=1;
+                    else if(*fc=='p') prompt_seen=1;
+                    /* -t/-n/-d/-u/-i unsupported yet: treated as no-arg flags */
+                }
+                if(prompt_seen && !prompt && i+1<ac){ prompt=argv[i+1]; i++; }
                 continue;
             }
             if(nv<7) vars[nv++]=argv[i];
@@ -1346,6 +1352,20 @@ void emit_command(FILE *out, char **argv, int ac, int id){
             fprintf(out,"    } }\n");
             return;
         }
+        /* -p PROMPT: bash semantics — prompt goes to stderr, displayed
+         * only when stdin is a terminal. Prompt word is expanded via
+         * emit_word (supports $var interpolation in the prompt). */
+        if(prompt){
+            char *pw=emit_word(out,prompt);
+            fprintf(out,"    if(isatty(0)){ fputs(%s,stderr); fflush(stderr); }\n",pw);
+            free(pw);
+        }
+        /* -s silent: disable echo while reading (termios), then restore
+         * and print the newline bash emits after silent reads. */
+        if(silent){
+            fprintf(out,"    { int __tt=isatty(0); struct termios __ot;\n");
+            fprintf(out,"    if(__tt){ struct termios __t; if(tcgetattr(0,&__t)==0){ __ot=__t; __t.c_lflag&=~(ECHO); tcsetattr(0,TCSANOW,&__t); } else __tt=0; }\n");
+        }
         fprintf(out,"    { char __rb[65536]; if(fgets(__rb,sizeof(__rb),stdin)){ int __rl=(int)strlen(__rb); if(__rl>0&&__rb[__rl-1]=='\\n')__rb[--__rl]=0;");
         if(nv==1){
             fprintf(out,"    strncpy(%s,__rb,sizeof(%s)-1);",safe_cname(vars[0]),safe_cname(vars[0]));
@@ -1359,6 +1379,9 @@ void emit_command(FILE *out, char **argv, int ac, int id){
             fprintf(out,"    if(__vi==%d-1 && __tok==NULL){} ",nv);
         }
         fprintf(out,"    } }\n");
+        if(silent){
+            fprintf(out,"    if(__tt){ tcsetattr(0,TCSANOW,&__ot); fputs(\"\\n\",stderr); }\n    }\n");
+        }
         return;
     }
     if(!strcmp(cmd,"exit")){
@@ -2460,7 +2483,14 @@ void emit_node(FILE *out, Node *n){
             while(*p && nv<8){
                 while(*p==' '||*p=='\t') p++;
                 if(!*p) break;
-                if(*p=='-'){ p++; while(*p&&*p!=' ')p++; continue; }
+                if(*p=='-'){
+                    int pflag=0;
+                    p++;
+                    while(*p&&*p!=' '){ if(*p=='p')pflag=1; p++; }
+                    /* -p consumes the next word (the prompt) */
+                    if(pflag){ while(*p==' ')p++; while(*p&&*p!=' ')p++; }
+                    continue;
+                }
                 int vl=0;
                 while(*p && *p!=' ' && *p!='\t' && vl<127) vars[nv][vl++]=*p++;
                 vars[nv][vl]=0;

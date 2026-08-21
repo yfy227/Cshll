@@ -159,23 +159,28 @@ Node *make_cmd(char **toks,int n,int ln){
     nd->argv=malloc((n+1)*sizeof(char*)); nd->argc=n;
     for(int i=0;i<n;i++) nd->argv[i]=xstrdup(toks[i]);
     nd->argv[n]=NULL;
-    /* If this is a 'read' command, register its target variables as strings */
-    if(n>=2 && !strcmp(toks[0],"read")){
+    /* If this is a 'read' command, register its target variables as strings.
+     * Flag parsing mirrors emit.c: single or combined short flags (-r,
+     * -rp, -pr, -rs, -a); -p consumes the following prompt word. */
+    if(n>=1 && !strcmp(toks[0],"read")){
         int has_a=0; /* -a flag: read into array */
+        int nv=0;    /* variable targets found */
         for(int i=1;i<n;i++){
-            if(toks[i][0]=='-'){
-                /* -p PROMPT: skip flag AND its argument */
-                if(!strcmp(toks[i],"-p") && i+1<n){
-                    i++; /* skip prompt string */
-                    continue;
+            if(toks[i][0]=='-' && toks[i][1] && toks[i][1]!='-'){
+                int prompt_seen=0;
+                for(const char *fc=toks[i]+1;*fc;fc++){
+                    if(*fc=='a') has_a=1;
+                    else if(*fc=='p') prompt_seen=1;
                 }
-                for(const char *fc=toks[i];*fc;fc++) if(*fc=='a') has_a=1;
-                continue;  /* skip flags like -r, -p */
+                if(prompt_seen && i+1<n) i++; /* skip prompt argument */
+                continue;  /* skip flag tokens */
             }
             if(!strcmp(toks[i],"<<<")||!strcmp(toks[i],"<<")) break;  /* stop at here-string/heredoc */
             if(!strcmp(toks[i],"<")) break;  /* stop at redirect */
             add_var(toks[i], has_a ? V_ARRAY : V_STR);
+            nv++;
         }
+        if(nv==0) add_var("REPLY",V_STR);  /* read with no targets → REPLY */
     }
     /* If this is an 'unset' command, register variables so they're declared */
     if(n>=2 && !strcmp(toks[0],"unset")){
@@ -554,7 +559,12 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                 if(!strcmp(toks[i],"read")){
                     for(int j=i+1;j<ntoks;j++){
                         if(!strcmp(toks[j],"do")||!strcmp(toks[j],";")) break;
-                        if(toks[j][0]=='-') continue;
+                        if(toks[j][0]=='-' && toks[j][1] && toks[j][1]!='-'){
+                            int pf=0;
+                            for(const char *fc=toks[j]+1;*fc;fc++) if(*fc=='p') pf=1;
+                            if(pf && j+1<ntoks) j++; /* -p consumes prompt */
+                            continue;
+                        }
                         add_var(toks[j],V_STR);
                     }
                 }
@@ -1128,12 +1138,19 @@ void dispatch_segment(char **toks, int ntoks, int lineno){
                     parser_pop();
                     return;
                 }
-                nd->left=make_cmd(toks,ai,lineno);
-                /* Right side may contain more && — dispatch recursively */
+                /* The left side may itself be a pipeline (cmd | cmd && cmd).
+                 * Dispatch it recursively into nd->left — mirrors the ||
+                 * path; dispatch_segment falls back to make_cmd when the
+                 * segment has no pipe. The former direct make_cmd() call
+                 * swallowed '|' and the following stage as literal argv
+                 * (REG-08: 'echo x | grep y && echo z' printed the pipe
+                 * instead of executing it). */
                 Node **_pi=parse_insert;
                 parser_append(nd);
                 BlkFrame fr={BLK_IF_THEN,nd,&nd->right,_pi};
                 parser_push(fr);
+                parse_insert=&nd->left;
+                dispatch_segment(toks,ai,lineno);
                 parse_insert=&nd->right;
                 dispatch_segment(toks+ai+1,ntoks-ai-1,lineno);
                 parser_pop();
