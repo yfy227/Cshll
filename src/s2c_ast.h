@@ -73,7 +73,11 @@ typedef struct NodeExt {
 
 #define Node NodeExt
 
-/* new_redir defined in shell2c.c */
-/* new_node defined in shell2c.c */
+/* AST constructors (defined in ast.c) */
+Node *new_node(NodeType t, int ln);
+Redir *new_redir(int fd,const char *file,int append,
+                 int dup_fd,int is_hd,int is_hs,const char *hdtext);
+/* Recursive AST release (defined in ast.c) */
+void free_node(Node *n);
 
 #endif /* S2C_AST_H */

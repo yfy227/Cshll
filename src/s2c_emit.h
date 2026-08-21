@@ -26,6 +26,8 @@ char *translate_expr(const char *tok);
 char *translate_brace_expansion(const char *body);
 char *translate_num_operand(const char *tok);
 char *translate_operand(const char *tok);
+char *translate_arith(const char *expr);          /* translate.c */
+char *expand_cmd_subst(const char *cmd);          /* translate.c */
 
 /* Condition translation */
 char *translate_cond(const char *cond);
@@ -35,14 +37,14 @@ char *translate_test_binary(const char *op, const char *a1, const char *a2);
 /* Word emission */
 char *emit_word(FILE *out, const char *word);
 
-/* Node emission */
-/* emit_node defined in shell2c.c */
-/* emit_functions defined in shell2c.c */
-/* emit_command defined in shell2c.c */
+/* Node emission (defined in emit.c) */
+void emit_node(FILE *out, Node *n);
+void emit_functions(FILE *out, Node *script);
+void emit_command(FILE *out, char **argv, int ac, int lineno);
 
 /* Globals */
 extern int tmp_id;
-/* pending_pipe_cmd defined in shell2c.c */
+extern Node *pending_pipe_cmd;   /* defined in emit.c */
 extern int pipe_restore_needed;
 extern int __redir_counter;
 

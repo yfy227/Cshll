@@ -30,23 +30,27 @@ typedef struct BlkFrame {
 
 /* blk_top is now the head pointer of the linked list (NULL = empty) */
 /* blk_stack name removed — use blk_top directly */
-/* blk_top, parse_root, parse_insert defined in shell2c.c */
+extern BlkFrame *blk_top;      /* defined in parse.c */
+extern Node *parse_root;       /* defined in parse.c */
+extern Node **parse_insert;    /* defined in parse.c */
+void parser_push(BlkFrame fr);
+void parser_pop(void);
 
-/* Tokenizer */
+/* Tokenizer (defined in tokenizer.c) */
 #define MAX_TOKS 2048
-/* tokenize defined in shell2c.c */
-/* expand_braces defined in shell2c.c */
+int tokenize(const char *line, char **toks, int maxtoks);
+int expand_braces(char **toks, int ntoks, int maxtoks);
 
-/* Parser */
-/* parse_script defined in shell2c.c */
-/* dispatch_segment defined in shell2c.c */
-/* make_cmd defined in shell2c.c */
+/* Parser (defined in parse.c) */
+Node *parse_script(FILE *f);
+void dispatch_segment(char **toks, int ntoks, int lineno);
 
-/* Helpers */
-/* is_assignment defined in shell2c.c */
-/* is_array_assignment defined in shell2c.c */
-/* extract_array_assign defined in shell2c.c */
-/* find_op defined in shell2c.c */
-/* strip_comment defined in shell2c.c */
+/* Helpers (defined in parse.c) */
+int is_assignment(const char *tok);
+int is_array_assignment(const char *tok);
+void extract_array_assign(const char *t, char *name, int name_sz,
+                          char *key, int key_sz, char *val, int val_sz,
+                          int *is_append);
+void strip_comment(char *line);
 
 #endif /* S2C_PARSE_H */

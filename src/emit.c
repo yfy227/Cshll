@@ -1,3 +1,6 @@
+/* emit.c — generated from src/parts/emit.inc during the 2026-08 modularization. */
+#include "s2c_all.h"
+
 /* ================================================================== */
 /* L8  Code emitter                                                   */
 /* ================================================================== */

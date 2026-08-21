@@ -1,3 +1,6 @@
+/* translate.c — generated from src/parts/translate.inc during the 2026-08 modularization. */
+#include "s2c_all.h"
+
 /* ================================================================== */
 /* L5  Expression translator  ($var, ${...}, $((...)))                */
 /* ================================================================== */

@@ -19,6 +19,7 @@
 #include <errno.h>
 
 /* ---- Utility functions ---- */
+static char *xstrdup(const char *s) __attribute__((unused));
 static char *xstrdup(const char *s){ return s ? strdup(s) : strdup(""); }
 
 static char *ltrim(char *s){ while(*s&&isspace((unsigned char)*s))s++; return s; }
@@ -30,6 +31,7 @@ static char *rtrim(char *s){
 static char *trim(char *s) __attribute__((unused));
 static char *trim(char *s){ return rtrim(ltrim(s)); }
 
+static int starts_with(const char *s,const char *p) __attribute__((unused));
 static int starts_with(const char *s,const char *p){
     return strncmp(s,p,strlen(p))==0;
 }
@@ -37,5 +39,6 @@ static int starts_with(const char *s,const char *p){
 /* ---- C keyword safe-naming ---- */
 /* C_KEYWORDS and safe_cname are defined in shell2c.c with extended list */
 const char *safe_cname(const char *name); /* defined in shell2c.c */
+char *c_escape_literal(const char *s);    /* defined in symtab.c */
 
 #endif /* S2C_COMMON_H */

@@ -1,3 +1,6 @@
+/* symtab.c — generated from src/parts/symtab.inc during the 2026-08 modularization. */
+#include "s2c_all.h"
+
 /* ================================================================== */
 /* L0  Utility — definitions now in s2c_common.h                       */
 /* ================================================================== */

@@ -39,5 +39,6 @@ extern int heredoc_next;
 
 int heredoc_store(const char *text, int expand);
 const char *heredoc_consume(int *expand);
+int heredoc_peek(void);
 
 #endif /* S2C_SYMTAB_H */
