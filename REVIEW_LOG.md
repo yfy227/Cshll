@@ -197,3 +197,25 @@
 **测试基线更新**：语法矩阵 28/28（新增 028_read_prompt）；回归 12/12（新增 REG-11/12）；e2e 12/12；双构建输出逐字节一致；VM 抽样 3/6（无回归，剩余缺口已记录：$(func) 赋值捕获、case 多模式 |）
 
 **VM 一致性批次（上轮验证、本轮一并提交）**：$$（OP_GETPID 0x83 + dlsym）、$?（EXEC_CMD/EXEC_PIPE 导出 "?"）、echo/printf 重定向回退 EXEC_CMD、管道直通（EXEC_CAP 捕获改 EXEC_CMD，尾随换行存活）、dash 下 echo -e/-n 重写为 printf
+
+---
+
+### 2026-08-23 05:00 — 第九轮审视（VM 路径一致性专项：2/6 → 6/6）
+
+18. [P0-已修复] VM elif 分支跳转极性反转：主 if 用 OP_JNZ（shell true=rc 0 不跳），elif 用 OP_JZ——条件为真时反而跳过 elif 块，elif 永不执行；且 elif 出口跳转 patch 到中途而非 if 结尾（执行完掉进 else 块）
+
+19. [P0-已修复] VM 路径非确定性根因（上轮"run4 挂起"之谜）：常量池构建循环用 0xFF 作终止哨兵，长度字节 slen^key 含随机 seed——碰撞 0xFF 时表提前截断，后续常量全变空串。改用 __VM_NCONSTS 计数迭代；新增 S2C_VM_SEED 环境变量调试钩子（固定 seed 可复现）
+
+20. [P1-已修复] VM 数组支持：新增 OP_STR_WORD(0x84)/OP_STR_NWORDS(0x85)；word 编译器支持 ${arr[N]} 索引读、${#arr[@]} 词计数（数组以空格分隔 env var 存储）
+
+21. [P1-已修复] VM case 多模式 sat|sun)：引号感知的 | 拆分，每子模式 STRCMP+JZ，任一匹配进 body
+
+22. [P0-已修复] $(func args) 带参捕获失败：OP_SETENV 自身弹 2 值（name+value），参数编译代码后跟多余 OP_POP——每参数多弹一个栈值，栈错位毁掉 CAP 标记。6 处全删（语句级路径因 vm_pop 空栈静默吞掉而"侥幸正常"，同样违规）
+
+23. [P0-已修复] VM 完全忽略 Node redirs 链（>&2、>file、2>/dev/null 全部丢失）：非 heredoc 重定向重建为命令后缀交 EXEC_CMD；vmc_build_cmdstr 词边界修复（重定向操作符与操作数无缝拼、fd 前缀三段合并 2+>+/dev/null → 2>/dev/null、顶层 token 一律词间空格）；通用 EXEC_CMD 路径复用 cmdstr（原先内联朴素空格拼接产生 >& 2 2 > /dev/null 不可解析串）
+
+24. [P1-已修复] EXEC_CMD 运行时展开支持 ${#var} 长度语法（[ ${#s} -eq 5 ] 曾因名字 #s 查不到而返回 0）
+
+期间自查纠错 4 次：XOR 编码手误（getpid）、0x84 实现语法垃圾行、插入位置破坏 else 链（生成 C 结构损坏——回归测试立即抓到）、replace 弄丢 { 闭括号。教训：**生成器字符串修改后必须立即验证生成产物可编译**。
+
+**测试基线**：VM 一致性 6/6（vs bash）；语法矩阵 28/28；回归 12/12；e2e 12/12

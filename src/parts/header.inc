@@ -446,7 +446,7 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
             /* ${...} form */
             if(*p == '{'){
                 p++;
-                /* ${#var} — string length */
+                /* ${#var} — string length; ${#arr[@]} — array word count */
                 if(*p == '#'){
                     p++;
                     char vn[128]; int vi = 0;
@@ -454,9 +454,17 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vn[vi++] = *p++;
                     vn[vi] = 0;
                     if(*p == '}') p++;
-                    vmc_push_str(vs, vn);
+                    int is_arr_count = 0;
+                    char base[128]; int bl = 0;
+                    if(vi > 3 && !strcmp(vn + vi - 3, "[@]")){
+                        is_arr_count = 1;
+                        bl = vi - 3;
+                        memcpy(base, vn, bl); base[bl] = 0;
+                    }
+                    vmc_push_str(vs, is_arr_count ? base : vn);
                     vm_buf_emit(vs->bc, OP_GETENV);
-                    vm_buf_emit(vs->bc, OP_STRLEN);
+                    if(is_arr_count) vm_buf_emit(vs->bc, OP_STR_NWORDS);
+                    else vm_buf_emit(vs->bc, OP_STRLEN);
                     vm_buf_emit(vs->bc, OP_TO_STR);
                     if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                     segment_count++;
@@ -464,9 +472,29 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                 /* ${var:-default} or ${var...} — read var name first */
                 else {
                     char vn[128]; int vi = 0;
-                    while(*p && *p != ':' && *p != '}' && *p != '^' && *p != ',' && *p != '/' && *p != '#' && *p != '%' && vi < (int)sizeof(vn) - 1)
+                    while(*p && *p != ':' && *p != '}' && *p != '^' && *p != ',' && *p != '/' && *p != '#' && *p != '%' && *p != '[' && vi < (int)sizeof(vn) - 1)
                         vn[vi++] = *p++;
                     vn[vi] = 0;
+                    /* ${arr[N]} — array element read. Arrays are stored as
+                     * whitespace-separated env vars (see vmc_compile_assign);
+                     * word N of that string is the element. */
+                    if(*p == '['){
+                        p++;
+                        char idx_s[32]; int ii = 0;
+                        while(*p && *p != ']' && ii < 31) idx_s[ii++] = *p++;
+                        idx_s[ii] = 0;
+                        if(*p == ']') p++;
+                        /* skip a following [@]/[*]-style suffix is not valid
+                         * here; plain index only */
+                        if(*p == '}') p++;
+                        vmc_push_str(vs, vn);
+                        vm_buf_emit(vs->bc, OP_GETENV);
+                        vmc_push_int(vs, atoi(idx_s));
+                        vm_buf_emit(vs->bc, OP_STR_WORD);
+                        if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
+                        segment_count++;
+                        goto braced_done;
+                    }
                     /* Check for :- (default value) */
                     if(*p == ':' && p[1] == '-'){
                         p += 2; /* skip :- */
@@ -594,6 +622,7 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                     if(segment_count > 0) vm_buf_emit(vs->bc, OP_STRCAT);
                     segment_count++;
                 }
+                braced_done: ;
             }
             /* $((expr)) — arithmetic: recursive-descent compiler */
             else if(*p == '(' && *(p+1) == '('){
@@ -676,7 +705,6 @@ static void vmc_compile_word(VmCompilerState *vs, const char *word){
                         vmc_push_str(vs, argname);
                         vmc_compile_word(vs, argbuf); /* expand $var, $(()) */
                         vm_buf_emit(vs->bc, OP_SETENV);
-                        vm_buf_emit(vs->bc, OP_POP);
                         argi++;
                     }
                     /* Compile function body inline */
@@ -874,6 +902,7 @@ static void vmc_push_int(VmCompilerState *vs, int32_t val){
 }
 
 /* Compile a command (NODE_CMD) */
+static void vmc_build_cmdstr(char *buf, int bufsize, Node *n); /* fwd */
 static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     if(!n->argv || n->argc == 0) return;
     const char *cmd = n->argv[0];
@@ -946,6 +975,38 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
         }
     }
 
+    /* ---- Redirects collected by the parser into n->redirs ----
+     * The VM fast paths (echo/printf/builtins) ignore n->redirs entirely,
+     * which silently DROPPED redirection ('x >&2 2>/dev/null' printed to
+     * stdout, 'x > file' went nowhere). If any non-heredoc redirect is
+     * attached, rebuild the full command string (argv + redirect suffix)
+     * and hand it to EXEC_CMD — system()/sh applies them natively. */
+    if(n->redirs){
+        int has_nonhd = 0;
+        for(Redir *r = n->redirs; r; r = r->next)
+            if(!r->is_heredoc && !r->is_herestr){ has_nonhd = 1; break; }
+        if(has_nonhd){
+            char full[4096]; int fc = 0;
+            fc += snprintf(full+fc, sizeof(full)-fc, "%s", cmd);
+            for(int i = 1; i < n->argc && fc < (int)sizeof(full)-8; i++)
+                fc += snprintf(full+fc, sizeof(full)-fc, " %s", n->argv[i]);
+            for(Redir *r = n->redirs; r && fc < (int)sizeof(full)-16; r = r->next){
+                if(r->is_heredoc || r->is_herestr) continue;
+                if(r->dup_fd >= 0)
+                    fc += snprintf(full+fc, sizeof(full)-fc, " %d>&%d",
+                                   r->fd, r->dup_fd);
+                else
+                    fc += snprintf(full+fc, sizeof(full)-fc, " %d%s%s",
+                                   r->fd, r->append ? ">>" : ">",
+                                   r->file ? r->file : "/dev/null");
+            }
+            vmc_push_str(vs, full);
+            vm_buf_emit(vs->bc, OP_EXEC_CMD);
+            vm_buf_emit(vs->bc, OP_POP);
+            return;
+        }
+    }
+
     /* Check if this is a user-defined function call */
     int fi = vm_find_func(cmd);
     if(fi >= 0 && vm_func_bodies[fi]){
@@ -956,7 +1017,6 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
             vmc_push_str(vs, pname);
             vmc_compile_word(vs, n->argv[i]);
             vm_buf_emit(vs->bc, OP_SETENV);
-            vm_buf_emit(vs->bc, OP_POP);
         }
         /* Set $# = number of args */
         vmc_push_str(vs, "__sh_argc");
@@ -1109,7 +1169,6 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
             vmc_push_int(vs, nargs);
             vm_buf_emit(vs->bc, OP_EXEC_PRINTF);
             vm_buf_emit(vs->bc, OP_SETENV);
-            vm_buf_emit(vs->bc, OP_POP);
             return;
         }
         /* Regular printf: build command, exec via system */
@@ -1122,13 +1181,11 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
             vmc_push_str(vs, "__vm_set_e");
             vmc_push_str(vs, "1");
             vm_buf_emit(vs->bc, OP_SETENV);
-            vm_buf_emit(vs->bc, OP_POP);
             return;
         } else if(strcmp(n->argv[1], "+e") == 0){
             vmc_push_str(vs, "__vm_set_e");
             vmc_push_str(vs, "0");
             vm_buf_emit(vs->bc, OP_SETENV);
-            vm_buf_emit(vs->bc, OP_POP);
             return;
         }
     }
@@ -1142,18 +1199,12 @@ static void vmc_compile_cmd(VmCompilerState *vs, Node *n){
     }
 
     /* For all other commands: EXEC_CMD with full command string.
-     * system() output goes directly to stdout. Pop the exit code. */
+     * system() output goes directly to stdout. Pop the exit code.
+     * Reuses vmc_build_cmdstr: it joins redirect operators with their
+     * operands without spaces (tokenizer emits '>&','2' separately). */
     {
-        char cmdstr[4096]; int ci = 0;
-        for(int i = 0; i < n->argc && ci < (int)sizeof(cmdstr) - 1; i++){
-            if(i > 0) cmdstr[ci++] = ' ';
-            int al = (int)strlen(n->argv[i]);
-            if(ci + al < (int)sizeof(cmdstr) - 1){
-                memcpy(cmdstr + ci, n->argv[i], al);
-                ci += al;
-            }
-        }
-        cmdstr[ci] = 0;
+        char cmdstr[4096];
+        vmc_build_cmdstr(cmdstr, sizeof(cmdstr), n);
         vmc_push_str(vs, cmdstr);
         vm_buf_emit(vs->bc, OP_EXEC_CMD);
         vm_buf_emit(vs->bc, OP_POP); /* discard exit code */
@@ -1229,7 +1280,8 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
     vm_buf_patch(vs->bc, jz_to_else, vm_buf_pc(vs->bc));
 
     /* Elif blocks */
-    for(int i = 0; i < n->elif_count; i++){
+    int jmp_ends[16]; int njmp = 0;
+    for(int i = 0; i < n->elif_count && i < 16; i++){
         if(n->elif_conds[i] && n->elif_conds[i]->cond){
             vmc_push_str(vs, n->elif_conds[i]->cond);
             vm_buf_emit(vs->bc, OP_EXEC_CMD);
@@ -1237,22 +1289,26 @@ static void vmc_compile_if(VmCompilerState *vs, Node *n){
         } else {
             vmc_push_int(vs, 1);
         }
-        int jz_skip = vm_buf_emit_jump(vs->bc, OP_JZ);
+        /* Jump polarity MUST match the main if: shell true is rc==0,
+         * so the elif body is skipped when rc is NON-zero (OP_JNZ).
+         * The former OP_JZ skipped the body precisely when the
+         * condition was TRUE — elif arms never ran. */
+        int jnz_skip = vm_buf_emit_jump(vs->bc, OP_JNZ);
         if(n->elif_blks[i]) vmc_compile_block(vs, n->elif_blks[i]);
-        int jmp_end2 = vm_buf_emit_jump(vs->bc, OP_JMP);
-        vm_buf_patch(vs->bc, jz_skip, vm_buf_pc(vs->bc));
-        /* Use jmp_end2 later... but for simplicity, patch at end */
-        /* Actually, all elif jmps should go to the same end. We need to
-         * track all these and patch them all. For now, patch each to
-         * the current position, which means they'll fall through. */
-        vm_buf_patch(vs->bc, jmp_end2, vm_buf_pc(vs->bc));
+        jmp_ends[njmp++] = vm_buf_emit_jump(vs->bc, OP_JMP);
+        vm_buf_patch(vs->bc, jnz_skip, vm_buf_pc(vs->bc));
     }
 
     /* Else block */
     if(n->else_blk) vmc_compile_block(vs, n->else_blk);
 
-    /* Patch all JMP to end */
+    /* Patch ALL block-exit jumps (then-block + every taken elif) to the
+     * real end of the if-statement — the former code patched each elif's
+     * exit to the position right after itself, letting a taken elif fall
+     * through into the else block. */
     vm_buf_patch(vs->bc, jmp_to_end, vm_buf_pc(vs->bc));
+    for(int i = 0; i < njmp; i++)
+        vm_buf_patch(vs->bc, jmp_ends[i], vm_buf_pc(vs->bc));
 }
 
 /* Compile while loop (NODE_WHILE) */
@@ -1438,29 +1494,50 @@ static void vmc_compile_case(VmCompilerState *vs, Node *n){
     int n_ends = 0;
 
     for(int i = 0; i < n->case_count; i++){
-        /* Duplicate the case value for this pattern test */
-        vm_buf_emit(vs->bc, OP_DUP);
+        /* Split the pattern on quote-unaware '|' into sub-patterns
+         * (mirrors emit.c: 'sat|sun)' must match either). */
+        char sub[16][256]; int nsub = 0;
+        {
+            const char *ps = n->case_pats[i];
+            while(*ps && nsub < 16){
+                while(*ps == ' ') ps++;
+                if(!*ps) break;
+                int tl = 0, in_dq = 0, in_sq = 0;
+                while(*ps && tl < 255){
+                    if(*ps == '"' && !in_sq) in_dq = !in_dq;
+                    else if(*ps == '\'' && !in_dq) in_sq = !in_sq;
+                    else if(!in_dq && !in_sq && *ps == '|') break;
+                    sub[nsub][tl++] = *ps++;
+                }
+                sub[nsub][tl] = 0;
+                nsub++;
+                if(*ps == '|') ps++;
+            }
+        }
+        if(nsub == 0){ sub[0][0] = 0; nsub = 1; }
 
-        /* Push pattern (strip quotes if present) */
-        const char *pat = n->case_pats[i];
-        vmc_compile_word(vs, pat);
-
-        /* String compare: 0 = match */
-        vm_buf_emit(vs->bc, OP_STRCMP);
-        /* If non-zero (no match), skip to next pattern */
-        int jnz_skip = vm_buf_emit_jump(vs->bc, OP_JNZ);
-
-        /* Match: pop the duplicate value */
+        /* Test each sub-pattern: any match enters the body (OR) */
+        int body_jz[16];
+        for(int s = 0; s < nsub; s++){
+            vm_buf_emit(vs->bc, OP_DUP);
+            vmc_compile_word(vs, sub[s]);
+            vm_buf_emit(vs->bc, OP_STRCMP);
+            body_jz[s] = vm_buf_emit_jump(vs->bc, OP_JZ); /* 0 = match */
+        }
+        /* No sub-pattern matched: pop dup, jump to next branch */
         vm_buf_emit(vs->bc, OP_POP);
+        int jmp_next = vm_buf_emit_jump(vs->bc, OP_JMP);
 
-        /* Compile the body */
+        /* Body (all matching sub-patterns land here) */
+        int body_pc = vm_buf_pc(vs->bc);
+        for(int s = 0; s < nsub; s++)
+            vm_buf_patch(vs->bc, body_jz[s], body_pc);
+        vm_buf_emit(vs->bc, OP_POP); /* pop the duplicated value */
         if(n->case_bodies[i]) vmc_compile_block(vs, n->case_bodies[i]);
-
-        /* Jump to end of case */
         jmp_to_ends[n_ends++] = vm_buf_emit_jump(vs->bc, OP_JMP);
 
-        /* Patch: no-match jumps here (next pattern) */
-        vm_buf_patch(vs->bc, jnz_skip, vm_buf_pc(vs->bc));
+        /* Next branch lands here */
+        vm_buf_patch(vs->bc, jmp_next, vm_buf_pc(vs->bc));
     }
 
     /* Default case */
@@ -1506,9 +1583,44 @@ static void vmc_build_cmdstr(char *buf, int bufsize, Node *n){
         if(ci + ql < bufsize - 1){ memcpy(buf+ci, q, ql); ci += ql; }
     }
     for(int i = start; i < n->argc && ci < bufsize - 2; i++){
-        buf[ci++] = ' ';
-        int al = strlen(n->argv[i]);
-        if(ci + al < bufsize - 1){ memcpy(buf+ci, n->argv[i], al); ci += al; }
+        const char *a = n->argv[i];
+        int al = strlen(a);
+        /* Redirect operators join their operand WITHOUT a space — the
+         * tokenizer splits '>&2' into ['>&','2'] and '2>/dev/null' into
+         * ['2','>','/dev/null']; naive space-joining produced '&> 2 2 >
+         * /dev/null' which /bin/sh cannot parse (REG: echo x >&2 2>
+         * /dev/null lost its output). */
+        int is_rdop = (a[0]=='>'||a[0]=='<'
+                       || (a[0]=='&'&&a[1]=='>')
+                       || (a[0]=='2'&&a[1]=='>')) && al <= 3;
+        /* fd-number prefix: '2' followed by '>' — the whole group
+         * '2' + '>' + '/dev/null' forms ONE word: '2>/dev/null'. The
+         * group starts a new word (space before it), but is internally
+         * space-free. */
+        int is_fdpre = (al==1 && isdigit((unsigned char)a[0])
+                        && i+1 < n->argc
+                        && (n->argv[i+1][0]=='>' || n->argv[i+1][0]=='<'));
+        /* Every top-level token starts a new word (the command word
+         * is already in the buffer; group members are consumed via the
+         * i+= skips above). */
+        if(i > 0) buf[ci++] = ' ';
+        if(ci + al < bufsize - 1){ memcpy(buf+ci, a, al); ci += al; }
+        if(is_fdpre && i+2 < n->argc){
+            /* join op + operand within the group */
+            const char *op = n->argv[i+1];
+            const char *fl = n->argv[i+2];
+            int ol = strlen(op), fln = strlen(fl);
+            if(ci + ol < bufsize - 1){ memcpy(buf+ci, op, ol); ci += ol; }
+            if(ci + fln < bufsize - 1){ memcpy(buf+ci, fl, fln); ci += fln; }
+            i += 2;
+        }
+        /* operand of a redirect op: join without space */
+        else if(is_rdop && i+1 < n->argc){
+            const char *op = n->argv[i+1];
+            int ol = strlen(op);
+            if(ci + ol < bufsize - 1){ memcpy(buf+ci, op, ol); ci += ol; }
+            i++;
+        }
     }
     buf[ci] = 0;
 }
@@ -1648,7 +1760,6 @@ static void vmc_compile_node(VmCompilerState *vs, Node *n){
                         vmc_push_str(vs, n->argv[i]);
                         vmc_compile_word(vs, eq + 1); /* expand $var */
                         vm_buf_emit(vs->bc, OP_SETENV);
-                        vm_buf_emit(vs->bc, OP_POP);
                         *eq = '=';
                     }
                 }

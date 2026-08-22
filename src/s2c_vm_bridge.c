@@ -138,9 +138,15 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
                      int obfuscate){
 
     /* ---- Generate per-build opcode permutation table ---- */
-    /* Seed: random per-build (from /dev/urandom or time) */
+    /* Seed: random per-build (from /dev/urandom or time).
+     * Debug/testing hook: S2C_VM_SEED env var pins the seed for
+     * reproducible builds when chasing nondeterministic failures. */
     unsigned int perm_seed;
     {
+        const char *pin = getenv("S2C_VM_SEED");
+        if(pin && *pin){
+            perm_seed = (unsigned int)strtoul(pin, NULL, 0);
+        } else {
         FILE *rf = fopen("/dev/urandom", "rb");
         if(rf){
             if(fread(&perm_seed, sizeof(perm_seed), 1, rf) != 1)
@@ -155,6 +161,7 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
             content_hash = content_hash * 31 + bc->data[i];
         }
         perm_seed ^= content_hash;
+        }
     }
 
     /* Generate permutation: a shuffled mapping of opcode 0x00-0xFF
@@ -333,7 +340,13 @@ void vmc_emit_output(FILE *out, VmBuf *bc, VmConstPool *cp,
     fprintf(out, "    static const unsigned char *__vm_cp_enc_ptrs_arr[1024];\n");
     fprintf(out, "    const unsigned char *__vm_cp_p2 = __vm_cp_enc;\n");
     fprintf(out, "    int __vm_cp_n2 = 0;\n");
-    fprintf(out, "    while(*__vm_cp_p2 != 0xFF && __vm_cp_n2 < 1024){\n");
+    /* Iterate by COUNT, not by a 0xFF sentinel: the length byte is
+     * (slen ^ key) where key derives from the per-build random seed,
+     * so a legitimate length byte CAN collide with 0xFF — the sentinel
+     * then terminated the table early and every later constant
+     * resolved to "" (nondeterministic output corruption across
+     * builds). __VM_NCONSTS is emitted above from the true count. */
+    fprintf(out, "    while(__vm_cp_n2 < __VM_NCONSTS && __vm_cp_n2 < 1024){\n");
     fprintf(out, "        __vm_cp_enc_ptrs_arr[__vm_cp_n2++] = __vm_cp_p2;\n");
     fprintf(out, "        /* Skip length byte + string bytes */\n");
     fprintf(out, "        uint32_t __rt = __vm_rt_key();\n");
